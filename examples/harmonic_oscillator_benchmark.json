@@ -811,6 +811,109 @@
           "size": 8192
         }
       ]
+    },
+    {
+      "timestamp_utc": "2026-01-20T12:07:11Z",
+      "steps": 2048,
+      "repeats": 3,
+      "size": 8192,
+      "coupled_size": 8192,
+      "integrators": [
+        "leapfrog"
+      ],
+      "unrolls": [
+        1,
+        2,
+        4,
+        8,
+        16
+      ],
+      "include_jit": false,
+      "include_scan": true,
+      "include_scan_coupled": false,
+      "include_coupled_rows": false,
+      "use_coupled_hamiltonian": false,
+      "scan_unroll": 4,
+      "scan_vec": 1,
+      "scan_tune": true,
+      "scan_unrolls": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "scan_vecs": [
+        1,
+        4
+      ],
+      "stability": false,
+      "stability_steps": 512,
+      "stability_dt": 0.01,
+      "results": [
+        {
+          "integrator": "leapfrog",
+          "mode": "step",
+          "hamiltonian": "harmonic",
+          "jit": false,
+          "unroll": 1,
+          "elapsed_s": 12.751439797000785,
+          "steps_per_s": 160.60931413264422,
+          "time_per_step_s": 0.0062262889633792895
+        },
+        {
+          "integrator": "leapfrog",
+          "mode": "step",
+          "hamiltonian": "harmonic",
+          "jit": true,
+          "unroll": 2,
+          "elapsed_s": 0.1742941670017899,
+          "steps_per_s": 11750.249794526791,
+          "time_per_step_s": 8.510457373134273e-05
+        },
+        {
+          "integrator": "leapfrog",
+          "mode": "step",
+          "hamiltonian": "harmonic",
+          "jit": true,
+          "unroll": 4,
+          "elapsed_s": 0.10573612499865703,
+          "steps_per_s": 19368.97157925933,
+          "time_per_step_s": 5.1628967284500504e-05
+        },
+        {
+          "integrator": "leapfrog",
+          "mode": "step",
+          "hamiltonian": "harmonic",
+          "jit": true,
+          "unroll": 8,
+          "elapsed_s": 0.10015291700256057,
+          "steps_per_s": 20448.730414388625,
+          "time_per_step_s": 4.890279150515653e-05
+        },
+        {
+          "integrator": "leapfrog",
+          "mode": "step",
+          "hamiltonian": "harmonic",
+          "jit": true,
+          "unroll": 16,
+          "elapsed_s": 0.13756799999828218,
+          "steps_per_s": 14887.18306601516,
+          "time_per_step_s": 6.717187499916122e-05
+        },
+        {
+          "integrator": "leapfrog",
+          "mode": "scan",
+          "hamiltonian": "harmonic",
+          "scan_unroll": 4,
+          "scan_vec": 1,
+          "scan_tune": true,
+          "jit": false,
+          "unroll": 0,
+          "elapsed_s": 0.003390207995835226,
+          "steps_per_s": 604092.7289758946,
+          "time_per_step_s": 1.655374997966419e-06
+        }
+      ]
     }
   ]
 }

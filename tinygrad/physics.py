@@ -15,8 +15,10 @@ This is the "native language" of physics on AI hardware.
 from tinygrad.engine.jit import TinyJit, JitError
 from tinygrad.engine.realize import capturing
 from tinygrad.helpers import getenv
+from tinygrad.dtype import dtypes
 from tinygrad.tensor import Tensor
 from tinygrad.uop.ops import KernelInfo, Ops, UOp, PatternMatcher, UPat, graph_rewrite
+from tinygrad.uop.symbolic import symbolic
 from typing import Callable
 
 # ============================================================================
@@ -169,7 +171,7 @@ class HamiltonianSystem:
         self.integrator_name = integrator
         self._jit_step = TinyJit(self.step)
         self._jit_step_inplace = TinyJit(self.step_inplace)
-        self._scan_kernel_cache: dict[tuple[float, int, str, tuple[int, ...], object], Callable] = {}
+        self._scan_kernel_cache: dict[tuple[float, int, int, int, str, tuple[int, ...], object], Callable] = {}
 
     def step(self, q: Tensor, p: Tensor, dt: float = 0.01) -> tuple[Tensor, Tensor]:
         return self._step(q, p, self.H, dt)
@@ -260,7 +262,8 @@ class HamiltonianSystem:
 
         return q, p, history
 
-    def evolve_scan_kernel(self, q: Tensor, p: Tensor, dt: float, steps: int, coupled: bool = False) -> tuple[Tensor, Tensor, list]:
+    def evolve_scan_kernel(self, q: Tensor, p: Tensor, dt: float, steps: int, coupled: bool = False,
+                           unroll_steps: int = 1, vector_width: int = 1, inplace: bool = False) -> tuple[Tensor, Tensor, list]:
         """Single-kernel scan for leapfrog with static steps (elementwise H)."""
         if self.integrator_name != "leapfrog":
             raise ValueError("scan kernel only supports leapfrog")
@@ -271,30 +274,46 @@ class HamiltonianSystem:
         if q.dtype != p.dtype:
             raise ValueError("scan kernel requires q and p with the same dtype")
         if coupled:
-            return self.evolve_scan_kernel_coupled(q, p, dt, steps)
+            return self.evolve_scan_kernel_coupled(q, p, dt, steps, unroll_steps=unroll_steps)
+        if unroll_steps < 1:
+            raise ValueError("unroll_steps must be >= 1")
+        if steps % unroll_steps != 0:
+            raise ValueError("steps must be divisible by unroll_steps")
+        if vector_width < 1:
+            raise ValueError("vector_width must be >= 1")
+        if vector_width > 1 and q.numel() % vector_width != 0:
+            raise ValueError("vector_width must divide the number of elements")
+        if vector_width > 1 and q.numel() % vector_width != 0:
+            raise ValueError("vector_width must divide the number of elements")
         q = q.contiguous().realize()
         p = p.contiguous().realize()
 
         if q.device != p.device:
             raise ValueError("scan kernel requires q and p on the same device")
 
-        key = (dt, steps, q.device, q.shape, q.dtype)
+        key = (dt, steps, unroll_steps, vector_width, q.device, q.shape, q.dtype)
         kernel = self._scan_kernel_cache.get(key)
         if kernel is None:
-            kernel = self._build_leapfrog_scan_kernel(dt, steps, q.device, q.shape, q.dtype)
+            kernel = self._build_leapfrog_scan_kernel(dt, steps, unroll_steps, vector_width, q.device, q.shape, q.dtype)
             self._scan_kernel_cache[key] = kernel
 
         q_start = q.detach()
         p_start = p.detach()
-        q, p = Tensor.custom_kernel(q, p, fxn=kernel)[:2]
-        Tensor.realize(q, p)
+        q_out, p_out = Tensor.custom_kernel(q, p, fxn=kernel)[:2]
+        Tensor.realize(q_out, p_out)
+        if inplace:
+            q.assign(q_out)
+            p.assign(p_out)
+            Tensor.realize(q, p)
+        else:
+            q, p = q_out, p_out
 
         history = []
         history.append((q_start.numpy().copy(), p_start.numpy().copy(), self.energy(q_start, p_start)))
         history.append((q.numpy().copy(), p.numpy().copy(), self.energy(q, p)))
         return q, p, history
 
-    def evolve_scan_kernel_coupled(self, q: Tensor, p: Tensor, dt: float, steps: int) -> tuple[Tensor, Tensor, list]:
+    def evolve_scan_kernel_coupled(self, q: Tensor, p: Tensor, dt: float, steps: int, unroll_steps: int = 1) -> tuple[Tensor, Tensor, list]:
         """Static-step scan for coupled Hamiltonians (multi-kernel, slower)."""
         if self.integrator_name != "leapfrog":
             raise ValueError("scan kernel only supports leapfrog")
@@ -311,13 +330,20 @@ class HamiltonianSystem:
 
         q_start = q.detach()
         p_start = p.detach()
+        if unroll_steps < 1:
+            raise ValueError("unroll_steps must be >= 1")
+        if steps % unroll_steps != 0:
+            raise ValueError("steps must be divisible by unroll_steps")
+
         step_scanned = self._jit_step_inplace
+        if unroll_steps > 1:
+            step_scanned = self.compile_unrolled_step_inplace(dt, unroll_steps)
         if step_scanned.captured is None:
             q_tmp = Tensor(q.numpy().copy(), device=q.device)
             p_tmp = Tensor(p.numpy().copy(), device=p.device)
             step_scanned(q_tmp, p_tmp, dt)
             step_scanned(q_tmp, p_tmp, dt)
-        step_scanned.call_repeat(q, p, dt, repeat=steps)
+        step_scanned.call_repeat(q, p, dt, repeat=steps // unroll_steps)
         Tensor.realize(q, p)
 
         history = []
@@ -325,7 +351,9 @@ class HamiltonianSystem:
         history.append((q.detach().numpy().copy(), p.detach().numpy().copy(), self.energy(q, p)))
         return q, p, history
 
-    def _build_leapfrog_scan_kernel(self, dt: float, steps: int, device: str, shape: tuple[int, ...], dtype) -> Callable:
+
+    def _build_leapfrog_scan_kernel(self, dt: float, steps: int, unroll_steps: int, vector_width: int,
+                                    device: str, shape: tuple[int, ...], dtype) -> Callable:
         q_sym = Tensor.empty((), device=device, dtype=dtype, requires_grad=True)
         p_sym = Tensor.empty((), device=device, dtype=dtype, requires_grad=True)
         H_sym = self.H(q_sym, p_sym)
@@ -334,37 +362,58 @@ class HamiltonianSystem:
             (UPat(Ops.CONST, src=(UPat(Ops.DEVICE),), name="c"), lambda c: UOp.const(c.dtype, c.arg)),
         ])
         dHdq_uop = graph_rewrite(dHdq_sym.uop, strip_device_consts, name="strip_device_consts")
+        dHdq_uop = graph_rewrite(dHdq_uop, symbolic, name="symbolic_dHdq")
         dHdp_uop = graph_rewrite(dHdp_sym.uop, strip_device_consts, name="strip_device_consts")
+        dHdp_uop = graph_rewrite(dHdp_uop, symbolic, name="symbolic_dHdp")
 
         def grad_uop(q_uop: UOp, p_uop: UOp) -> tuple[UOp, UOp]:
             sub = {q_sym.uop: q_uop, p_sym.uop: p_uop}
             return dHdq_uop.substitute(sub), dHdp_uop.substitute(sub)
 
         def kernel(q: UOp, p: UOp) -> UOp:
-            step = UOp.range(steps, 0)
+            tile_steps = steps // unroll_steps
+            step = UOp.range(tile_steps, 0)
             q_step = q.after(step)
             p_step = p.after(step)
 
             q_flat = q_step.flatten()
             p_flat = p_step.flatten()
-            idx = UOp.range(q_flat.size, 1)
-            q_elem = q_flat.after(step)[idx]
-            p_elem = p_flat.after(step)[idx]
+            idx = UOp.range(q_flat.size, 1) if vector_width == 1 else None
+            if vector_width == 1:
+                q_elem = q_flat.after(step)[idx]
+                p_elem = p_flat.after(step)[idx]
+            else:
+                outer = q_flat.size // vector_width
+                oidx = UOp.range(outer, 1)
+                base = oidx * UOp.const(dtypes.index, vector_width)
+                q_ptr = q_flat.after(step).index(base, ptr=True)
+                p_ptr = p_flat.after(step).index(base, ptr=True)
+                q_vec_ptr = q_ptr.cast(q_flat.dtype.base.vec(vector_width).ptr(size=q_ptr.dtype.size, addrspace=q_ptr.dtype.addrspace))
+                p_vec_ptr = p_ptr.cast(p_flat.dtype.base.vec(vector_width).ptr(size=p_ptr.dtype.size, addrspace=p_ptr.dtype.addrspace))
+                q_elem = q_vec_ptr.load()
+                p_elem = p_vec_ptr.load()
 
-            dHdq_1, _ = grad_uop(q_elem, p_elem)
-            dt_uop = dHdq_1.const_like(dt)
-            half_dt = dHdq_1.const_like(0.5*dt)
-            p_half = p_elem - half_dt * dHdq_1
-            _, dHdp = grad_uop(q_elem, p_half)
-            q_new = q_elem + dt_uop * dHdp
-            dHdq_2, _ = grad_uop(q_new, p_half)
-            p_new = p_half - half_dt * dHdq_2
+            for _ in range(unroll_steps):
+                dHdq_1, _ = grad_uop(q_elem, p_elem)
+                dt_uop = dHdq_1.const_like(dt)
+                half_dt = dHdq_1.const_like(0.5*dt)
+                p_half = p_elem - half_dt * dHdq_1
+                _, dHdp = grad_uop(q_elem, p_half)
+                q_elem = q_elem + dt_uop * dHdp
+                dHdq_2, _ = grad_uop(q_elem, p_half)
+                p_elem = p_half - half_dt * dHdq_2
 
-            store_q = q_flat.after(step)[idx].store(q_new)
-            store_p = p_flat.after(step)[idx].store(p_new)
-            return UOp.group(store_q, store_p).end(idx, step).sink(arg=KernelInfo(name=f"leapfrog_scan_{steps}", opts_to_apply=()))
+            if vector_width == 1:
+                store_q = q_flat.after(step)[idx].store(q_elem)
+                store_p = p_flat.after(step)[idx].store(p_elem)
+                return UOp.group(store_q, store_p).end(idx, step).sink(arg=KernelInfo(name=f"leapfrog_scan_{steps}", opts_to_apply=()))
+
+            store_q = q_vec_ptr.store(q_elem)
+            store_p = p_vec_ptr.store(p_elem)
+            return UOp.group(store_q, store_p).end(oidx, step).sink(arg=KernelInfo(name=f"leapfrog_scan_{steps}", opts_to_apply=()))
 
         return kernel
+
 
     def compile_unrolled_step(self, dt: float, unroll: int):
         """Prototype unroll/scan by compiling N steps into one captured graph."""
@@ -374,6 +423,18 @@ class HamiltonianSystem:
         def unrolled_step(q: Tensor, p: Tensor):
             for _ in range(unroll):
                 q, p = self.step(q, p, dt)
+            return q, p
+
+        return TinyJit(unrolled_step)
+
+    def compile_unrolled_step_inplace(self, dt: float, unroll: int):
+        """In-place unroll by compiling N step_inplace calls into one captured graph."""
+        if unroll < 1:
+            raise ValueError("unroll must be >= 1")
+
+        def unrolled_step(q: Tensor, p: Tensor, dt_inner: float):
+            for _ in range(unroll):
+                q, p = self.step_inplace(q, p, dt_inner)
             return q, p
 
         return TinyJit(unrolled_step)
