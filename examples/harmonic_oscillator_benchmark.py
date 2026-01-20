@@ -126,12 +126,13 @@ def _energy_stats(history: list[tuple]) -> tuple[float, float]:
 
 
 def _bench_scan(system: HamiltonianSystem, steps: int, repeats: int, coupled: bool, size: int,
-                unroll_steps: int, vector_width: int, inplace: bool) -> tuple[float, float]:
+                unroll_steps: int, vector_width: int, inplace: bool, coupled_fused: bool = False) -> tuple[float, float]:
   def run_once() -> float:
     q, p = _make_state(size)
     start = time.perf_counter()
     system.evolve_scan_kernel(q, p, dt=0.01, steps=steps, coupled=coupled,
-                              unroll_steps=unroll_steps, vector_width=vector_width, inplace=inplace)
+                              unroll_steps=unroll_steps, vector_width=vector_width, inplace=inplace,
+                              coupled_fused=coupled_fused)
     return time.perf_counter() - start
 
   times = [run_once() for _ in range(repeats)]
@@ -186,6 +187,7 @@ def main():
   include_jit = "--jit" in args
   include_scan = "--scan" in args
   include_scan_coupled = "--scan-coupled" in args
+  include_scan_coupled_fused = "--scan-coupled-fused" in args
   include_coupled_rows = "--coupled-rows" in args
   use_coupled_hamiltonian = "--coupled-hamiltonian" in args
   json_path = _parse_str_flag(args, "json", None)
@@ -195,8 +197,8 @@ def main():
   print("=" * 72)
   print(f"steps={steps} repeats={repeats} size={size} coupled_size={coupled_size} integrators={','.join(integrators)} "
         f"unrolls={','.join(map(str, unrolls))} jit={include_jit} scan={include_scan} scan_coupled={include_scan_coupled} "
-        f"coupled_rows={include_coupled_rows} coupled_H={use_coupled_hamiltonian} scan_unroll={scan_unroll} scan_vec={scan_vec} "
-        f"scan_tune={scan_tune} scan_inplace={scan_inplace} stability={stability}")
+        f"scan_coupled_fused={include_scan_coupled_fused} coupled_rows={include_coupled_rows} coupled_H={use_coupled_hamiltonian} "
+        f"scan_unroll={scan_unroll} scan_vec={scan_vec} scan_tune={scan_tune} scan_inplace={scan_inplace} stability={stability}")
   print("-" * 72)
   print(f"{'integrator':12s} {'mode':12s} {'jit':5s} {'unroll':6s} {'ms':>10s} {'steps/s':>12s}")
 
@@ -300,6 +302,28 @@ def main():
         "size": coupled_size,
       })
 
+    if integrator == "leapfrog" and include_scan_coupled_fused:
+      coupled_system = system if use_coupled_hamiltonian else HamiltonianSystem(coupled_hamiltonian(), integrator=integrator)
+      elapsed, steps_per_s = _bench_scan(coupled_system, steps, repeats, coupled=True, size=coupled_size,
+                                         unroll_steps=1, vector_width=1, inplace=scan_inplace, coupled_fused=True)
+      time_per_step_s = elapsed / steps
+      print(f"{integrator:12s} {'scan_cpl_f':12s} {'-':5s} {'-':6s} {elapsed*1e3:10.2f} {steps_per_s:12,.0f}")
+      json_results.append({
+        "integrator": integrator,
+        "mode": "scan_coupled_fused",
+        "hamiltonian": "coupled",
+        "scan_unroll": 1,
+        "scan_vec": 1,
+        "scan_tune": False,
+        "scan_inplace": scan_inplace,
+        "jit": False,
+        "unroll": 0,
+        "elapsed_s": elapsed,
+        "steps_per_s": steps_per_s,
+        "time_per_step_s": time_per_step_s,
+        "size": coupled_size,
+      })
+
     if stability:
       q, p = _make_state(size)
       _, _, history = system.evolve(q, p, dt=stability_dt, steps=stability_steps, record_every=1)
@@ -335,6 +359,7 @@ def main():
       "include_jit": include_jit,
       "include_scan": include_scan,
       "include_scan_coupled": include_scan_coupled,
+      "include_scan_coupled_fused": include_scan_coupled_fused,
       "include_coupled_rows": include_coupled_rows,
       "use_coupled_hamiltonian": use_coupled_hamiltonian,
       "scan_unroll": scan_unroll,

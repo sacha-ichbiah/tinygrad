@@ -330,9 +330,8 @@ pm_reduce = PatternMatcher([
 
 pm_add_loads = PatternMatcher([
   # add loads to non ptr index
-  (UPat(Ops.INDEX, name="idx"), lambda idx: None if isinstance(idx.dtype, (PtrDType, ImageDType)) else
-    idx.replace(dtype=idx.src[0].dtype).load(dtype=idx.dtype.base)),
+  (UPat(Ops.INDEX, name="idx"), lambda idx: None if isinstance(idx.dtype, (PtrDType, ImageDType)) or
+    not isinstance(idx.src[0].dtype, (PtrDType, ImageDType)) else idx.replace(dtype=idx.src[0].dtype).load(dtype=idx.dtype.base)),
   # remove loads from stores
   (UPat(Ops.STORE, src=(UPat(Ops.LOAD),), allow_any_len=True, name="s"), lambda s: s.replace(src=(s.src[0].src[0],)+s.src[1:])),
 ])
-

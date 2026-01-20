@@ -204,8 +204,17 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
         return None
 
       case Ops.INDEX:
-        # non pointer index doesn't have a shape
-        if not isinstance(self.dtype, PtrDType): return None
+        # non pointer index doesn't have a shape unless explicitly marked as value-indexed
+        if not isinstance(self.dtype, PtrDType):
+          if self.arg != "value": return None
+          if self.src[0]._shape is None: return None
+          if len(self.src[1:]) == 0: return self.src[0].shape
+          ret_shape = []
+          for r in self.src[1:]:
+            if r.op is Ops.CONST: ret_shape.append(1)
+            elif r.op is Ops.RANGE: ret_shape.append(r.vmax + 1)
+            else: return None
+          return tuple(ret_shape)
         # fully indexed doesn't have a shape. TODO: remove this
         if self.src[0]._shape is None or len(self.src[1:]) == len(self.src[0].shape): return None
         # pointer index
@@ -371,6 +380,8 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
   def detach(self): return UOp(Ops.DETACH, self.dtype, (self,))
   def index(self, *srcs:UOp|None, ptr=False, **kwargs):
     return UOp(Ops.INDEX, kwargs.pop("dtype", self.dtype if ptr else self.dtype.base), (self,)+tuple([x for x in srcs if x is not None]), **kwargs)
+  def vindex(self, *srcs:UOp|None, **kwargs):
+    return UOp(Ops.INDEX, kwargs.pop("dtype", self.dtype.base), (self,)+tuple([x for x in srcs if x is not None]), arg="value", **kwargs)
   def __getitem__(self, idx):
     idx = argfix(idx)
     assert len(idx) == len(self.shape), f"__getitem__ shape mismatch, indexing {self.shape} with {len(idx)} args"

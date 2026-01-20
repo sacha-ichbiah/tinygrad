@@ -4,7 +4,7 @@ from tinygrad.helpers import DEVECTORIZE, TRANSCENDENTAL, SPEC, DEBUG, getenv, T
 from tinygrad.uop.ops import PatternMatcher, graph_rewrite, UOp, pm_lower_index_dtype, Ops, UPat, track_rewrites, KernelInfo, pyrender
 from tinygrad.uop.spec import type_verify, program_spec, kernel_spec
 from tinygrad.renderer import Renderer, ProgramSpec
-from tinygrad.dtype import dtypes, PtrDType
+from tinygrad.dtype import dtypes, PtrDType, ImageDType
 from tinygrad.helpers import panic
 from tinygrad.codegen.opt import Opt
 
@@ -24,6 +24,19 @@ pm_syntactic_sugar = PatternMatcher([
   # INDEX on ptr INDEX concats them
   (UPat(Ops.INDEX, name="i1").f(Ops.INDEX, name="i2", allow_any_len=True),
    lambda i1,i2: i2.replace(src=i1.src+i2.src[1:]) if isinstance(i1.dtype, PtrDType) and not isinstance(i2.dtype, PtrDType) else None),
+])
+
+def lower_value_index(x:UOp) -> UOp|None:
+  if isinstance(x.src[0].dtype, (PtrDType, ImageDType)): return None
+  def is_idx(u:UOp) -> bool:
+    if u.op in {Ops.CONST, Ops.RANGE, Ops.SPECIAL}: return True
+    if u.op is Ops.CAST and u.src[0].op in {Ops.CONST, Ops.RANGE, Ops.SPECIAL}: return True
+    return False
+  if not all(is_idx(s) for s in x.src[1:]): return None
+  return x.src[0]
+
+pm_lower_value_index = PatternMatcher([
+  (UPat(Ops.INDEX, name="x"), lower_value_index),
 ])
 
 def full_rewrite_to_sink(sink:UOp, ren:Renderer|None=None, optimize:bool=True) -> UOp:
@@ -76,6 +89,7 @@ def full_rewrite_to_sink(sink:UOp, ren:Renderer|None=None, optimize:bool=True) -
   sink = graph_rewrite(sink, pm_add_gpudims, ctx=ren, name="add gpudims")
 
   # **** optimizations are done, now we lower to actual code ****
+  sink = graph_rewrite(sink, pm_lower_value_index, name="lower value index")
 
   # add loads
   sink = graph_rewrite(sink, pm_add_loads, name="** add loads (code)")

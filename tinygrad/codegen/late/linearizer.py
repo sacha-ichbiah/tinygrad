@@ -1,7 +1,7 @@
 import heapq
 from typing import Any
 from collections import defaultdict
-from tinygrad.uop.ops import PatternMatcher, UOp, Ops, UPat, multirange_str
+from tinygrad.uop.ops import AxisType, PatternMatcher, UOp, Ops, UPat, multirange_str
 from tinygrad.helpers import prod, getenv, TUPLE_ORDER
 
 def linearize(sink:UOp) -> list[UOp]:
@@ -83,6 +83,7 @@ class CFGContext:
       zipped = zip(order, order[1:]) if k.op is Ops.SINK else zip([k.src[1]] + order, order)
       for x,y in zipped:
         # TODO: this can happen! it causes infinite loop in shufflenet
+        if x.op is Ops.RANGE and x.arg[-1] == AxisType.REDUCE: continue
         assert y.src[1] not in x.backward_slice_with_self
         self.edges[y.src[1]] = x
 
