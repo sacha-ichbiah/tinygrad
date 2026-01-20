@@ -205,7 +205,8 @@ class CapturedJit(Generic[ReturnType]):
     self.__post_init__()
 
   # jit exec
-  def __call__(self, input_buffers:list[Buffer], var_vals:dict[str, int]) -> ReturnType:
+  def __call__(self, input_buffers:list[Buffer], var_vals:dict[str, int], repeat: int = 1) -> ReturnType:
+    if repeat < 1: raise JitError("repeat must be >= 1")
     # assign inputs
     for idx, offset, device, size, dtype in self.extra_view_inputs:
       input_buffers.append(Buffer(device, size, dtype, base=input_buffers[idx], offset=offset).ensure_allocated())
@@ -230,7 +231,8 @@ class CapturedJit(Generic[ReturnType]):
       self._first_run = False
 
     if DEBUG >= 1 and len(self._jit_cache) >= 10: print(f"jit execs {len(self._jit_cache)} kernels")
-    for ei in self._jit_cache: ei.run(var_vals, jit=True)
+    for _ in range(repeat):
+      for ei in self._jit_cache: ei.run(var_vals, jit=True)
     self._clear_inputs()
     return self.ret
 
@@ -363,3 +365,11 @@ class TinyJit(Generic[ReturnType]):
 
     self.cnt += 1
     return ret
+
+  def call_repeat(self, *args, repeat: int = 1, **kwargs) -> ReturnType:
+    if self.captured is None: raise JitError("call_repeat requires a captured JIT")
+    input_buffers, var_vals, names, expected_input_info = _prepare_jit_inputs(args, kwargs)
+    if self.captured.expected_names != names: raise JitError(f"args mismatch in JIT: {self.captured.expected_names=} != {names}")
+    if self.captured.expected_input_info != expected_input_info:
+      raise JitError(f"args mismatch in JIT: {self.captured.expected_input_info=} != {expected_input_info=}")
+    return self.captured(input_buffers, var_vals, repeat=repeat)

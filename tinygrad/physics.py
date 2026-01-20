@@ -12,13 +12,35 @@ Core Philosophy:
 This is the "native language" of physics on AI hardware.
 """
 
-from tinygrad.engine.jit import TinyJit
+from tinygrad.engine.jit import TinyJit, JitError
+from tinygrad.engine.realize import capturing
+from tinygrad.helpers import getenv
 from tinygrad.tensor import Tensor
+from tinygrad.uop.ops import KernelInfo, Ops, UOp, PatternMatcher, UPat, graph_rewrite
 from typing import Callable
 
 # ============================================================================
 # CORE: HAMILTONIAN MECHANICS VIA AUTOGRAD
 # ============================================================================
+
+_grad_H_jit_cache: dict[tuple, TinyJit] = {}
+
+
+def _grad_H_key(q: Tensor, p: Tensor, H_func) -> tuple:
+    return (H_func, q.shape, p.shape, q.dtype, p.dtype, q.device, p.device)
+
+
+def _grad_H_compute(q: Tensor, p: Tensor, H_func) -> tuple[Tensor, Tensor]:
+    q_grad = q.detach().requires_grad_(True)
+    p_grad = p.detach().requires_grad_(True)
+
+    H = H_func(q_grad, p_grad)
+    H.backward()
+
+    dHdq = q_grad.grad.detach() if q_grad.grad is not None else q * 0
+    dHdp = p_grad.grad.detach() if p_grad.grad is not None else p * 0
+    return dHdq, dHdp
+
 
 def _grad_H(q: Tensor, p: Tensor, H_func) -> tuple[Tensor, Tensor]:
     """
@@ -30,16 +52,25 @@ def _grad_H(q: Tensor, p: Tensor, H_func) -> tuple[Tensor, Tensor]:
         dq/dt = +dH/dp  (velocity)
         dp/dt = -dH/dq  (force = negative gradient of energy)
     """
-    q_grad = q.detach().requires_grad_(True)
-    p_grad = p.detach().requires_grad_(True)
+    if not getenv("TINYGRAD_GRADH_JIT", 1):
+        return _grad_H_compute(q, p, H_func)
+    if capturing:
+        return _grad_H_compute(q, p, H_func)
 
-    H = H_func(q_grad, p_grad)
-    H.backward()
+    q_use = q.contiguous().realize()
+    p_use = p.contiguous().realize()
+    key = _grad_H_key(q_use, p_use, H_func)
+    jit = _grad_H_jit_cache.get(key)
+    if jit is None:
+        def grad_fn(q_in: Tensor, p_in: Tensor) -> tuple[Tensor, Tensor]:
+            return _grad_H_compute(q_in, p_in, H_func)
+        jit = _grad_H_jit_cache.setdefault(key, TinyJit(grad_fn))
 
-    dHdq = q_grad.grad.detach() if q_grad.grad is not None else q * 0
-    dHdp = p_grad.grad.detach() if p_grad.grad is not None else p * 0
-
-    return dHdq, dHdp
+    try:
+        return jit(q_use, p_use)
+    except JitError:
+        _grad_H_jit_cache.pop(key, None)
+        return _grad_H_compute(q_use, p_use, H_func)
 
 
 # ============================================================================
@@ -137,9 +168,18 @@ class HamiltonianSystem:
         self._step = self.INTEGRATORS[integrator]
         self.integrator_name = integrator
         self._jit_step = TinyJit(self.step)
+        self._jit_step_inplace = TinyJit(self.step_inplace)
+        self._scan_kernel_cache: dict[tuple[float, int, str, tuple[int, ...], object], Callable] = {}
 
     def step(self, q: Tensor, p: Tensor, dt: float = 0.01) -> tuple[Tensor, Tensor]:
         return self._step(q, p, self.H, dt)
+
+    def step_inplace(self, q: Tensor, p: Tensor, dt: float = 0.01) -> tuple[Tensor, Tensor]:
+        """In-place step for scan loops; updates q and p buffers via assign."""
+        q_new, p_new = self.step(q, p, dt)
+        q.assign(q_new)
+        p.assign(p_new)
+        return q, p
 
     def energy(self, q: Tensor, p: Tensor) -> float:
         return float(self.H(q, p).numpy())
@@ -175,11 +215,21 @@ class HamiltonianSystem:
             return self.evolve(q, p, dt, steps, record_every=record_every)
         if q.requires_grad or p.requires_grad:
             return self.evolve(q, p, dt, steps, record_every=record_every)
+        if self.integrator_name == "leapfrog" and scan >= steps and record_every >= steps and q.shape == p.shape:
+            return self.evolve_scan_kernel(q, p, dt, steps)
 
         q_history: list[Tensor] = []
         p_history: list[Tensor] = []
         step_single = self._jit_step
-        step_unrolled = self.compile_unrolled_step(dt, scan)
+        q_start = q.detach()
+        p_start = p.detach()
+        step_scanned = self._jit_step_inplace
+
+        if step_scanned.captured is None:
+            q_tmp = q.detach()
+            p_tmp = p.detach()
+            step_scanned(q_tmp, p_tmp, dt)
+            step_scanned(q_tmp, p_tmp, dt)
 
         next_record = 0
         i = 0
@@ -195,7 +245,7 @@ class HamiltonianSystem:
                 q, p = step_single(q, p, dt)
                 i += 1
             else:
-                q, p = step_unrolled(q, p)
+                step_scanned.call_repeat(q, p, dt, repeat=scan)
                 i += scan
 
         q_history.append(q.detach())
@@ -209,6 +259,112 @@ class HamiltonianSystem:
             history.append((q_np, p_np, e))
 
         return q, p, history
+
+    def evolve_scan_kernel(self, q: Tensor, p: Tensor, dt: float, steps: int, coupled: bool = False) -> tuple[Tensor, Tensor, list]:
+        """Single-kernel scan for leapfrog with static steps (elementwise H)."""
+        if self.integrator_name != "leapfrog":
+            raise ValueError("scan kernel only supports leapfrog")
+        if q.requires_grad or p.requires_grad:
+            raise ValueError("scan kernel does not support gradients")
+        if q.shape != p.shape:
+            raise ValueError("scan kernel requires q and p with the same shape")
+        if q.dtype != p.dtype:
+            raise ValueError("scan kernel requires q and p with the same dtype")
+        if coupled:
+            return self.evolve_scan_kernel_coupled(q, p, dt, steps)
+        q = q.contiguous().realize()
+        p = p.contiguous().realize()
+
+        if q.device != p.device:
+            raise ValueError("scan kernel requires q and p on the same device")
+
+        key = (dt, steps, q.device, q.shape, q.dtype)
+        kernel = self._scan_kernel_cache.get(key)
+        if kernel is None:
+            kernel = self._build_leapfrog_scan_kernel(dt, steps, q.device, q.shape, q.dtype)
+            self._scan_kernel_cache[key] = kernel
+
+        q_start = q.detach()
+        p_start = p.detach()
+        q, p = Tensor.custom_kernel(q, p, fxn=kernel)[:2]
+        Tensor.realize(q, p)
+
+        history = []
+        history.append((q_start.numpy().copy(), p_start.numpy().copy(), self.energy(q_start, p_start)))
+        history.append((q.numpy().copy(), p.numpy().copy(), self.energy(q, p)))
+        return q, p, history
+
+    def evolve_scan_kernel_coupled(self, q: Tensor, p: Tensor, dt: float, steps: int) -> tuple[Tensor, Tensor, list]:
+        """Static-step scan for coupled Hamiltonians (multi-kernel, slower)."""
+        if self.integrator_name != "leapfrog":
+            raise ValueError("scan kernel only supports leapfrog")
+        if q.requires_grad or p.requires_grad:
+            raise ValueError("scan kernel does not support gradients")
+        if q.shape != p.shape:
+            raise ValueError("scan kernel requires q and p with the same shape")
+        if q.dtype != p.dtype:
+            raise ValueError("scan kernel requires q and p with the same dtype")
+        q = q.contiguous().realize()
+        p = p.contiguous().realize()
+        if q.device != p.device:
+            raise ValueError("scan kernel requires q and p on the same device")
+
+        q_start = q.detach()
+        p_start = p.detach()
+        step_scanned = self._jit_step_inplace
+        if step_scanned.captured is None:
+            q_tmp = Tensor(q.numpy().copy(), device=q.device)
+            p_tmp = Tensor(p.numpy().copy(), device=p.device)
+            step_scanned(q_tmp, p_tmp, dt)
+            step_scanned(q_tmp, p_tmp, dt)
+        step_scanned.call_repeat(q, p, dt, repeat=steps)
+        Tensor.realize(q, p)
+
+        history = []
+        history.append((q_start.numpy().copy(), p_start.numpy().copy(), self.energy(q_start, p_start)))
+        history.append((q.detach().numpy().copy(), p.detach().numpy().copy(), self.energy(q, p)))
+        return q, p, history
+
+    def _build_leapfrog_scan_kernel(self, dt: float, steps: int, device: str, shape: tuple[int, ...], dtype) -> Callable:
+        q_sym = Tensor.empty((), device=device, dtype=dtype, requires_grad=True)
+        p_sym = Tensor.empty((), device=device, dtype=dtype, requires_grad=True)
+        H_sym = self.H(q_sym, p_sym)
+        dHdq_sym, dHdp_sym = H_sym.gradient(q_sym, p_sym)
+        strip_device_consts = PatternMatcher([
+            (UPat(Ops.CONST, src=(UPat(Ops.DEVICE),), name="c"), lambda c: UOp.const(c.dtype, c.arg)),
+        ])
+        dHdq_uop = graph_rewrite(dHdq_sym.uop, strip_device_consts, name="strip_device_consts")
+        dHdp_uop = graph_rewrite(dHdp_sym.uop, strip_device_consts, name="strip_device_consts")
+
+        def grad_uop(q_uop: UOp, p_uop: UOp) -> tuple[UOp, UOp]:
+            sub = {q_sym.uop: q_uop, p_sym.uop: p_uop}
+            return dHdq_uop.substitute(sub), dHdp_uop.substitute(sub)
+
+        def kernel(q: UOp, p: UOp) -> UOp:
+            step = UOp.range(steps, 0)
+            q_step = q.after(step)
+            p_step = p.after(step)
+
+            q_flat = q_step.flatten()
+            p_flat = p_step.flatten()
+            idx = UOp.range(q_flat.size, 1)
+            q_elem = q_flat.after(step)[idx]
+            p_elem = p_flat.after(step)[idx]
+
+            dHdq_1, _ = grad_uop(q_elem, p_elem)
+            dt_uop = dHdq_1.const_like(dt)
+            half_dt = dHdq_1.const_like(0.5*dt)
+            p_half = p_elem - half_dt * dHdq_1
+            _, dHdp = grad_uop(q_elem, p_half)
+            q_new = q_elem + dt_uop * dHdp
+            dHdq_2, _ = grad_uop(q_new, p_half)
+            p_new = p_half - half_dt * dHdq_2
+
+            store_q = q_flat.after(step)[idx].store(q_new)
+            store_p = p_flat.after(step)[idx].store(p_new)
+            return UOp.group(store_q, store_p).end(idx, step).sink(arg=KernelInfo(name=f"leapfrog_scan_{steps}", opts_to_apply=()))
+
+        return kernel
 
     def compile_unrolled_step(self, dt: float, unroll: int):
         """Prototype unroll/scan by compiling N steps into one captured graph."""
@@ -278,25 +434,6 @@ def fast_yoshida4(q: Tensor, p: Tensor, dHdq_func: Callable, dHdp_func: Callable
     q, p = substep(q, p, _W0 * dt)
     q, p = substep(q, p, _W1 * dt)
     return q.realize(), p.realize()
-
-
-class FastHamiltonianSystem:
-    """Fast Hamiltonian system using analytical gradients."""
-    INTEGRATORS = {"leapfrog": fast_leapfrog, "yoshida4": fast_yoshida4}
-
-    def __init__(self, H_func: Callable, dHdq_func: Callable, dHdp_func: Callable,
-                 integrator: str = "leapfrog"):
-        self.H, self.dHdq, self.dHdp = H_func, dHdq_func, dHdp_func
-        if integrator not in self.INTEGRATORS:
-            raise ValueError(f"Unknown integrator: {integrator}")
-        self._step_func = self.INTEGRATORS[integrator]
-        self.integrator_name = integrator
-
-    def step(self, q: Tensor, p: Tensor, dt: float = 0.01) -> tuple[Tensor, Tensor]:
-        return self._step_func(q, p, self.dHdq, self.dHdp, dt)
-
-    def energy(self, q: Tensor, p: Tensor) -> float:
-        return float(self.H(q, p).numpy())
 
 
 # ============================================================================
