@@ -149,12 +149,54 @@ class HamiltonianSystem:
         q_history: list[Tensor] = []
         p_history: list[Tensor] = []
 
-        step = self._jit_step
+        step = self._jit_step if not (q.requires_grad or p.requires_grad) else self.step
         for i in range(steps):
             if i % record_every == 0:
                 q_history.append(q.detach())
                 p_history.append(p.detach())
             q, p = step(q, p, dt)
+
+        q_history.append(q.detach())
+        p_history.append(p.detach())
+
+        history = []
+        for q_t, p_t in zip(q_history, p_history):
+            q_np = q_t.numpy().copy()
+            p_np = p_t.numpy().copy()
+            e = float(self.H(q_t, p_t).numpy())
+            history.append((q_np, p_np, e))
+
+        return q, p, history
+
+    def evolve_scan(self, q: Tensor, p: Tensor, dt: float, steps: int, scan: int = 8,
+                    record_every: int = 1) -> tuple[Tensor, Tensor, list]:
+        """Higher-level scan API: unrolls multiple steps while preserving record cadence."""
+        if scan <= 1:
+            return self.evolve(q, p, dt, steps, record_every=record_every)
+        if q.requires_grad or p.requires_grad:
+            return self.evolve(q, p, dt, steps, record_every=record_every)
+
+        q_history: list[Tensor] = []
+        p_history: list[Tensor] = []
+        step_single = self._jit_step
+        step_unrolled = self.compile_unrolled_step(dt, scan)
+
+        next_record = 0
+        i = 0
+        while i < steps:
+            if i == next_record:
+                q_history.append(q.detach())
+                p_history.append(p.detach())
+                next_record += record_every
+
+            remaining = steps - i
+            to_record = next_record - i if next_record <= steps else remaining
+            if remaining < scan or to_record < scan:
+                q, p = step_single(q, p, dt)
+                i += 1
+            else:
+                q, p = step_unrolled(q, p)
+                i += scan
 
         q_history.append(q.detach())
         p_history.append(p.detach())

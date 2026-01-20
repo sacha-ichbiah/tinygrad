@@ -55,7 +55,7 @@ def harmonic_hamiltonian(k: float = 1.0, m: float = 1.0):
 # SIMULATION
 # ============================================================================
 
-def run_simulation(integrator="yoshida4"):
+def run_simulation(integrator="yoshida4", scan: int = 1):
     """
     Simulate a harmonic oscillator using the TinyPhysics compiler approach.
     """
@@ -92,7 +92,7 @@ def run_simulation(integrator="yoshida4"):
     print(f"\nInitial: q={q.numpy()[0]:.4f}, p={p.numpy()[0]:.4f}, E={E_start:.6f}")
 
     # EVOLVE
-    q, p, history = system.evolve(q, p, dt=dt, steps=steps, record_every=1)
+    q, p, history = system.evolve_scan(q, p, dt=dt, steps=steps, scan=scan, record_every=1)
 
     # Final state
     E_end = system.energy(q, p)
@@ -142,21 +142,33 @@ def compare_integrators():
         print(f"  {name:12s}: {drift:.2e}")
 
 
-def benchmark(integrator: str = "yoshida4", steps: int = 20000, repeats: int = 5, jit: bool = False):
+def benchmark(integrator: str = "yoshida4", steps: int = 20000, repeats: int = 5,
+              jit: bool = False, unroll: int = 1):
     """Micro-benchmark for autograd-based harmonic oscillator step speed."""
     k, m, dt = 1.0, 1.0, 0.01
     H = harmonic_hamiltonian(k=k, m=m)
     system = HamiltonianSystem(H, integrator=integrator)
+    if unroll > 1 and steps % unroll != 0:
+        raise ValueError("steps must be divisible by unroll")
 
     def bench_once(use_jit: bool) -> float:
         q = Tensor([1.0], requires_grad=True)
         p = Tensor([0.0], requires_grad=True)
-        step = TinyJit(system.step) if use_jit else system.step
-        if use_jit:
-            q, p = step(q, p, dt)
+        if unroll > 1:
+            step = system.compile_unrolled_step(dt, unroll)
+            q, p = step(q, p)
+            steps_per_call = unroll
+        else:
+            step = TinyJit(system.step) if use_jit else system.step
+            if use_jit:
+                q, p = step(q, p, dt)
+            steps_per_call = 1
         start = time.perf_counter()
-        for _ in range(steps):
-            q, p = step(q, p, dt)
+        for _ in range(steps // steps_per_call):
+            if unroll > 1:
+                q, p = step(q, p)
+            else:
+                q, p = step(q, p, dt)
         q.numpy()
         p.numpy()
         return time.perf_counter() - start
@@ -164,11 +176,16 @@ def benchmark(integrator: str = "yoshida4", steps: int = 20000, repeats: int = 5
     print("=" * 60)
     print("HARMONIC OSCILLATOR BENCHMARK (AUTOGRAD)")
     print("=" * 60)
-    print(f"Integrator: {integrator}, steps: {steps}, repeats: {repeats}")
+    print(f"Integrator: {integrator}, steps: {steps}, repeats: {repeats}, unroll: {unroll}")
 
     times = [bench_once(jit) for _ in range(repeats)]
     best = min(times)
-    print(f"{'autograd' + (' + TinyJit' if jit else ''):28s}: {best*1e3:.2f} ms  ({steps/best:,.0f} steps/s)")
+    label = "autograd"
+    if unroll > 1:
+        label += f" + unroll={unroll} + TinyJit"
+    elif jit:
+        label += " + TinyJit"
+    print(f"{label:28s}: {best*1e3:.2f} ms  ({steps/best:,.0f} steps/s)")
 
 
 def _parse_integrator(args, default="yoshida4"):
@@ -193,9 +210,11 @@ if __name__ == "__main__":
         integrator = _parse_integrator(args)
         steps = _parse_int_flag(args, "steps", 20000)
         repeats = _parse_int_flag(args, "repeats", 5)
-        benchmark(integrator=integrator, steps=steps, repeats=repeats, jit="--jit" in args)
+        unroll = _parse_int_flag(args, "unroll", 1)
+        benchmark(integrator=integrator, steps=steps, repeats=repeats, jit="--jit" in args, unroll=unroll)
     elif "--compare" in args:
         compare_integrators()
     else:
         integrator = _parse_integrator(args)
-        run_simulation(integrator)
+        scan = _parse_int_flag(args, "scan", 1)
+        run_simulation(integrator, scan=scan)
