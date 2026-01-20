@@ -12,6 +12,7 @@ Core Philosophy:
 This is the "native language" of physics on AI hardware.
 """
 
+from tinygrad.engine.jit import TinyJit
 from tinygrad.tensor import Tensor
 from typing import Callable
 
@@ -135,6 +136,7 @@ class HamiltonianSystem:
             raise ValueError(f"Unknown integrator: {integrator}")
         self._step = self.INTEGRATORS[integrator]
         self.integrator_name = integrator
+        self._jit_step = TinyJit(self.step)
 
     def step(self, q: Tensor, p: Tensor, dt: float = 0.01) -> tuple[Tensor, Tensor]:
         return self._step(q, p, self.H, dt)
@@ -147,11 +149,54 @@ class HamiltonianSystem:
         q_history: list[Tensor] = []
         p_history: list[Tensor] = []
 
+        step = self._jit_step
         for i in range(steps):
             if i % record_every == 0:
                 q_history.append(q.detach())
                 p_history.append(p.detach())
-            q, p = self.step(q, p, dt)
+            q, p = step(q, p, dt)
+
+        q_history.append(q.detach())
+        p_history.append(p.detach())
+
+        history = []
+        for q_t, p_t in zip(q_history, p_history):
+            q_np = q_t.numpy().copy()
+            p_np = p_t.numpy().copy()
+            e = float(self.H(q_t, p_t).numpy())
+            history.append((q_np, p_np, e))
+
+        return q, p, history
+
+    def compile_unrolled_step(self, dt: float, unroll: int):
+        """Prototype unroll/scan by compiling N steps into one captured graph."""
+        if unroll < 1:
+            raise ValueError("unroll must be >= 1")
+
+        def unrolled_step(q: Tensor, p: Tensor):
+            for _ in range(unroll):
+                q, p = self.step(q, p, dt)
+            return q, p
+
+        return TinyJit(unrolled_step)
+
+    def evolve_unrolled(self, q: Tensor, p: Tensor, dt: float, steps: int, unroll: int = 8,
+                        record_every: int = 1) -> tuple[Tensor, Tensor, list]:
+        """Prototype unrolled evolution; records at unroll boundaries only."""
+        if steps % unroll != 0:
+            raise ValueError("steps must be divisible by unroll")
+        if record_every % unroll != 0:
+            raise ValueError("record_every must be divisible by unroll")
+
+        q_history: list[Tensor] = []
+        p_history: list[Tensor] = []
+        step = self.compile_unrolled_step(dt, unroll)
+
+        for i in range(0, steps, unroll):
+            if i % record_every == 0:
+                q_history.append(q.detach())
+                p_history.append(p.detach())
+            q, p = step(q, p)
 
         q_history.append(q.detach())
         p_history.append(p.detach())
@@ -914,6 +959,1173 @@ class QuantumSystem:
         history.append((x_np.copy(), prob.copy(), n, w, x_mean, e))
 
         return psi_real, psi_imag, history
+
+    def imaginary_time_step(self, psi_real: Tensor, psi_imag: Tensor,
+                            dtau: float) -> tuple[Tensor, Tensor]:
+        """
+        Imaginary time evolution: ψ(τ+dτ) = e^(-Ĥdτ/ℏ)ψ(τ) / norm
+
+        Wick rotation t → -iτ turns Schrödinger into diffusion equation.
+        Higher energy states decay faster → relaxes to ground state.
+
+        Must renormalize after each step (evolution is not unitary).
+        """
+        if self.V is None:
+            # Free particle
+            psi_k_r, psi_k_i = fft(psi_real, psi_imag)
+            # Kinetic decay: e^(-ℏk²dτ/2m) is real
+            decay = (-self.hbar * self.k * self.k * dtau / (2 * self.m)).exp()
+            psi_k_r = psi_k_r * decay
+            psi_k_i = psi_k_i * decay
+            psi_real, psi_imag = ifft(psi_k_r, psi_k_i)
+        else:
+            # Strang splitting with real exponential decay
+            # Half step potential: e^(-Vdτ/2ℏ)
+            decay_V_half = (-self.V * dtau / (2 * self.hbar)).exp()
+            psi_real = psi_real * decay_V_half
+            psi_imag = psi_imag * decay_V_half
+
+            # Full step kinetic in momentum space
+            psi_k_r, psi_k_i = fft(psi_real, psi_imag)
+            decay_T = (-self.hbar * self.k * self.k * dtau / (2 * self.m)).exp()
+            psi_k_r = psi_k_r * decay_T
+            psi_k_i = psi_k_i * decay_T
+            psi_real, psi_imag = ifft(psi_k_r, psi_k_i)
+
+            # Half step potential
+            psi_real = psi_real * decay_V_half
+            psi_imag = psi_imag * decay_V_half
+
+        # Renormalize (critical for imaginary time!)
+        psi_real, psi_imag = normalize_wavefunction(psi_real, psi_imag, self.dx)
+        return psi_real.realize(), psi_imag.realize()
+
+    def find_ground_state(self, psi_real: Tensor, psi_imag: Tensor,
+                          dtau: float = 0.01, steps: int = 1000,
+                          tol: float = 1e-10, record_every: int = 10) -> tuple[Tensor, Tensor, list]:
+        """
+        Find ground state via imaginary time evolution.
+
+        Args:
+            psi_real, psi_imag: Initial guess (any state with ground state overlap)
+            dtau: Imaginary time step
+            steps: Maximum steps
+            tol: Energy convergence tolerance
+            record_every: Record history every N steps
+
+        Returns:
+            (psi_real, psi_imag, history) where history contains
+            (prob_array, energy, width) for each recorded step.
+        """
+        history = []
+        x_np = self.x.numpy()
+        E_prev = self.energy(psi_real, psi_imag)
+
+        for i in range(steps):
+            if i % record_every == 0:
+                prob = self.probability_density(psi_real, psi_imag).numpy()
+                E = self.energy(psi_real, psi_imag)
+                w = self.width(psi_real, psi_imag)
+                history.append((x_np.copy(), prob.copy(), E, w))
+
+            psi_real, psi_imag = self.imaginary_time_step(psi_real, psi_imag, dtau)
+
+            # Check convergence
+            if i % record_every == 0 and i > 0:
+                E_new = self.energy(psi_real, psi_imag)
+                if abs(E_new - E_prev) < tol:
+                    break
+                E_prev = E_new
+
+        # Record final state
+        prob = self.probability_density(psi_real, psi_imag).numpy()
+        E = self.energy(psi_real, psi_imag)
+        w = self.width(psi_real, psi_imag)
+        history.append((x_np.copy(), prob.copy(), E, w))
+
+        return psi_real, psi_imag, history
+
+    def harmonic_potential(self, omega: float = 1.0) -> Tensor:
+        """Create harmonic oscillator potential: V(x) = ½mω²x²"""
+        return 0.5 * self.m * omega**2 * self.x * self.x
+
+    def ground_state_exact(self, omega: float = 1.0) -> tuple[Tensor, Tensor, float]:
+        """
+        Exact ground state of harmonic oscillator.
+
+        ψ₀(x) = (mω/πℏ)^(1/4) exp(-mωx²/2ℏ)
+        E₀ = ℏω/2
+
+        Returns:
+            (psi_real, psi_imag, E0)
+        """
+        x_np = self.x.numpy()
+        alpha = self.m * omega / self.hbar
+        norm = (alpha / np.pi) ** 0.25
+        psi = norm * np.exp(-alpha * x_np**2 / 2)
+        E0 = self.hbar * omega / 2
+        return Tensor(psi), Tensor(np.zeros_like(psi)), E0
+
+
+# ============================================================================
+# ISING MODEL (Phase 5: Statistical Mechanics)
+# ============================================================================
+#
+# The Ising model describes interacting spins on a lattice:
+#
+#     H = -J Σ_{<i,j>} s_i s_j - h Σ_i s_i
+#
+# where s_i ∈ {+1, -1} are discrete spins, J is the coupling constant,
+# h is the external magnetic field, and <i,j> denotes nearest neighbors.
+#
+# For J > 0 (ferromagnetic), aligned spins are favored.
+# The 2D Ising model exhibits a phase transition at T_c ≈ 2.269 J/k_B.
+#
+# Unlike continuous Hamiltonian systems, the Ising model evolves via
+# stochastic Monte Carlo dynamics (Metropolis algorithm) to sample
+# from the Boltzmann distribution P(s) ∝ exp(-H/k_B T).
+
+
+def ising_energy(spins: Tensor, J: float = 1.0, h: float = 0.0) -> float:
+    """
+    Compute the Ising model Hamiltonian for a 2D lattice.
+
+    H = -J Σ_{<i,j>} s_i s_j - h Σ_i s_i
+
+    Uses periodic boundary conditions.
+
+    Args:
+        spins: Tensor of shape (L, L) with values +1 or -1
+        J: Coupling constant (J > 0 for ferromagnetic)
+        h: External magnetic field
+
+    Returns:
+        Total energy of the configuration
+    """
+    # Nearest neighbor interactions (periodic boundary conditions)
+    # Shift right and down to get neighbors
+    spins_np = spins.numpy()
+    L = spins_np.shape[0]
+
+    # Sum over all nearest-neighbor pairs
+    interaction = (
+        spins_np * np.roll(spins_np, 1, axis=0) +  # up neighbor
+        spins_np * np.roll(spins_np, 1, axis=1)    # left neighbor
+    )
+
+    H = -J * interaction.sum() - h * spins_np.sum()
+    return float(H)
+
+
+def ising_magnetization(spins: Tensor) -> float:
+    """
+    Compute the magnetization per spin: m = (1/N) Σ s_i
+
+    Returns value in [-1, 1]. |m| → 1 means ordered (ferromagnetic),
+    m → 0 means disordered (paramagnetic).
+    """
+    return float(spins.numpy().mean())
+
+
+def ising_magnetization_abs(spins: Tensor) -> float:
+    """Compute the absolute magnetization per spin: |m|"""
+    return abs(ising_magnetization(spins))
+
+
+def metropolis_step(spins: Tensor, beta: float, J: float = 1.0,
+                    h: float = 0.0) -> Tensor:
+    """
+    One Metropolis Monte Carlo sweep over all spins.
+
+    For each spin, propose a flip and accept with probability:
+        P_accept = min(1, exp(-β ΔE))
+
+    where ΔE is the energy change from flipping that spin.
+
+    Args:
+        spins: Current spin configuration (L, L)
+        beta: Inverse temperature β = 1/(k_B T)
+        J: Coupling constant
+        h: External magnetic field
+
+    Returns:
+        Updated spin configuration
+    """
+    spins_np = spins.numpy().copy()
+    L = spins_np.shape[0]
+
+    # For 2D Ising, ΔE for flipping spin s_i = 2 s_i (J Σ_neighbors s_j + h)
+    for _ in range(L * L):
+        # Pick random site
+        i, j = np.random.randint(0, L), np.random.randint(0, L)
+        s = spins_np[i, j]
+
+        # Sum of neighbors (periodic boundary conditions)
+        neighbors_sum = (
+            spins_np[(i + 1) % L, j] +
+            spins_np[(i - 1) % L, j] +
+            spins_np[i, (j + 1) % L] +
+            spins_np[i, (j - 1) % L]
+        )
+
+        # Energy change from flipping spin
+        delta_E = 2 * s * (J * neighbors_sum + h)
+
+        # Metropolis acceptance
+        if delta_E <= 0 or np.random.random() < np.exp(-beta * delta_E):
+            spins_np[i, j] = -s
+
+    return Tensor(spins_np)
+
+
+def wolff_step(spins: Tensor, beta: float, J: float = 1.0) -> Tensor:
+    """
+    One Wolff cluster flip step (faster near critical temperature).
+
+    The Wolff algorithm builds a cluster of aligned spins with probability
+    P_add = 1 - exp(-2βJ) and flips the entire cluster. This dramatically
+    reduces critical slowing down near T_c.
+
+    Args:
+        spins: Current spin configuration (L, L)
+        beta: Inverse temperature β = 1/(k_B T)
+        J: Coupling constant
+
+    Returns:
+        Updated spin configuration
+
+    Note: External field h is not supported in Wolff algorithm.
+    """
+    spins_np = spins.numpy().copy()
+    L = spins_np.shape[0]
+
+    # Probability to add neighbor to cluster
+    p_add = 1.0 - np.exp(-2 * beta * J)
+
+    # Pick random seed spin
+    i0, j0 = np.random.randint(0, L), np.random.randint(0, L)
+    seed_spin = spins_np[i0, j0]
+
+    # Build cluster using BFS
+    cluster = {(i0, j0)}
+    frontier = [(i0, j0)]
+
+    while frontier:
+        i, j = frontier.pop()
+        for di, dj in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+            ni, nj = (i + di) % L, (j + dj) % L
+            if (ni, nj) not in cluster and spins_np[ni, nj] == seed_spin:
+                if np.random.random() < p_add:
+                    cluster.add((ni, nj))
+                    frontier.append((ni, nj))
+
+    # Flip all spins in cluster
+    for i, j in cluster:
+        spins_np[i, j] = -spins_np[i, j]
+
+    return Tensor(spins_np)
+
+
+class IsingSystem:
+    """
+    2D Ising model on a square lattice with periodic boundary conditions.
+
+    The Ising model is the "Hello World" of statistical mechanics:
+        H = -J Σ_{<i,j>} s_i s_j - h Σ_i s_i
+
+    Unlike continuous Hamiltonian systems, the Ising model evolves via
+    stochastic Monte Carlo dynamics to sample the Boltzmann distribution.
+
+    The system exhibits a phase transition:
+        - T < T_c: Ordered (ferromagnetic), |m| ≈ 1
+        - T > T_c: Disordered (paramagnetic), m ≈ 0
+        - T_c = 2 / ln(1 + √2) ≈ 2.269 (for J = k_B = 1)
+
+    Example:
+        system = IsingSystem(L=32, J=1.0, h=0.0, T=2.0)
+        spins = system.random_spins()  # Start hot (random)
+        for _ in range(1000):
+            spins = system.step(spins)  # Equilibrate
+        print(f"Magnetization: {system.magnetization(spins):.3f}")
+    """
+
+    # Critical temperature for 2D Ising model (exact, Onsager 1944)
+    T_CRITICAL = 2.0 / np.log(1 + np.sqrt(2))  # ≈ 2.269
+
+    ALGORITHMS = {"metropolis": metropolis_step, "wolff": wolff_step}
+
+    def __init__(self, L: int, J: float = 1.0, h: float = 0.0, T: float = 2.0,
+                 algorithm: str = "metropolis"):
+        """
+        Initialize Ising system.
+
+        Args:
+            L: Lattice size (L × L spins)
+            J: Coupling constant (J > 0 for ferromagnetic)
+            h: External magnetic field
+            T: Temperature (in units where k_B = 1)
+            algorithm: "metropolis" or "wolff"
+        """
+        self.L = L
+        self.J = J
+        self.h = h
+        self.T = T
+        self.beta = 1.0 / T
+
+        if algorithm not in self.ALGORITHMS:
+            raise ValueError(f"Unknown algorithm: {algorithm}. Use: {list(self.ALGORITHMS.keys())}")
+        if algorithm == "wolff" and h != 0:
+            raise ValueError("Wolff algorithm does not support external field h ≠ 0")
+        self._step_func = self.ALGORITHMS[algorithm]
+        self.algorithm_name = algorithm
+
+    def random_spins(self) -> Tensor:
+        """Create random (hot) initial configuration."""
+        return Tensor(np.random.choice([-1, 1], size=(self.L, self.L)).astype(np.float32))
+
+    def uniform_spins(self, value: int = 1) -> Tensor:
+        """Create uniform (cold) initial configuration."""
+        return Tensor(np.full((self.L, self.L), value, dtype=np.float32))
+
+    def step(self, spins: Tensor) -> Tensor:
+        """Perform one Monte Carlo step."""
+        if self.algorithm_name == "wolff":
+            return self._step_func(spins, self.beta, self.J)
+        return self._step_func(spins, self.beta, self.J, self.h)
+
+    def set_temperature(self, T: float):
+        """Change the temperature."""
+        self.T = T
+        self.beta = 1.0 / T
+
+    def energy(self, spins: Tensor) -> float:
+        """Compute total energy H."""
+        return ising_energy(spins, self.J, self.h)
+
+    def energy_per_spin(self, spins: Tensor) -> float:
+        """Compute energy per spin: E/N."""
+        return self.energy(spins) / (self.L * self.L)
+
+    def magnetization(self, spins: Tensor) -> float:
+        """Compute magnetization per spin: m = (1/N) Σ s_i."""
+        return ising_magnetization(spins)
+
+    def magnetization_abs(self, spins: Tensor) -> float:
+        """Compute absolute magnetization per spin: |m|."""
+        return ising_magnetization_abs(spins)
+
+    def evolve(self, spins: Tensor, steps: int, record_every: int = 1,
+               warmup: int = 0) -> tuple[Tensor, list]:
+        """
+        Evolve the system and record history.
+
+        Args:
+            spins: Initial spin configuration
+            steps: Number of Monte Carlo steps
+            record_every: Record every N steps
+            warmup: Number of initial steps to skip (thermalization)
+
+        Returns:
+            (final_spins, history) where history contains
+            (spins_array, energy, magnetization) for each recorded step.
+        """
+        # Warmup (thermalization)
+        for _ in range(warmup):
+            spins = self.step(spins)
+
+        history = []
+        for i in range(steps):
+            if i % record_every == 0:
+                spins_np = spins.numpy().copy()
+                e = self.energy_per_spin(spins)
+                m = self.magnetization_abs(spins)
+                history.append((spins_np, e, m))
+            spins = self.step(spins)
+
+        # Record final state
+        spins_np = spins.numpy().copy()
+        e = self.energy_per_spin(spins)
+        m = self.magnetization_abs(spins)
+        history.append((spins_np, e, m))
+
+        return spins, history
+
+    def measure(self, spins: Tensor, steps: int, warmup: int = 100) -> dict:
+        """
+        Measure thermal averages after equilibration.
+
+        Returns dict with <E>, <E²>, <|m|>, <m²>, specific heat C, susceptibility χ.
+        """
+        # Thermalize
+        for _ in range(warmup):
+            spins = self.step(spins)
+
+        E_vals, M_vals = [], []
+        for _ in range(steps):
+            spins = self.step(spins)
+            E_vals.append(self.energy_per_spin(spins))
+            M_vals.append(self.magnetization_abs(spins))
+
+        E_mean = np.mean(E_vals)
+        E2_mean = np.mean(np.array(E_vals) ** 2)
+        M_mean = np.mean(M_vals)
+        M2_mean = np.mean(np.array(M_vals) ** 2)
+
+        N = self.L * self.L
+        # Specific heat: C = (β²/N) * (<E²> - <E>²)
+        C = (self.beta ** 2) * N * (E2_mean - E_mean ** 2)
+        # Susceptibility: χ = β * N * (<m²> - <m>²)
+        chi = self.beta * N * (M2_mean - M_mean ** 2)
+
+        return {
+            "E_mean": E_mean,
+            "E2_mean": E2_mean,
+            "M_mean": M_mean,
+            "M2_mean": M2_mean,
+            "specific_heat": C,
+            "susceptibility": chi,
+            "temperature": self.T,
+        }
+
+
+# ============================================================================
+# CONTINUOUS SPIN ISING (Soft Spins with Hamiltonian Dynamics)
+# ============================================================================
+#
+# For autograd-friendly Ising dynamics, we can use continuous "soft spins"
+# σ ∈ ℝ with a double-well potential that pushes them toward ±1:
+#
+#     H = Σ_i p_i²/2 + λ Σ_i (σ_i² - 1)² - J Σ_{<i,j>} σ_i σ_j - h Σ_i σ_i
+#
+# This gives Hamiltonian dynamics that relaxes toward Ising-like states.
+
+
+def soft_ising_hamiltonian(L: int, J: float = 1.0, h: float = 0.0, lam: float = 1.0):
+    """
+    Create a Hamiltonian for continuous (soft) spins on a 2D lattice.
+
+    H = Σ p²/2m + λ Σ(σ² - 1)² - J Σ_{<i,j>} σ_i σ_j - h Σ σ
+
+    The λ(σ² - 1)² term is a double-well potential pushing spins toward ±1.
+
+    Args:
+        L: Lattice size (L × L)
+        J: Coupling constant
+        h: External field
+        lam: Double-well strength (larger = more discrete-like)
+
+    Returns:
+        H_func(q, p) for use with HamiltonianSystem
+    """
+    def H(q: Tensor, p: Tensor) -> Tensor:
+        # q is flattened (L*L,), reshape to (L, L)
+        sigma = q.reshape(L, L)
+
+        # Kinetic energy
+        T = 0.5 * (p * p).sum()
+
+        # Double-well potential: pushes σ toward ±1
+        V_well = lam * ((sigma * sigma - 1) ** 2).sum()
+
+        # Nearest-neighbor interaction (periodic BC)
+        # Use tinygrad operations for autograd
+        sigma_right = sigma.cat(sigma[:, :1], dim=1)[:, 1:]  # shift left
+        sigma_down = sigma.cat(sigma[:1, :], dim=0)[1:, :]   # shift up
+        V_coupling = -J * (sigma * sigma_right + sigma * sigma_down).sum()
+
+        # External field
+        V_field = -h * sigma.sum()
+
+        return T + V_well + V_coupling + V_field
+
+    return H
+
+
+class SoftIsingSystem:
+    """
+    Continuous-spin Ising model with Hamiltonian dynamics.
+
+    Uses "soft spins" σ ∈ ℝ with a double-well potential to approximate
+    discrete Ising dynamics. This allows gradient-based Hamiltonian mechanics.
+
+    The Hamiltonian:
+        H = Σ p²/2 + λ Σ(σ² - 1)² - J Σ_{<i,j>} σ_i σ_j - h Σ σ
+
+    Example:
+        system = SoftIsingSystem(L=16, J=1.0, lam=5.0)
+        q, p = system.random_state()
+        for _ in range(100):
+            q, p = system.step(q, p, dt=0.01)
+    """
+
+    def __init__(self, L: int, J: float = 1.0, h: float = 0.0, lam: float = 5.0,
+                 integrator: str = "leapfrog"):
+        """
+        Initialize soft Ising system.
+
+        Args:
+            L: Lattice size (L × L)
+            J: Coupling constant
+            h: External field
+            lam: Double-well strength
+            integrator: "euler", "leapfrog", "yoshida4", or "implicit"
+        """
+        self.L = L
+        self.J = J
+        self.h = h
+        self.lam = lam
+        self.H_func = soft_ising_hamiltonian(L, J, h, lam)
+        self._system = HamiltonianSystem(self.H_func, integrator=integrator)
+
+    def random_state(self, noise: float = 0.1) -> tuple[Tensor, Tensor]:
+        """Create random initial state near ±1."""
+        sigma = np.random.choice([-1.0, 1.0], size=(self.L * self.L,))
+        sigma = sigma + noise * np.random.randn(self.L * self.L)
+        q = Tensor(sigma.astype(np.float32))
+        p = Tensor(np.zeros(self.L * self.L, dtype=np.float32))
+        return q, p
+
+    def uniform_state(self, value: float = 1.0) -> tuple[Tensor, Tensor]:
+        """Create uniform initial state."""
+        q = Tensor(np.full(self.L * self.L, value, dtype=np.float32))
+        p = Tensor(np.zeros(self.L * self.L, dtype=np.float32))
+        return q, p
+
+    def step(self, q: Tensor, p: Tensor, dt: float = 0.01) -> tuple[Tensor, Tensor]:
+        """Perform one symplectic integration step."""
+        return self._system.step(q, p, dt)
+
+    def energy(self, q: Tensor, p: Tensor) -> float:
+        """Compute total Hamiltonian."""
+        return self._system.energy(q, p)
+
+    def magnetization(self, q: Tensor) -> float:
+        """Compute magnetization per spin."""
+        return float(q.numpy().mean())
+
+    def discretized_spins(self, q: Tensor) -> Tensor:
+        """Get discrete spins by taking sign of continuous values."""
+        return Tensor(np.sign(q.numpy()).astype(np.float32))
+
+
+# ============================================================================
+# KOSTERLITZ-THOULESS / XY MODEL (Phase 6: Topological Physics)
+# ============================================================================
+#
+# The 2D XY model is defined by continuous spins θ_i ∈ [0, 2π) on a lattice:
+#
+#     H = -J Σ_{<ij>} cos(θ_i - θ_j)
+#
+# Key physics:
+#     - Below T_KT: vortices bound in pairs, quasi-long-range order
+#     - Above T_KT: vortices unbind, exponential decay of correlations
+#     - T_KT ≈ 0.89 J (Kosterlitz-Thouless transition)
+#
+# The vortex-antivortex interaction follows a Coulomb gas mapping:
+#     H_vortex ~ -πJ Σ_{i<j} n_i n_j log|r_ij|
+# where n_i = ±1 is the vorticity (winding number).
+
+
+def xy_hamiltonian_lattice(theta: Tensor, J: float = 1.0) -> Tensor:
+    """
+    XY model Hamiltonian on a 2D lattice with periodic boundary conditions.
+
+    H = -J Σ_{<ij>} cos(θ_i - θ_j)
+
+    Args:
+        theta: Tensor of shape (L, L) containing spin angles in [0, 2π)
+        J: Coupling constant (positive = ferromagnetic)
+
+    Returns:
+        Total energy as a scalar Tensor
+    """
+    # Compute angle differences to neighbors using roll for periodic BC
+    # Roll by -1 gets the next neighbor (i+1)
+    theta_np = theta.numpy()
+    L = theta_np.shape[0]
+
+    # Differences to right and down neighbors
+    diff_right = theta_np - np.roll(theta_np, -1, axis=1)  # θ_{i,j} - θ_{i,j+1}
+    diff_down = theta_np - np.roll(theta_np, -1, axis=0)   # θ_{i,j} - θ_{i+1,j}
+
+    # H = -J Σ cos(Δθ)
+    energy = -J * (np.cos(diff_right).sum() + np.cos(diff_down).sum())
+    return Tensor([energy])
+
+
+def _xy_grad(theta: Tensor, J: float = 1.0) -> Tensor:
+    """
+    Compute gradient of XY Hamiltonian analytically.
+
+    ∂H/∂θ_i = J Σ_{j∈neighbors} sin(θ_i - θ_j)
+    """
+    theta_np = theta.numpy()
+    L = theta_np.shape[0]
+
+    # Contributions from all 4 neighbors
+    grad = np.zeros_like(theta_np)
+
+    # Right neighbor: sin(θ_{i,j} - θ_{i,j+1})
+    grad += J * np.sin(theta_np - np.roll(theta_np, -1, axis=1))
+    # Left neighbor: sin(θ_{i,j} - θ_{i,j-1})
+    grad += J * np.sin(theta_np - np.roll(theta_np, 1, axis=1))
+    # Down neighbor: sin(θ_{i,j} - θ_{i+1,j})
+    grad += J * np.sin(theta_np - np.roll(theta_np, -1, axis=0))
+    # Up neighbor: sin(θ_{i,j} - θ_{i-1,j})
+    grad += J * np.sin(theta_np - np.roll(theta_np, 1, axis=0))
+
+    return Tensor(grad.astype(np.float32))
+
+
+def detect_vortices(theta: Tensor) -> tuple[list, list]:
+    """
+    Detect vortices and antivortices on the XY lattice.
+
+    Uses plaquette winding number: n = (1/2π) Σ_plaquette Δθ
+
+    A vortex has winding +1 (angles increase by 2π around plaquette).
+    An antivortex has winding -1 (angles decrease by 2π).
+
+    Returns:
+        (vortices, antivortices): Lists of (x, y) positions (plaquette centers)
+    """
+    theta_np = theta.numpy()
+    L = theta_np.shape[0]
+
+    def wrap_angle(a):
+        """Wrap angle difference to [-π, π]."""
+        return np.arctan2(np.sin(a), np.cos(a))
+
+    vortices = []
+    antivortices = []
+
+    for i in range(L):
+        for j in range(L):
+            # Plaquette corners: (i,j) -> (i,j+1) -> (i+1,j+1) -> (i+1,j) -> (i,j)
+            i1 = (i + 1) % L
+            j1 = (j + 1) % L
+
+            # Angle differences around plaquette (counterclockwise)
+            d1 = wrap_angle(theta_np[i, j1] - theta_np[i, j])      # right
+            d2 = wrap_angle(theta_np[i1, j1] - theta_np[i, j1])    # down
+            d3 = wrap_angle(theta_np[i1, j] - theta_np[i1, j1])    # left
+            d4 = wrap_angle(theta_np[i, j] - theta_np[i1, j])      # up
+
+            winding = (d1 + d2 + d3 + d4) / (2 * np.pi)
+
+            if winding > 0.5:
+                vortices.append((i + 0.5, j + 0.5))
+            elif winding < -0.5:
+                antivortices.append((i + 0.5, j + 0.5))
+
+    return vortices, antivortices
+
+
+def xy_langevin_step(theta: Tensor, J: float = 1.0, dt: float = 0.01,
+                     temperature: float = 0.5, gamma: float = 1.0) -> Tensor:
+    """
+    Overdamped Langevin dynamics for XY model.
+
+    dθ/dt = -(1/γ) ∂H/∂θ + √(2T/γ) η(t)
+
+    where η is Gaussian white noise.
+
+    Args:
+        theta: Current angles (L, L)
+        J: Coupling constant
+        dt: Time step
+        temperature: Temperature (T_KT ≈ 0.89 J)
+        gamma: Damping coefficient
+
+    Returns:
+        Updated angles (wrapped to [0, 2π))
+    """
+    # Compute gradient analytically
+    dHdtheta = _xy_grad(theta, J)
+
+    # Deterministic drift toward lower energy
+    drift = -dHdtheta.numpy() / gamma
+
+    # Stochastic thermal noise
+    noise_strength = np.sqrt(2 * temperature * dt / gamma)
+    noise = noise_strength * np.random.randn(*theta.shape).astype(np.float32)
+
+    # Update angles
+    theta_new = theta.numpy() + dt * drift + noise
+
+    # Wrap to [0, 2π)
+    theta_new = theta_new % (2 * np.pi)
+
+    return Tensor(theta_new.astype(np.float32))
+
+
+def xy_metropolis_step(theta: Tensor, J: float = 1.0, beta: float = 1.0,
+                       delta: float = 0.5) -> Tensor:
+    """
+    Metropolis Monte Carlo step for XY model.
+
+    For each spin, propose θ' = θ + uniform(-δ, δ) and accept with
+    probability min(1, exp(-β ΔE)).
+
+    Args:
+        theta: Current angles (L, L)
+        J: Coupling constant
+        beta: Inverse temperature β = 1/T
+        delta: Maximum angle change per proposal
+
+    Returns:
+        Updated angles
+    """
+    theta_np = theta.numpy().copy()
+    L = theta_np.shape[0]
+
+    for _ in range(L * L):
+        i, j = np.random.randint(0, L), np.random.randint(0, L)
+        theta_old = theta_np[i, j]
+
+        # Propose new angle
+        theta_new = theta_old + np.random.uniform(-delta, delta)
+
+        # Compute energy change (only affected bonds)
+        neighbors = [
+            theta_np[(i + 1) % L, j],
+            theta_np[(i - 1) % L, j],
+            theta_np[i, (j + 1) % L],
+            theta_np[i, (j - 1) % L]
+        ]
+
+        E_old = -J * sum(np.cos(theta_old - n) for n in neighbors)
+        E_new = -J * sum(np.cos(theta_new - n) for n in neighbors)
+        delta_E = E_new - E_old
+
+        # Metropolis acceptance
+        if delta_E <= 0 or np.random.random() < np.exp(-beta * delta_E):
+            theta_np[i, j] = theta_new % (2 * np.pi)
+
+    return Tensor(theta_np.astype(np.float32))
+
+
+class XYLatticeSystem:
+    """
+    2D XY model on a lattice - the canonical system for Kosterlitz-Thouless physics.
+
+    The XY model consists of planar spins (angles θ ∈ [0, 2π)) on a 2D lattice:
+        H = -J Σ_{<ij>} cos(θ_i - θ_j)
+
+    The system exhibits the Kosterlitz-Thouless transition:
+    - T < T_KT ≈ 0.89 J: Vortices bound in pairs, power-law correlations
+    - T > T_KT: Free vortices proliferate, exponential correlation decay
+
+    This is a topological phase transition - no symmetry breaking, but
+    the proliferation of topological defects (vortices) destroys order.
+
+    Example:
+        system = XYLatticeSystem(L=32, J=1.0, temperature=0.5)
+        theta = system.random_state()
+        for _ in range(1000):
+            theta = system.step(theta, dt=0.01)
+        vortices, antivortices = system.detect_vortices(theta)
+        print(f"Found {len(vortices)} vortices, {len(antivortices)} antivortices")
+    """
+
+    # Kosterlitz-Thouless transition temperature (approximate)
+    T_KT = 0.89  # In units where J = 1
+
+    def __init__(self, L: int, J: float = 1.0, temperature: float = 0.5,
+                 gamma: float = 1.0, dynamics: str = "langevin"):
+        """
+        Initialize XY lattice system.
+
+        Args:
+            L: Lattice size (L × L)
+            J: Coupling constant
+            temperature: Temperature (T_KT ≈ 0.89 J for the transition)
+            gamma: Damping coefficient (for Langevin dynamics)
+            dynamics: "langevin" or "metropolis"
+        """
+        self.L = L
+        self.J = J
+        self.temperature = temperature
+        self.gamma = gamma
+        self.dynamics = dynamics
+
+    def random_state(self) -> Tensor:
+        """Initialize with random angles (high-T like)."""
+        return Tensor(np.random.uniform(0, 2 * np.pi, (self.L, self.L)).astype(np.float32))
+
+    def ordered_state(self, angle: float = 0.0) -> Tensor:
+        """Initialize with all spins aligned (low-T ground state)."""
+        return Tensor(np.full((self.L, self.L), angle, dtype=np.float32))
+
+    def single_vortex(self, x0: int = None, y0: int = None, charge: int = 1) -> Tensor:
+        """
+        Create a configuration with a single vortex at (x0, y0).
+
+        θ(x, y) = charge × arctan2(y - y0, x - x0)
+
+        Note: On a periodic lattice, a single vortex is topologically
+        forbidden (total charge must be 0). This creates a defect that
+        will be screened by boundary effects.
+        """
+        if x0 is None: x0 = self.L // 2
+        if y0 is None: y0 = self.L // 2
+
+        theta = np.zeros((self.L, self.L), dtype=np.float32)
+        for i in range(self.L):
+            for j in range(self.L):
+                dx = i - x0
+                dy = j - y0
+                if dx == 0 and dy == 0:
+                    theta[i, j] = 0
+                else:
+                    theta[i, j] = charge * np.arctan2(dy, dx)
+        return Tensor(theta % (2 * np.pi))
+
+    def vortex_pair(self, separation: int = 4) -> Tensor:
+        """
+        Create a vortex-antivortex pair configuration.
+
+        This is the fundamental excitation in the KT model.
+        At T < T_KT, pairs remain bound. At T > T_KT, they unbind.
+        """
+        x0 = self.L // 2 - separation // 2
+        x1 = self.L // 2 + separation // 2
+        y0 = self.L // 2
+
+        theta = np.zeros((self.L, self.L), dtype=np.float32)
+        for i in range(self.L):
+            for j in range(self.L):
+                # Vortex at (x0, y0)
+                angle1 = np.arctan2(j - y0, i - x0)
+                # Antivortex at (x1, y0)
+                angle2 = -np.arctan2(j - y0, i - x1)
+                theta[i, j] = angle1 + angle2
+        return Tensor(theta % (2 * np.pi))
+
+    def step(self, theta: Tensor, dt: float = 0.01) -> Tensor:
+        """Evolve the system by one time step."""
+        if self.dynamics == "langevin":
+            return xy_langevin_step(theta, self.J, dt, self.temperature, self.gamma)
+        else:  # metropolis
+            return xy_metropolis_step(theta, self.J, 1.0 / self.temperature, delta=0.5)
+
+    def energy(self, theta: Tensor) -> float:
+        """Compute total energy."""
+        return float(xy_hamiltonian_lattice(theta, self.J).numpy()[0])
+
+    def energy_per_spin(self, theta: Tensor) -> float:
+        """Energy per spin (ground state is -2J per spin)."""
+        return self.energy(theta) / (self.L * self.L)
+
+    def detect_vortices(self, theta: Tensor) -> tuple[list, list]:
+        """Detect vortices and antivortices."""
+        return detect_vortices(theta)
+
+    def vortex_count(self, theta: Tensor) -> tuple[int, int]:
+        """Count vortices and antivortices."""
+        v, av = self.detect_vortices(theta)
+        return len(v), len(av)
+
+    def vortex_density(self, theta: Tensor) -> float:
+        """Total vortex + antivortex density."""
+        n_v, n_av = self.vortex_count(theta)
+        return (n_v + n_av) / (self.L * self.L)
+
+    def magnetization(self, theta: Tensor) -> tuple[float, float]:
+        """
+        Compute magnetization M = (1/N) Σ (cos θ, sin θ).
+
+        Returns (|M|, angle). For XY model, |M| → 0 in thermodynamic limit
+        but correlations <S_i · S_j> can have power-law decay below T_KT.
+        """
+        theta_np = theta.numpy()
+        mx = np.mean(np.cos(theta_np))
+        my = np.mean(np.sin(theta_np))
+        return np.sqrt(mx**2 + my**2), np.arctan2(my, mx)
+
+    def helicity_modulus(self, theta: Tensor, delta: float = 0.01) -> float:
+        """
+        Compute helicity modulus (superfluid stiffness) Υ.
+
+        Υ = (1/L²) d²F/dφ² where φ is a twist in boundary conditions.
+        This is the order parameter for the KT transition:
+        - T < T_KT: Υ > 0 (universal jump to 2T/π at T_KT)
+        - T > T_KT: Υ = 0
+
+        Uses finite difference approximation.
+        """
+        theta_np = theta.numpy()
+        L = self.L
+
+        # Energy at twist 0
+        E0 = self.energy(theta)
+
+        # Energy at twist +δ (add phase gradient in x direction)
+        theta_plus = theta_np.copy()
+        for i in range(L):
+            theta_plus[:, i] += delta * i / L
+        E_plus = float(xy_hamiltonian_lattice(Tensor(theta_plus), self.J).numpy()[0])
+
+        # Energy at twist -δ
+        theta_minus = theta_np.copy()
+        for i in range(L):
+            theta_minus[:, i] -= delta * i / L
+        E_minus = float(xy_hamiltonian_lattice(Tensor(theta_minus), self.J).numpy()[0])
+
+        # Second derivative: Υ = d²E/dφ² / L²
+        d2E = (E_plus - 2 * E0 + E_minus) / (delta ** 2)
+        return d2E / (L * L)
+
+    def evolve(self, theta: Tensor, dt: float, steps: int,
+               record_every: int = 1) -> tuple[Tensor, list]:
+        """Evolve system and record history."""
+        history = []
+
+        for i in range(steps):
+            if i % record_every == 0:
+                theta_np = theta.numpy().copy()
+                e = self.energy_per_spin(theta)
+                v, av = self.detect_vortices(theta)
+                m_mag, m_angle = self.magnetization(theta)
+                history.append({
+                    'theta': theta_np,
+                    'energy': e,
+                    'vortices': v,
+                    'antivortices': av,
+                    'n_vortices': len(v),
+                    'n_antivortices': len(av),
+                    'magnetization': m_mag,
+                })
+            theta = self.step(theta, dt)
+
+        # Record final state
+        theta_np = theta.numpy().copy()
+        e = self.energy_per_spin(theta)
+        v, av = self.detect_vortices(theta)
+        m_mag, _ = self.magnetization(theta)
+        history.append({
+            'theta': theta_np,
+            'energy': e,
+            'vortices': v,
+            'antivortices': av,
+            'n_vortices': len(v),
+            'n_antivortices': len(av),
+            'magnetization': m_mag,
+        })
+
+        return theta, history
+
+
+# ============================================================================
+# XY VORTEX GAS MODEL (Coulomb Gas Representation)
+# ============================================================================
+#
+# The XY model vortices can be mapped exactly to a 2D Coulomb gas:
+#
+#     H = -πJ Σ_{i<j} n_i n_j log|r_ij/a| + E_core × N_vortices
+#
+# where n_i = ±1 is the vortex charge (winding number) and a is the
+# lattice spacing (UV cutoff).
+#
+# This "dual" description makes the KT physics transparent:
+# - Vortex pairs attract (opposite charges)
+# - Free energy balance: E_pair ~ 2πJ log(R) vs S_pair ~ 2 log(R)
+# - Unbinding at T_KT where entropy wins: k_B T_KT = πJ/2
+
+
+def xy_vortex_hamiltonian(charges: Tensor, J: float = 1.0,
+                          E_core: float = 0.0, a: float = 1.0):
+    """
+    Coulomb gas Hamiltonian for XY model vortices.
+
+    H = -πJ Σ_{i<j} n_i n_j log|r_ij/a| + E_core × N
+
+    Args:
+        charges: Tensor of shape (N,) with values +1 or -1
+        J: XY coupling constant
+        E_core: Vortex core energy
+        a: Lattice spacing (UV cutoff)
+
+    Returns:
+        Hamiltonian function H(z) where z contains positions
+    """
+    n = charges.shape[0]
+
+    def H(z):
+        x = z.reshape(n, 2)[:, 0]
+        y = z.reshape(n, 2)[:, 1]
+
+        # Pairwise distances
+        dx = x.unsqueeze(1) - x.unsqueeze(0)
+        dy = y.unsqueeze(1) - y.unsqueeze(0)
+        r = (dx * dx + dy * dy + a * a).sqrt()  # Regularized at short distance
+
+        # Charge product
+        charge_ij = charges.unsqueeze(1) * charges.unsqueeze(0)
+
+        # H = -πJ Σ_{i<j} n_i n_j log(r/a)
+        log_r = (r / a).log()
+        H_matrix = -np.pi * J * charge_ij * log_r
+
+        # Upper triangle only (i < j)
+        mask = Tensor([[1.0 if j > i else 0.0 for j in range(n)] for i in range(n)])
+        H_int = (H_matrix * mask).sum()
+
+        return H_int + E_core * n
+
+    return H
+
+
+def xy_vortex_dynamics(z: Tensor, charges: Tensor, J: float = 1.0,
+                       dt: float = 0.01, temperature: float = 0.0,
+                       gamma: float = 1.0, a: float = 1.0) -> Tensor:
+    """
+    Overdamped Langevin dynamics for XY vortices.
+
+    dz_i/dt = -(1/γ) ∂H/∂z_i + √(2T/γ) η(t)
+
+    Unlike point vortices in fluids (which have circulation-weighted
+    symplectic structure), XY vortices follow standard overdamped dynamics.
+    """
+    n = charges.shape[0]
+    z_np = z.numpy().reshape(n, 2)
+    charges_np = charges.numpy()
+
+    # Compute forces from Coulomb interaction
+    # F_i = πJ Σ_j n_i n_j (r_ij / |r_ij|²)
+    force = np.zeros_like(z_np)
+
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                dx = z_np[i, 0] - z_np[j, 0]
+                dy = z_np[i, 1] - z_np[j, 1]
+                r_sq = dx * dx + dy * dy + a * a
+                # Force from j on i
+                coeff = np.pi * J * charges_np[i] * charges_np[j] / r_sq
+                force[i, 0] += coeff * dx
+                force[i, 1] += coeff * dy
+
+    # Overdamped: v = F / γ
+    v = force / gamma
+
+    # Thermal noise
+    if temperature > 0:
+        noise = np.sqrt(2 * temperature * dt / gamma) * np.random.randn(n, 2)
+        z_new = z_np + dt * v + noise
+    else:
+        z_new = z_np + dt * v
+
+    return Tensor(z_new.flatten().astype(np.float32))
+
+
+class XYVortexGas:
+    """
+    Vortex gas model for the Kosterlitz-Thouless transition.
+
+    Treats vortices as point particles with Coulomb (log) interactions:
+        H = -πJ Σ_{i<j} n_i n_j log|r_ij| + E_core × N
+
+    This is the "dual" picture of the XY model, making the KT physics
+    transparent:
+    - Vortex-antivortex pairs attract (like +/- charges in 2D Coulomb)
+    - Binding energy ~ 2πJ log(R), entropy ~ 2 log(R)
+    - Unbinding when entropy wins: T_KT = πJ/2
+
+    Example:
+        # Create a vortex-antivortex pair
+        charges = Tensor([1.0, -1.0])
+        z = Tensor([0.0, 1.0, 0.0, -1.0])  # (x0,y0,x1,y1)
+        system = XYVortexGas(charges, J=1.0, temperature=0.3)
+
+        # Below T_KT, pair stays bound
+        for _ in range(1000):
+            z = system.step(z, dt=0.01)
+        print(f"Pair separation: {system.pair_separation(z):.2f}")
+    """
+
+    def __init__(self, charges: Tensor, J: float = 1.0, E_core: float = 0.0,
+                 temperature: float = 0.0, gamma: float = 1.0, a: float = 1.0):
+        """
+        Initialize vortex gas.
+
+        Args:
+            charges: Vortex charges (+1 or -1)
+            J: XY coupling constant
+            E_core: Vortex core energy
+            temperature: Temperature for Langevin dynamics
+            gamma: Damping coefficient
+            a: Short-distance cutoff (lattice spacing)
+        """
+        self.charges = charges
+        self.n_vortices = charges.shape[0]
+        self.J = J
+        self.E_core = E_core
+        self.temperature = temperature
+        self.gamma = gamma
+        self.a = a
+        self.H = xy_vortex_hamiltonian(charges, J, E_core, a)
+
+    def step(self, z: Tensor, dt: float = 0.01) -> Tensor:
+        """Evolve vortex positions."""
+        return xy_vortex_dynamics(z, self.charges, self.J, dt,
+                                  self.temperature, self.gamma, self.a)
+
+    def energy(self, z: Tensor) -> float:
+        """Compute interaction energy."""
+        return float(self.H(z).numpy())
+
+    def pair_separation(self, z: Tensor, i: int = 0, j: int = 1) -> float:
+        """Distance between two vortices."""
+        pos = z.numpy().reshape(self.n_vortices, 2)
+        return float(np.sqrt((pos[i, 0] - pos[j, 0])**2 + (pos[i, 1] - pos[j, 1])**2))
+
+    def total_charge(self) -> int:
+        """Total vorticity (should be 0 for neutrality)."""
+        return int(self.charges.numpy().sum())
+
+    def center_of_mass(self, z: Tensor) -> tuple[float, float]:
+        """Center of mass of all vortices."""
+        pos = z.numpy().reshape(self.n_vortices, 2)
+        return float(pos[:, 0].mean()), float(pos[:, 1].mean())
+
+    def evolve(self, z: Tensor, dt: float, steps: int,
+               record_every: int = 1) -> tuple[Tensor, list]:
+        """Evolve and record history."""
+        history = []
+
+        for i in range(steps):
+            if i % record_every == 0:
+                pos = z.numpy().reshape(self.n_vortices, 2)
+                history.append({
+                    'positions': pos.copy(),
+                    'energy': self.energy(z),
+                    'separation': self.pair_separation(z) if self.n_vortices >= 2 else 0,
+                })
+            z = self.step(z, dt)
+
+        pos = z.numpy().reshape(self.n_vortices, 2)
+        history.append({
+            'positions': pos.copy(),
+            'energy': self.energy(z),
+            'separation': self.pair_separation(z) if self.n_vortices >= 2 else 0,
+        })
+
+        return z, history
+
+
+def create_vortex_pair(separation: float = 2.0) -> tuple[Tensor, Tensor]:
+    """Create a bound vortex-antivortex pair."""
+    charges = Tensor([1.0, -1.0])
+    z = Tensor([0.0, separation/2, 0.0, -separation/2])
+    return charges, z
+
+
+def create_vortex_gas(n_pairs: int, box_size: float = 10.0) -> tuple[Tensor, Tensor]:
+    """Create charge-neutral vortex gas with random positions."""
+    charges = [1.0 if i % 2 == 0 else -1.0 for i in range(2 * n_pairs)]
+    positions = np.random.uniform(-box_size/2, box_size/2, 4 * n_pairs)
+    return Tensor(charges), Tensor(positions.astype(np.float32))
 
 
 # Backward compatibility

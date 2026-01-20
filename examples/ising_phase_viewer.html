@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Ising Phase Transition - TinyPhysics</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #eee;
+            margin: 0;
+            min-height: 100vh;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        h1 { color: #fff; font-weight: 300; margin-bottom: 5px; }
+        .subtitle { color: #888; margin-bottom: 20px; font-size: 14px; }
+        .container { display: flex; gap: 20px; flex-wrap: wrap; justify-content: center; }
+        canvas {
+            background: rgba(0,0,0,0.4);
+            border-radius: 10px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+        }
+        .info {
+            background: rgba(0,0,0,0.4);
+            border-radius: 10px;
+            padding: 20px;
+            max-width: 400px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+        }
+        .info h3 { color: #f4a; margin: 0 0 15px 0; }
+        .formula {
+            font-family: monospace;
+            background: rgba(0,0,0,0.3);
+            padding: 8px 12px;
+            border-radius: 4px;
+            color: #4f4;
+            display: block;
+            margin: 10px 0;
+        }
+        .critical { color: #ff0; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h1>Ising Model Phase Transition</h1>
+    <div class="subtitle">2D square lattice, 32 × 32 spins</div>
+
+    <div class="container">
+        <canvas id="magCanvas" width="400" height="300"></canvas>
+        <canvas id="susCanvas" width="400" height="300"></canvas>
+    </div>
+
+    <div class="info" style="margin-top: 20px; max-width: 820px;">
+        <h3>The Onsager Solution (1944)</h3>
+        <p>The 2D Ising model has an exact solution showing a continuous phase transition.</p>
+        <div class="formula">T_c = 2J / ln(1 + √2) ≈ 2.269 J/k_B</div>
+        <p>
+            <strong>T &lt; T_c:</strong> Ordered phase (ferromagnetic), |m| ≈ 1<br>
+            <strong>T &gt; T_c:</strong> Disordered phase (paramagnetic), m ≈ 0
+        </p>
+        <p>At T_c, the susceptibility χ and correlation length ξ diverge - this is the critical point.</p>
+        <p class="critical">Critical temperature T_c ≈ 2.269</p>
+    </div>
+
+    <script>
+        const T = [1.5, 1.6, 1.7, 1.8, 1.9, 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9000000000000004, 3.0, 3.1, 3.2, 3.3, 3.4000000000000004, 3.5];
+        const M = [0.9870234375, 0.97976171875, 0.97031640625, 0.95708984375, 0.937578125, 0.90798046875, 0.8643515625, 0.7976328125, 0.57123828125, 0.31228125, 0.204875, 0.13408984375, 0.1146171875, 0.0871796875, 0.090015625, 0.085484375, 0.07377734375, 0.06728125, 0.05941015625, 0.04704296875, 0.06185546875];
+        const chi = [0.023274125000019314, 0.04564198242192674, 0.06300274816172693, 0.10722460937504114, 0.18804769736837107, 0.6160488359374767, 0.978102113095225, 3.1319770170454766, 16.856700618206546, 16.06010979166667, 10.413895599999998, 3.779624825721154, 2.948044189814815, 2.3241287723214286, 1.254698620689655, 1.386023666666666, 1.224726466733871, 0.6309708203125, 0.6725370217803031, 0.34107376378676474, 0.6559030133928572];
+        const Tc = 2.269185314213022;
+
+        function drawPlot(canvasId, data, yLabel, color) {
+            const canvas = document.getElementById(canvasId);
+            const ctx = canvas.getContext('2d');
+            const w = canvas.width, h = canvas.height;
+            const pad = 50;
+
+            ctx.fillStyle = 'transparent';
+            ctx.fillRect(0, 0, w, h);
+
+            // Find data range
+            const xMin = Math.min(...T), xMax = Math.max(...T);
+            const yMin = 0, yMax = Math.max(...data) * 1.1;
+
+            // Draw axes
+            ctx.strokeStyle = '#444';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(pad, pad);
+            ctx.lineTo(pad, h - pad);
+            ctx.lineTo(w - pad, h - pad);
+            ctx.stroke();
+
+            // Draw T_c vertical line
+            const tcX = pad + ((Tc - xMin) / (xMax - xMin)) * (w - 2*pad);
+            ctx.strokeStyle = '#ff0';
+            ctx.setLineDash([5, 5]);
+            ctx.beginPath();
+            ctx.moveTo(tcX, pad);
+            ctx.lineTo(tcX, h - pad);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            // Labels
+            ctx.fillStyle = '#888';
+            ctx.font = '12px sans-serif';
+            ctx.fillText('T', w - pad + 10, h - pad + 5);
+            ctx.fillText(yLabel, pad - 5, pad - 10);
+            ctx.fillStyle = '#ff0';
+            ctx.fillText('T_c', tcX - 10, pad - 5);
+
+            // Draw data
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            for (let i = 0; i < T.length; i++) {
+                const x = pad + ((T[i] - xMin) / (xMax - xMin)) * (w - 2*pad);
+                const y = h - pad - ((data[i] - yMin) / (yMax - yMin)) * (h - 2*pad);
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            }
+            ctx.stroke();
+
+            // Draw points
+            ctx.fillStyle = color;
+            for (let i = 0; i < T.length; i++) {
+                const x = pad + ((T[i] - xMin) / (xMax - xMin)) * (w - 2*pad);
+                const y = h - pad - ((data[i] - yMin) / (yMax - yMin)) * (h - 2*pad);
+                ctx.beginPath();
+                ctx.arc(x, y, 4, 0, 2 * Math.PI);
+                ctx.fill();
+            }
+        }
+
+        drawPlot('magCanvas', M, '|m|', '#f4a');
+        drawPlot('susCanvas', chi, 'χ', '#4af');
+    </script>
+</body>
+</html>

@@ -52,9 +52,9 @@ def run_vortex_pair():
     print(f"Initial Momentum: ({px0:.6f}, {py0:.6f})")
     print(f"Initial Angular Momentum: {L0:.6f}")
 
-    # Evolve
-    dt, steps = 0.01, 2000
-    z_final, history = system.evolve(z, dt=dt, steps=steps, record_every=10)
+    # Evolve (reduced steps for faster iteration - autograd is slow)
+    dt, steps = 0.05, 100
+    z_final, history = system.evolve(z, dt=dt, steps=steps, record_every=2)
 
     # Final state
     E_final = system.energy(z_final)
@@ -98,8 +98,8 @@ def run_vortex_dipole():
     print(f"\nInitial Energy: {E0:.6f}")
     print(f"Initial Momentum: ({px0:.6f}, {py0:.6f})")
 
-    dt, steps = 0.01, 1000
-    z_final, history = system.evolve(z, dt=dt, steps=steps, record_every=5)
+    dt, steps = 0.05, 100
+    z_final, history = system.evolve(z, dt=dt, steps=steps, record_every=2)
 
     E_final = system.energy(z_final)
     print(f"Final Energy: {E_final:.6f}")
@@ -142,8 +142,8 @@ def run_three_vortices():
     print(f"\nInitial Energy: {E0:.6f}")
     print(f"Initial Angular Momentum: {L0:.6f}")
 
-    dt, steps = 0.01, 2000
-    z_final, history = system.evolve(z, dt=dt, steps=steps, record_every=10)
+    dt, steps = 0.05, 100
+    z_final, history = system.evolve(z, dt=dt, steps=steps, record_every=2)
 
     E_final = system.energy(z_final)
     L_final = system.angular_momentum(z_final)
@@ -191,6 +191,8 @@ def generate_viewer(history, gamma, filename="examples/point_vortex_viewer.html"
         }}
         .info h3 {{ margin-top: 0; color: #4af; }}
         code {{ color: #4f4; }}
+        .controls {{ margin: 10px; }}
+        button {{ padding: 8px 16px; margin: 0 5px; cursor: pointer; }}
     </style>
 </head>
 <body>
@@ -202,6 +204,11 @@ def generate_viewer(history, gamma, filename="examples/point_vortex_viewer.html"
         <p>Kirchhoff's equations derived automatically via autograd!</p>
         <p><span style="color:#ff4444">●</span> Positive circulation &nbsp;
            <span style="color:#4444ff">●</span> Negative circulation</p>
+    </div>
+    <div class="controls">
+        <button onclick="togglePlay()">Play/Pause</button>
+        <button onclick="reset()">Reset</button>
+        <span id="frameInfo">Frame: 0</span>
     </div>
     <div class="container">
         <canvas id="vortexCanvas" width="600" height="600"></canvas>
@@ -219,65 +226,105 @@ def generate_viewer(history, gamma, filename="examples/point_vortex_viewer.html"
         const cy = canvas.height / 2;
         const scale = 150;
 
-        // Draw trajectories
-        ctx.fillStyle = '#000';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-        // Draw traces
-        for (let v = 0; v < nVortices; v++) {{
-            ctx.strokeStyle = colors[v];
-            ctx.lineWidth = 1;
-            ctx.globalAlpha = 0.5;
-            ctx.beginPath();
-            for (let t = 0; t < trajectories.length; t++) {{
-                const x = cx + trajectories[t][v][0] * scale;
-                const y = cy - trajectories[t][v][1] * scale;
-                if (t === 0) ctx.moveTo(x, y);
-                else ctx.lineTo(x, y);
-            }}
-            ctx.stroke();
-        }}
-
-        // Draw final positions
-        ctx.globalAlpha = 1.0;
-        const final = trajectories[trajectories.length - 1];
-        for (let v = 0; v < nVortices; v++) {{
-            const x = cx + final[v][0] * scale;
-            const y = cy - final[v][1] * scale;
-            ctx.fillStyle = colors[v];
-            ctx.beginPath();
-            ctx.arc(x, y, 8, 0, 2 * Math.PI);
-            ctx.fill();
-            ctx.strokeStyle = '#fff';
-            ctx.lineWidth = 2;
-            ctx.stroke();
-        }}
-
-        // Energy plot
         const eCanvas = document.getElementById('energyCanvas');
         const ectx = eCanvas.getContext('2d');
-        ectx.fillStyle = '#000';
-        ectx.fillRect(0, 0, eCanvas.width, eCanvas.height);
-        ectx.fillStyle = '#fff';
-        ectx.font = '12px monospace';
-        ectx.fillText('Energy Conservation', 10, 20);
 
-        const eMin = Math.min(...energies);
-        const eMax = Math.max(...energies);
-        const range = eMax - eMin || 1e-10;
+        let frame = 0;
+        let playing = true;
+        let trailLength = 50;
 
-        ectx.strokeStyle = '#4f4';
-        ectx.beginPath();
-        for (let i = 0; i < energies.length; i++) {{
-            const x = 10 + (i / energies.length) * 280;
-            const y = 180 - ((energies[i] - eMin) / range) * 150;
-            if (i === 0) ectx.moveTo(x, y);
-            else ectx.lineTo(x, y);
+        function drawFrame() {{
+            // Clear canvas
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // Draw trails
+            const trailStart = Math.max(0, frame - trailLength);
+            for (let v = 0; v < nVortices; v++) {{
+                ctx.strokeStyle = colors[v];
+                ctx.lineWidth = 2;
+                ctx.globalAlpha = 0.6;
+                ctx.beginPath();
+                for (let t = trailStart; t <= frame; t++) {{
+                    const x = cx + trajectories[t][v][0] * scale;
+                    const y = cy - trajectories[t][v][1] * scale;
+                    if (t === trailStart) ctx.moveTo(x, y);
+                    else ctx.lineTo(x, y);
+                }}
+                ctx.stroke();
+            }}
+
+            // Draw current positions
+            ctx.globalAlpha = 1.0;
+            const current = trajectories[frame];
+            for (let v = 0; v < nVortices; v++) {{
+                const x = cx + current[v][0] * scale;
+                const y = cy - current[v][1] * scale;
+                ctx.fillStyle = colors[v];
+                ctx.beginPath();
+                ctx.arc(x, y, 10, 0, 2 * Math.PI);
+                ctx.fill();
+                ctx.strokeStyle = '#fff';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+            }}
+
+            // Draw energy plot
+            ectx.fillStyle = '#000';
+            ectx.fillRect(0, 0, eCanvas.width, eCanvas.height);
+            ectx.fillStyle = '#fff';
+            ectx.font = '12px monospace';
+            ectx.fillText('Energy Conservation', 10, 20);
+
+            const eMin = Math.min(...energies);
+            const eMax = Math.max(...energies);
+            const range = eMax - eMin || 1e-10;
+
+            ectx.strokeStyle = '#333';
+            ectx.beginPath();
+            for (let i = 0; i < energies.length; i++) {{
+                const x = 10 + (i / energies.length) * 280;
+                const y = 180 - ((energies[i] - eMin) / range) * 150;
+                if (i === 0) ectx.moveTo(x, y);
+                else ectx.lineTo(x, y);
+            }}
+            ectx.stroke();
+
+            // Highlight current position on energy plot
+            ectx.strokeStyle = '#4f4';
+            ectx.lineWidth = 2;
+            ectx.beginPath();
+            for (let i = 0; i <= frame; i++) {{
+                const x = 10 + (i / energies.length) * 280;
+                const y = 180 - ((energies[i] - eMin) / range) * 150;
+                if (i === 0) ectx.moveTo(x, y);
+                else ectx.lineTo(x, y);
+            }}
+            ectx.stroke();
+
+            const drift = Math.abs(energies[frame] - energies[0]) / (Math.abs(energies[0]) || 1e-10);
+            ectx.fillText('Drift: ' + drift.toExponential(2), 10, 195);
+
+            document.getElementById('frameInfo').textContent = 'Frame: ' + frame + '/' + (trajectories.length - 1);
         }}
-        ectx.stroke();
 
-        const drift = Math.abs(energies[energies.length-1] - energies[0]) / Math.abs(energies[0]);
-        ectx.fillText('Drift: ' + drift.toExponential(2), 10, 195);
+        function animate() {{
+            if (playing) {{
+                frame = (frame + 1) % trajectories.length;
+            }}
+            drawFrame();
+            requestAnimationFrame(animate);
+        }}
+
+        function togglePlay() {{
+            playing = !playing;
+        }}
+
+        function reset() {{
+            frame = 0;
+        }}
+
+        animate();
     </script>
 </body>
 </html>"""
