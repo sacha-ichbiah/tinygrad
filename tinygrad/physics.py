@@ -129,6 +129,9 @@ def _reindex_reduce_input(ctx: dict, x: UOp) -> UOp|None:
 def _const_to_vindex(ctx: dict, x: UOp) -> UOp|None:
     base = x.base
     if base.op not in (Ops.CONST, Ops.VCONST): return None
+    dev = ctx.get("device")
+    if dev is not None and (len(base.src) == 0 or base.src[0].op is not Ops.DEVICE):
+        base = UOp.const(base.dtype, base.arg, device=dev)
     shape = x.shape
     ranges = ctx["ranges"]
     if shape is None or len(shape) != len(ranges): return None
@@ -140,6 +143,7 @@ def _broadcast_value_index(ctx: dict, x: UOp) -> UOp|None:
     if x.op not in (Ops.RESHAPE, Ops.EXPAND): return None
     src = x.src[0]
     if src.op is not Ops.INDEX or src.arg != "value": return None
+    if src.src[0].op in (Ops.REDUCE, Ops.REDUCE_AXIS): return None
     try:
         shape = x.shape
     except Exception:
@@ -147,7 +151,11 @@ def _broadcast_value_index(ctx: dict, x: UOp) -> UOp|None:
     ranges = ctx["ranges"]
     if shape is None or len(shape) != len(ranges): return None
     idx = tuple(UOp.const(dtypes.index, 0) if resolve(s == 1) else ranges[i] for i, s in enumerate(shape))
-    return src.src[0].vindex(*idx, dtype=x.dtype)
+    base = src.src[0]
+    dev = ctx.get("device")
+    if dev is not None and base.op in (Ops.CONST, Ops.VCONST) and (len(base.src) == 0 or base.src[0].op is not Ops.DEVICE):
+        base = UOp.const(base.dtype, base.arg, device=dev)
+    return base.vindex(*idx, dtype=x.dtype)
 
 
 def _drop_scalar_value_index(ctx: dict, x: UOp) -> UOp|None:
@@ -168,6 +176,7 @@ def _broadcast_scalar_index(ctx: dict, x: UOp) -> UOp|None:
     if x.op not in (Ops.RESHAPE, Ops.EXPAND): return None
     src = x.src[0]
     if src.op is not Ops.INDEX or src.arg is not None: return None
+    if src.src[0].op in (Ops.REDUCE, Ops.REDUCE_AXIS): return None
     if src.src[0].op is Ops.DEFINE_REG: return None
     if src.src[0].op is Ops.AFTER and src.src[0].src[0].op is Ops.DEFINE_REG: return None
     if not all(s.op is Ops.CONST and s.arg == 0 for s in src.src[1:]): return None
@@ -182,6 +191,7 @@ def _broadcast_scalar_base(ctx: dict, x: UOp) -> UOp|None:
     if x.op not in (Ops.RESHAPE, Ops.EXPAND): return None
     base = x.base
     if base.op is not Ops.INDEX: return None
+    if base.src[0].op in (Ops.REDUCE, Ops.REDUCE_AXIS): return None
     if base.src[0].op is Ops.DEFINE_REG: return None
     if base.src[0].op is Ops.AFTER and base.src[0].src[0].op is Ops.DEFINE_REG: return None
     if base.arg == "value":
@@ -193,7 +203,10 @@ def _broadcast_scalar_base(ctx: dict, x: UOp) -> UOp|None:
         if not all(s.op is Ops.CONST and s.arg == 0 for s in base.src[1:]): return None
     else:
         return None
-    shape = x.shape
+    try:
+        shape = x.shape
+    except Exception:
+        return None
     ranges = ctx["ranges"]
     if shape is None or len(shape) != len(ranges): return None
     idx = tuple(UOp.const(dtypes.index, 0) if resolve(s == 1) else ranges[i] for i, s in enumerate(shape))
@@ -244,6 +257,13 @@ def _strip_device_const(ctx: dict, c: UOp) -> UOp|None:
   if c.op not in (Ops.CONST, Ops.VCONST): return None
   if len(c.src) == 0 or c.src[0].op is not Ops.DEVICE: return None
   return UOp.const(c.dtype, c.arg)
+
+def _add_device_const(ctx: dict, c: UOp) -> UOp|None:
+  if c.op not in (Ops.CONST, Ops.VCONST): return None
+  if len(c.src) != 0 and c.src[0].op is Ops.DEVICE: return None
+  dev = ctx.get("device")
+  if dev is None: return None
+  return UOp.const(c.dtype, c.arg, device=dev)
 
 def _drop_vector_expand(ctx: dict, x: UOp) -> UOp|None:
   if x.op not in (Ops.RESHAPE, Ops.EXPAND): return None
@@ -638,10 +658,11 @@ class HamiltonianSystem:
         q_start = q.detach()
         p_start = p.detach()
         if not double_buffer:
-            if vector_width > 1:
+            if vector_width > 1 and not getenv("TINYGRAD_COUPLED_FUSED_VEC_EXPERIMENTAL", 0):
                 q_out, p_out = self._evolve_coupled_two_phase_vec(q, p, dt, steps, vector_width)
             else:
-                q_out, p_out = self._evolve_scan_kernel_coupled_split(q, p, dt, steps, unroll_steps=unroll_steps)
+                q_out, p_out = self._evolve_scan_kernel_coupled_split(
+                    q, p, dt, steps, unroll_steps=unroll_steps, vector_width=vector_width)
             Tensor.realize(q_out, p_out)
             history = []
             history.append((q_start.numpy().copy(), p_start.numpy().copy(), self.energy(q_start, p_start)))
@@ -902,7 +923,7 @@ class HamiltonianSystem:
                 uop = graph_rewrite(
                     uop,
                     PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _const_to_vindex)], compiled=False),
-                    ctx={"ranges": ranges},
+                    ctx={"ranges": ranges, "device": device},
                     name="const_to_vindex",
                 )
                 uop = graph_rewrite(
@@ -910,12 +931,6 @@ class HamiltonianSystem:
                     PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _drop_scalar_value_index)], compiled=False),
                     ctx={},
                     name="drop_scalar_value_index",
-                )
-                uop = graph_rewrite(
-                    uop,
-                    PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _drop_const_reshape)], compiled=False),
-                    ctx={},
-                    name="drop_const_reshape",
                 )
                 uop = graph_rewrite(
                     uop,
@@ -932,7 +947,7 @@ class HamiltonianSystem:
                 uop = graph_rewrite(
                     uop,
                     PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _broadcast_value_index)], compiled=False),
-                    ctx={"ranges": ranges},
+                    ctx={"ranges": ranges, "device": device},
                     name="broadcast_value_index",
                 )
                 uop = graph_rewrite(
@@ -952,12 +967,6 @@ class HamiltonianSystem:
                     PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _drop_reg_expand)], compiled=False),
                     ctx={},
                     name="drop_reg_expand",
-                )
-                uop = graph_rewrite(
-                    uop,
-                    PatternMatcher([(UPat((Ops.CONST, Ops.VCONST), name="c"), _strip_device_const)], compiled=False),
-                    ctx={},
-                    name="strip_device_consts",
                 )
                 return uop
             q_val = q.vindex(*ranges)
@@ -1078,7 +1087,7 @@ class HamiltonianSystem:
                 uop = graph_rewrite(
                     uop,
                     PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _const_to_vindex)], compiled=False),
-                    ctx={"ranges": ranges},
+                    ctx={"ranges": ranges, "device": q.device},
                     name="const_to_vindex",
                 )
                 uop = graph_rewrite(
@@ -1086,12 +1095,6 @@ class HamiltonianSystem:
                     PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _drop_scalar_value_index)], compiled=False),
                     ctx={},
                     name="drop_scalar_value_index",
-                )
-                uop = graph_rewrite(
-                    uop,
-                    PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _drop_const_reshape)], compiled=False),
-                    ctx={},
-                    name="drop_const_reshape",
                 )
                 uop = graph_rewrite(
                     uop,
@@ -1108,7 +1111,7 @@ class HamiltonianSystem:
                 uop = graph_rewrite(
                     uop,
                     PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _broadcast_value_index)], compiled=False),
-                    ctx={"ranges": ranges},
+                    ctx={"ranges": ranges, "device": q.device},
                     name="broadcast_value_index",
                 )
                 uop = graph_rewrite(
@@ -1166,14 +1169,26 @@ class HamiltonianSystem:
 
     def _build_coupled_kernel_qp_new_with_reduce(self, dt: float, device: str, shape: tuple[int, ...], dtype,
                                                  dHdq_elem_uop: UOp, dHdp_elem_uop: UOp,
-                                                 reduce_uop: UOp, placeholders_dHdq: list[UOp]) -> Callable:
+                                                 reduce_uop: UOp, placeholders_dHdq: list[UOp],
+                                                 unroll_steps: int = 1, vector_width: int = 1) -> Callable:
         q_sym_uop, p_sym_uop, _, _ = self._get_coupled_grad_uops(device, shape, dtype)
         axis = reduce_uop.arg[1]
         if len(axis) != len(shape) or not all(i in axis for i in range(len(shape))):
             raise ValueError("split reduce kernel only supports full reductions")
+        if unroll_steps < 1:
+            raise ValueError("unroll_steps must be >= 1")
+        if vector_width < 1:
+            raise ValueError("vector_width must be >= 1")
+        if vector_width > 1 and shape and shape[-1] % vector_width != 0:
+            raise ValueError("vector_width must divide the last dimension")
 
-        def kernel(q: UOp, p: UOp, acc0: UOp, acc1_out: UOp, q_out: UOp, p_out: UOp) -> UOp:
-            ranges = [UOp.range(s, i+1) for i, s in enumerate(shape)]
+        def kernel(q: UOp, p: UOp, acc0_out: UOp, acc1_out: UOp, q_out: UOp, p_out: UOp) -> UOp:
+            use_vec = vector_width > 1
+            if use_vec:
+                ranges = [UOp.range(s, i+1) for i, s in enumerate(shape[:-1])]
+                ranges.append(UOp.range(shape[-1] // vector_width, len(shape)))
+            else:
+                ranges = [UOp.range(s, i+1) for i, s in enumerate(shape)]
             reduce_counter = [len(ranges) + 1]
             def rewrite_elem(uop: UOp) -> UOp:
                 uop = graph_rewrite(
@@ -1190,9 +1205,15 @@ class HamiltonianSystem:
                 )
                 uop = graph_rewrite(
                     uop,
-                    PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _drop_const_reshape)], compiled=False),
+                    PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _drop_empty_reshape)], compiled=False),
                     ctx={},
-                    name="drop_const_reshape",
+                    name="drop_empty_reshape",
+                )
+                uop = graph_rewrite(
+                    uop,
+                    PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _drop_zero_vec_shape)], compiled=False),
+                    ctx={},
+                    name="drop_zero_vec_shape",
                 )
                 uop = graph_rewrite(
                     uop,
@@ -1214,58 +1235,135 @@ class HamiltonianSystem:
                 )
                 uop = graph_rewrite(
                     uop,
-                    PatternMatcher([(UPat((Ops.CONST, Ops.VCONST), name="c"), _strip_device_const)], compiled=False),
-                    ctx={},
-                    name="strip_device_consts",
+                    PatternMatcher([(UPat((Ops.CONST, Ops.VCONST), name="c"), _add_device_const)], compiled=False),
+                    ctx={"device": device},
+                    name="add_device_consts",
                 )
                 return uop
-            q_val = q.vindex(*ranges)
-            p_val = p.vindex(*ranges)
-            acc0_val = acc0.vindex(UOp.const(dtypes.index, 0))
-            dHdq_1 = dHdq_elem_uop.substitute({q_sym_uop: q_val, p_sym_uop: p_val})
-            if placeholders_dHdq:
-                acc_loads = {placeholders_dHdq[i]: acc0_val for i in range(len(placeholders_dHdq))}
-                dHdq_1 = dHdq_1.substitute(acc_loads, name="reduce_placeholders")
-            dHdq_1 = rewrite_elem(dHdq_1)
-            half_dt = UOp.const(dHdq_1.dtype, 0.5 * dt, shape=tuple(r.vmax + 1 for r in ranges))
-            neg_one = UOp.const(dHdq_1.dtype, -1.0, shape=tuple(r.vmax + 1 for r in ranges))
-            p_half = p_val + (half_dt * dHdq_1) * neg_one
-            dHdp = dHdp_elem_uop.substitute({q_sym_uop: q_val, p_sym_uop: p_half})
-            dHdp = rewrite_elem(dHdp)
-            dt_uop = UOp.const(dHdp.dtype, dt, shape=tuple(r.vmax + 1 for r in ranges))
-            q_new = q_val + dt_uop * dHdp
-            red = reduce_uop.substitute({q_sym_uop: q_new, p_sym_uop: p_half})
-            red = graph_rewrite(
-                red,
-                PatternMatcher([(UPat(Ops.REDUCE_AXIS, name="x"), _lower_reduce_axis)], compiled=False),
-                ctx={"reduce_counter": reduce_counter, "ranges": ranges},
-                name="lower_reduce_axis",
-            )
-            red = rewrite_elem(red)
-            red = graph_rewrite(
-                red,
-                PatternMatcher([(UPat(Ops.REDUCE, name="x"), _reindex_reduce_input)], compiled=False),
-                ctx={"ranges": ranges},
-                name="reindex_reduce_input",
-            )
-            reduce_ranges = [r for r in red.ranges if r.arg[-1] == AxisType.REDUCE]
-            acc1_store = acc1_out.index(UOp.const(dtypes.index, 0), ptr=True).store(red).end(*reduce_ranges)
-            acc1_val = acc1_out.after(acc1_store).vindex(UOp.const(dtypes.index, 0))
-            dHdq_2 = dHdq_elem_uop.substitute({q_sym_uop: q_new, p_sym_uop: p_half})
-            if placeholders_dHdq:
-                acc_loads = {placeholders_dHdq[i]: acc1_val for i in range(len(placeholders_dHdq))}
-                dHdq_2 = dHdq_2.substitute(acc_loads, name="reduce_placeholders")
-            dHdq_2 = rewrite_elem(dHdq_2)
-            p_new = p_half + (half_dt * dHdq_2) * neg_one
-            store_q = q_out.index(*ranges, ptr=True).store(q_new)
-            store_p = p_out.index(*ranges, ptr=True).store(p_new)
-            return UOp.group(store_q, store_p).end(*ranges).sink(
-                arg=KernelInfo(name="coupled_qp_new_with_reduce", opts_to_apply=()))
+            if use_vec:
+                base = ranges[-1] * UOp.const(dtypes.index, vector_width, device=device)
+                q_ptr = q.index(*ranges[:-1], base, ptr=True)
+                p_ptr = p.index(*ranges[:-1], base, ptr=True)
+                vec_dtype = q.dtype.base.vec(vector_width)
+                q_vec_ptr = q_ptr.cast(vec_dtype.ptr(size=q_ptr.dtype.size, addrspace=q_ptr.dtype.addrspace))
+                p_vec_ptr = p_ptr.cast(vec_dtype.ptr(size=p_ptr.dtype.size, addrspace=p_ptr.dtype.addrspace))
+                q_vec = q_vec_ptr.load()
+                p_vec = p_vec_ptr.load()
+                q_lanes = [q_vec.gep(i) for i in range(vector_width)]
+                p_lanes = [p_vec.gep(i) for i in range(vector_width)]
+            else:
+                q_val = q.vindex(*ranges)
+                p_val = p.vindex(*ranges)
+            shape_vals = None if use_vec else tuple(r.vmax + 1 for r in ranges)
+            half_dt = UOp.const(q.dtype, 0.5 * dt, device=device, shape=shape_vals)
+            neg_one = UOp.const(q.dtype, -1.0, device=device, shape=shape_vals)
+            dt_uop = UOp.const(q.dtype, dt, device=device, shape=shape_vals)
+            for step in range(unroll_steps):
+                if use_vec:
+                    q_red = q_lanes[0]
+                    p_red = p_lanes[0]
+                    for i in range(1, vector_width):
+                        q_red = q_red + q_lanes[i]
+                        p_red = p_red + p_lanes[i]
+                    red0 = reduce_uop.substitute({q_sym_uop: q_red, p_sym_uop: p_red})
+                else:
+                    red0 = reduce_uop.substitute({q_sym_uop: q_val, p_sym_uop: p_val})
+                red0 = graph_rewrite(
+                    red0,
+                    PatternMatcher([(UPat(Ops.REDUCE_AXIS, name="x"), _lower_reduce_axis)], compiled=False),
+                    ctx={"reduce_counter": reduce_counter, "ranges": ranges},
+                    name="lower_reduce_axis",
+                )
+                # keep reduce graph intact to avoid invalid reshape rewrites
+                # leave reduce inputs as-is to avoid invalid reshapes on full-reduce paths
+                reduce_ranges0 = [r for r in red0.ranges if r.arg[-1] == AxisType.REDUCE]
+                acc0_idx = UOp.const(dtypes.index, step, device=device)
+                acc0_store = acc0_out.index(acc0_idx, ptr=True).store(red0).end(*reduce_ranges0)
+                acc0_val = red0
+                if not use_vec and shape_vals is not None and acc0_val.shape != shape_vals:
+                    acc0_val = acc0_val._broadcast_to(shape_vals)
+                if use_vec:
+                    p_half_lanes = []
+                    q_new_lanes = []
+                    for i in range(vector_width):
+                        dHdq_1 = dHdq_elem_uop.substitute({q_sym_uop: q_lanes[i], p_sym_uop: p_lanes[i]})
+                        if placeholders_dHdq:
+                            acc_loads = {placeholders_dHdq[j]: acc0_val for j in range(len(placeholders_dHdq))}
+                            dHdq_1 = dHdq_1.substitute(acc_loads, name="reduce_placeholders")
+                        dHdq_1 = rewrite_elem(dHdq_1)
+                        p_half = p_lanes[i] + (half_dt * dHdq_1) * neg_one
+                        dHdp = dHdp_elem_uop.substitute({q_sym_uop: q_lanes[i], p_sym_uop: p_half})
+                        dHdp = rewrite_elem(dHdp)
+                        q_new = q_lanes[i] + dt_uop * dHdp
+                        p_half_lanes.append(p_half)
+                        q_new_lanes.append(q_new)
+                    q_new_red = q_new_lanes[0]
+                    p_half_red = p_half_lanes[0]
+                    for i in range(1, vector_width):
+                        q_new_red = q_new_red + q_new_lanes[i]
+                        p_half_red = p_half_red + p_half_lanes[i]
+                    red1 = reduce_uop.substitute({q_sym_uop: q_new_red, p_sym_uop: p_half_red})
+                else:
+                    dHdq_1 = dHdq_elem_uop.substitute({q_sym_uop: q_val, p_sym_uop: p_val})
+                    if placeholders_dHdq:
+                        acc_loads = {placeholders_dHdq[j]: acc0_val for j in range(len(placeholders_dHdq))}
+                        dHdq_1 = dHdq_1.substitute(acc_loads, name="reduce_placeholders")
+                    dHdq_1 = rewrite_elem(dHdq_1)
+                    p_half = p_val + (half_dt * dHdq_1) * neg_one
+                    dHdp = dHdp_elem_uop.substitute({q_sym_uop: q_val, p_sym_uop: p_half})
+                    dHdp = rewrite_elem(dHdp)
+                    q_new = q_val + dt_uop * dHdp
+                    red1 = reduce_uop.substitute({q_sym_uop: q_new, p_sym_uop: p_half})
+                red1 = graph_rewrite(
+                    red1,
+                    PatternMatcher([(UPat(Ops.REDUCE_AXIS, name="x"), _lower_reduce_axis)], compiled=False),
+                    ctx={"reduce_counter": reduce_counter, "ranges": ranges},
+                    name="lower_reduce_axis",
+                )
+                # keep reduce graph intact to avoid invalid reshape rewrites
+                # leave reduce inputs as-is to avoid invalid reshapes on full-reduce paths
+                reduce_ranges1 = [r for r in red1.ranges if r.arg[-1] == AxisType.REDUCE]
+                acc1_idx = UOp.const(dtypes.index, step, device=device)
+                acc1_store = acc1_out.index(acc1_idx, ptr=True).store(red1).end(*reduce_ranges1)
+                acc1_val = red1
+                if not use_vec and shape_vals is not None and acc1_val.shape != shape_vals:
+                    acc1_val = acc1_val._broadcast_to(shape_vals)
+                if use_vec:
+                    p_new_lanes = []
+                    for i in range(vector_width):
+                        dHdq_2 = dHdq_elem_uop.substitute({q_sym_uop: q_new_lanes[i], p_sym_uop: p_half_lanes[i]})
+                        if placeholders_dHdq:
+                            acc_loads = {placeholders_dHdq[j]: acc1_val for j in range(len(placeholders_dHdq))}
+                            dHdq_2 = dHdq_2.substitute(acc_loads, name="reduce_placeholders")
+                        dHdq_2 = rewrite_elem(dHdq_2)
+                        p_new = p_half_lanes[i] + (half_dt * dHdq_2) * neg_one
+                        p_new_lanes.append(p_new)
+                    q_lanes = q_new_lanes
+                    p_lanes = p_new_lanes
+                else:
+                    dHdq_2 = dHdq_elem_uop.substitute({q_sym_uop: q_new, p_sym_uop: p_half})
+                    if placeholders_dHdq:
+                        acc_loads = {placeholders_dHdq[j]: acc1_val for j in range(len(placeholders_dHdq))}
+                        dHdq_2 = dHdq_2.substitute(acc_loads, name="reduce_placeholders")
+                    dHdq_2 = rewrite_elem(dHdq_2)
+                    p_new = p_half + (half_dt * dHdq_2) * neg_one
+                    q_val, p_val = q_new, p_new
+            if use_vec:
+                q_val = q_lanes[0].vectorize(*q_lanes[1:])
+                p_val = p_lanes[0].vectorize(*p_lanes[1:])
+                store_q = q_vec_ptr.store(q_val)
+                store_p = p_vec_ptr.store(p_val)
+            else:
+                store_q = q_out.index(*ranges, ptr=True).store(q_val)
+                store_p = p_out.index(*ranges, ptr=True).store(p_val)
+            sink = UOp.group(store_q, store_p).end(*ranges).sink(
+                arg=KernelInfo(name=f"coupled_qp_new_with_reduce_{unroll_steps}", opts_to_apply=()))
+            return _cse_uops(sink)
 
         return kernel
 
     def _evolve_scan_kernel_coupled_split(self, q: Tensor, p: Tensor, dt: float, steps: int,
-                                          unroll_steps: int = 1) -> tuple[Tensor, Tensor]:
+                                          unroll_steps: int = 1, vector_width: int = 1) -> tuple[Tensor, Tensor]:
         q_sym_uop, p_sym_uop, dHdq_uop, dHdp_uop = self._get_coupled_grad_uops(q.device, q.shape, q.dtype)
         dHdq_reduce_nodes = [u for u in dHdq_uop.toposort() if u.op is Ops.REDUCE_AXIS]
         dHdp_reduce_nodes = [u for u in dHdp_uop.toposort() if u.op is Ops.REDUCE_AXIS]
@@ -1309,12 +1407,36 @@ class HamiltonianSystem:
 
         kernel_qp_reduce = None
         if use_fused_qp:
+            dHdq_elem_use = dHdq_elem_uop
+            dHdp_elem_use = dHdp_elem_uop
+            if vector_width > 1:
+                const_vec = PatternMatcher([
+                    (UPat((Ops.CONST, Ops.VCONST), name="x"), _const_to_vec),
+                ], compiled=False)
+                drop_scalar_expand = PatternMatcher([
+                    (UPat((Ops.RESHAPE, Ops.EXPAND), name="x"),
+                     lambda x: x.src[0] if x.src[0]._shape is None else None),
+                ], compiled=False)
+                drop_vector_expand = PatternMatcher([
+                    (UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _drop_vector_expand),
+                ], compiled=False)
+                dHdq_elem_use = graph_rewrite(
+                    dHdq_elem_use, const_vec, ctx={"vector_width": vector_width}, name="const_vec")
+                dHdp_elem_use = graph_rewrite(
+                    dHdp_elem_use, const_vec, ctx={"vector_width": vector_width}, name="const_vec")
+                dHdq_elem_use = graph_rewrite(dHdq_elem_use, drop_scalar_expand, ctx={}, name="drop_scalar_expand")
+                dHdp_elem_use = graph_rewrite(dHdp_elem_use, drop_scalar_expand, ctx={}, name="drop_scalar_expand")
+                dHdq_elem_use = graph_rewrite(
+                    dHdq_elem_use, drop_vector_expand, ctx={"vector_width": vector_width}, name="drop_vector_expand")
+                dHdp_elem_use = graph_rewrite(
+                    dHdp_elem_use, drop_vector_expand, ctx={"vector_width": vector_width}, name="drop_vector_expand")
             red = dHdq_reduce_nodes[0]
-            key_qp = (self.H, q.device, q.shape, q.dtype, "qp_new_reduce", dt)
+            key_qp = (self.H, q.device, q.shape, q.dtype, "qp_new_reduce", dt, unroll_steps, vector_width)
             kernel_qp_reduce = self._elem_kernel_coupled_cache.get(key_qp)
             if kernel_qp_reduce is None:
                 kernel_qp_reduce = self._build_coupled_kernel_qp_new_with_reduce(
-                    dt, q.device, q.shape, q.dtype, dHdq_elem_uop, dHdp_elem_uop, red, dHdq_placeholders)
+                    dt, q.device, q.shape, q.dtype, dHdq_elem_use, dHdp_elem_use, red, dHdq_placeholders,
+                    unroll_steps=unroll_steps, vector_width=vector_width)
                 self._elem_kernel_coupled_cache[key_qp] = kernel_qp_reduce
         else:
             key_half = (self.H, q.device, q.shape, q.dtype, "p_half", dt)
@@ -1342,38 +1464,44 @@ class HamiltonianSystem:
         p_cur = p
         q_buf = Tensor.empty(*q.shape, device=q.device, dtype=q.dtype)
         p_buf = Tensor.empty(*p.shape, device=p.device, dtype=p.dtype)
+        acc_dtype = q.dtype
 
         if unroll_steps < 1:
             raise ValueError("unroll_steps must be >= 1")
         if steps % unroll_steps != 0:
             raise ValueError("steps must be divisible by unroll_steps")
-        for _ in range(steps // unroll_steps):
-            for _ in range(unroll_steps):
-                accs_dHdq = []
-                for red_kernel in reduce_kernels_dHdq:
-                    out = Tensor.empty(1, device=q.device, dtype=q.dtype)
-                    accs_dHdq.append(Tensor.custom_kernel(q_cur, p_cur, out, fxn=red_kernel)[2])
-                if use_fused_qp:
-                    acc0 = accs_dHdq[0]
-                    acc1_buf = Tensor.empty(1, device=q.device, dtype=q.dtype)
-                    out = Tensor.custom_kernel(q_cur, p_cur, acc0, acc1_buf, q_buf, p_buf, fxn=kernel_qp_reduce)
-                    q_new, p_new = out[4], out[5]
-                    Tensor.realize(q_new, p_new)
-                    q_cur, p_cur = q_new, p_new
-                    continue
-                p_half = Tensor.custom_kernel(q_cur, p_cur, *accs_dHdq, p_buf, fxn=kernel_p_half)[-1]
-                accs_dHdp = []
-                for red_kernel in reduce_kernels_dHdp:
-                    out = Tensor.empty(1, device=q.device, dtype=q.dtype)
-                    accs_dHdp.append(Tensor.custom_kernel(q_cur, p_half, out, fxn=red_kernel)[2])
-                q_new = Tensor.custom_kernel(q_cur, p_half, *accs_dHdp, q_buf, fxn=kernel_q_new)[-1]
-                accs_dHdq_2 = []
-                for red_kernel in reduce_kernels_dHdq:
-                    out = Tensor.empty(1, device=q.device, dtype=q.dtype)
-                    accs_dHdq_2.append(Tensor.custom_kernel(q_new, p_half, out, fxn=red_kernel)[2])
-                p_new = Tensor.custom_kernel(q_new, p_half, *accs_dHdq_2, p_buf, fxn=kernel_p_new)[-1]
+        if vector_width < 1:
+            raise ValueError("vector_width must be >= 1")
+        if vector_width > 1 and q.shape and q.shape[-1] % vector_width != 0:
+            raise ValueError("vector_width must divide the last dimension")
+        if use_fused_qp:
+            for _ in range(steps // unroll_steps):
+                acc0_buf = Tensor.empty(unroll_steps, device=q.device, dtype=acc_dtype)
+                acc1_buf = Tensor.empty(unroll_steps, device=q.device, dtype=acc_dtype)
+                out = Tensor.custom_kernel(q_cur, p_cur, acc0_buf, acc1_buf, q_buf, p_buf, fxn=kernel_qp_reduce)
+                q_new, p_new = out[4], out[5]
                 Tensor.realize(q_new, p_new)
                 q_cur, p_cur = q_new, p_new
+        else:
+            for _ in range(steps // unroll_steps):
+                for _ in range(unroll_steps):
+                    accs_dHdq = []
+                    for red_kernel in reduce_kernels_dHdq:
+                        out = Tensor.empty(1, device=q.device, dtype=q.dtype)
+                        accs_dHdq.append(Tensor.custom_kernel(q_cur, p_cur, out, fxn=red_kernel)[2])
+                    p_half = Tensor.custom_kernel(q_cur, p_cur, *accs_dHdq, p_buf, fxn=kernel_p_half)[-1]
+                    accs_dHdp = []
+                    for red_kernel in reduce_kernels_dHdp:
+                        out = Tensor.empty(1, device=q.device, dtype=q.dtype)
+                        accs_dHdp.append(Tensor.custom_kernel(q_cur, p_half, out, fxn=red_kernel)[2])
+                    q_new = Tensor.custom_kernel(q_cur, p_half, *accs_dHdp, q_buf, fxn=kernel_q_new)[-1]
+                    accs_dHdq_2 = []
+                    for red_kernel in reduce_kernels_dHdq:
+                        out = Tensor.empty(1, device=q.device, dtype=q.dtype)
+                        accs_dHdq_2.append(Tensor.custom_kernel(q_new, p_half, out, fxn=red_kernel)[2])
+                    p_new = Tensor.custom_kernel(q_new, p_half, *accs_dHdq_2, p_buf, fxn=kernel_p_new)[-1]
+                    Tensor.realize(q_new, p_new)
+                    q_cur, p_cur = q_new, p_new
 
         return q_cur, p_cur
 
@@ -1752,7 +1880,7 @@ class HamiltonianSystem:
                     neg_one = UOp.const(dHdq_1.dtype, -1.0, shape=shape_vals if not use_vec else None)
                     p_half = p_val + (half_dt * dHdq_1) * neg_one
                     if use_vec:
-                        store_p_half = p_ptr.store(p_half)
+                        store_p_half = p_vec_ptr.store(p_half)
                     else:
                         store_p_half = p_phase.index(*ranges, ptr=True).store(p_half)
                     dep = store_p_half
@@ -1783,7 +1911,7 @@ class HamiltonianSystem:
                     dt_uop = UOp.const(dHdp.dtype, dt, shape=shape_vals if not use_vec else None)
                     q_new = q_val + dt_uop * dHdp
                     if use_vec:
-                        store_q_new = q_ptr.store(q_new)
+                        store_q_new = q_vec_ptr.store(q_new)
                     else:
                         store_q_new = q_phase.index(*ranges, ptr=True).store(q_new)
                     dep = store_q_new
@@ -1814,7 +1942,7 @@ class HamiltonianSystem:
                     half_dt = UOp.const(dHdq_2.dtype, 0.5*dt, shape=shape_vals if not use_vec else None)
                     p_new = p_val + (half_dt * dHdq_2) * neg_one
                     if use_vec:
-                        store_p_new = p_ptr.store(p_new)
+                        store_p_new = p_vec_ptr.store(p_new)
                     else:
                         store_p_new = p_phase.index(*ranges, ptr=True).store(p_new)
                     dep = store_p_new
