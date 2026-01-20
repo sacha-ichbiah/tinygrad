@@ -117,6 +117,21 @@ def full_rewrite_to_sink(sink:UOp, ren:Renderer|None=None, optimize:bool=True) -
   pm_final_rewrite = pm_decomp+pm_render+extra_matcher+pm_split_ends
   sink = graph_rewrite(sink, pm_final_rewrite, ctx=ren.device, name="final rewrite")
 
+  # catch any late-introduced index dtypes
+  sink = graph_rewrite(sink, pm_lower_index_dtype+load_store_indexing, ctx=ren.device, name="lower all index dtypes (late)")
+  sink = graph_rewrite(
+    sink,
+    PatternMatcher([(UPat(Ops.CAST, dtype=dtypes.index, name="u"), lambda u: u.src[0])]),
+    name="strip index casts (late)",
+  )
+  sink = graph_rewrite(
+    sink,
+    PatternMatcher([
+      (UPat((Ops.RESHAPE, Ops.EXPAND), name="u"), lambda u: u.base if u.base.op is Ops.CONST else None),
+    ]),
+    name="strip const reshape/expand (late)",
+  )
+
   # this was the linearizer
   sink = graph_rewrite(sink, pm_add_control_flow, ctx=CFGContext(sink), name="add control flow", bottom_up=True)
 

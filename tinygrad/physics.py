@@ -178,6 +178,18 @@ def _broadcast_scalar_base(ctx: dict, x: UOp) -> UOp|None:
     idx = tuple(UOp.const(dtypes.index, 0) if resolve(s == 1) else ranges[i] for i, s in enumerate(shape))
     return base.src[0].vindex(*idx, dtype=x.dtype)
 
+def _drop_const_reshape(ctx: dict, x: UOp) -> UOp|None:
+  if x.op not in (Ops.RESHAPE, Ops.EXPAND): return None
+  base = x.base
+  if base.op not in (Ops.CONST, Ops.VCONST): return None
+  try:
+    shape = x.shape
+  except Exception:
+    return None
+  if shape is None: return None
+  if not all(resolve(s == 1) for s in shape): return None
+  return base
+
 
 
 
@@ -652,30 +664,29 @@ class HamiltonianSystem:
                 dHdp = dHdp_uop.substitute(sub)
                 return dHdq, dHdp
 
-            stores: list[UOp] = []
-            q_cur = q_base
-            p_cur = p_base
+            q_val = q_base.vindex(*ranges)
+            p_val = p_base.vindex(*ranges)
             for _ in range(unroll_steps):
-                q_val = q_cur.vindex(*ranges)
-                p_val = p_cur.vindex(*ranges)
-
                 dHdq_1, _ = grad_uop(q_val, p_val)
                 dt_uop = dHdq_1.const_like(dt)
                 half_dt = dHdq_1.const_like(0.5*dt)
+                try:
+                    if dt_uop.shape is not None and len(dt_uop.shape) == len(ranges):
+                        dt_uop = dt_uop.vindex(*ranges)
+                    if half_dt.shape is not None and len(half_dt.shape) == len(ranges):
+                        half_dt = half_dt.vindex(*ranges)
+                except Exception:
+                    pass
                 p_half = p_val - half_dt * dHdq_1
                 _, dHdp = grad_uop(q_val, p_half)
                 q_new = q_val + dt_uop * dHdp
                 dHdq_2, _ = grad_uop(q_new, p_half)
                 p_new = p_half - half_dt * dHdq_2
+                q_val, p_val = q_new, p_new
 
-                store_q = q_base.index(*ranges, ptr=True).store(q_new.vindex(*ranges))
-                store_p = p_base.index(*ranges, ptr=True).store(p_new.vindex(*ranges))
-                group = UOp.group(store_q, store_p)
-                stores.extend((store_q, store_p))
-                q_cur = q_base.after(group)
-                p_cur = p_base.after(group)
-
-            kernel_sink = UOp.group(*stores).end(*ranges, step).sink(
+            store_q = q_base.index(*ranges, ptr=True).store(q_val)
+            store_p = p_base.index(*ranges, ptr=True).store(p_val)
+            kernel_sink = UOp.group(store_q, store_p).end(*ranges, step).sink(
                 arg=KernelInfo(name=f"leapfrog_scan_coupled_{steps}", opts_to_apply=()))
             lower_reduce_axis = PatternMatcher([
                 (UPat(Ops.REDUCE_AXIS, name="x"), _lower_reduce_axis),
@@ -685,6 +696,9 @@ class HamiltonianSystem:
             ], compiled=False)
             drop_scalar_value_index = PatternMatcher([
                 (UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _drop_scalar_value_index),
+            ], compiled=False)
+            drop_const_reshape = PatternMatcher([
+                (UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _drop_const_reshape),
             ], compiled=False)
             broadcast_value_index = PatternMatcher([
                 (UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _broadcast_value_index),
@@ -712,6 +726,12 @@ class HamiltonianSystem:
                 drop_scalar_value_index,
                 ctx={},
                 name="drop_scalar_value_index",
+            )
+            kernel_sink = graph_rewrite(
+                kernel_sink,
+                drop_const_reshape,
+                ctx={},
+                name="drop_const_reshape",
             )
             kernel_sink = graph_rewrite(
                 kernel_sink,
@@ -769,6 +789,13 @@ class HamiltonianSystem:
             dHdq_1, _ = grad_uop(q_val, p_val)
             dt_uop = dHdq_1.const_like(dt)
             half_dt = dHdq_1.const_like(0.5*dt)
+            try:
+                if dt_uop.shape is not None and len(dt_uop.shape) == len(ranges):
+                    dt_uop = dt_uop.vindex(*ranges)
+                if half_dt.shape is not None and len(half_dt.shape) == len(ranges):
+                    half_dt = half_dt.vindex(*ranges)
+            except Exception:
+                pass
             p_half = p_val - half_dt * dHdq_1
             _, dHdp = grad_uop(q_val, p_half)
             q_new = q_val + dt_uop * dHdp
@@ -787,6 +814,9 @@ class HamiltonianSystem:
             ], compiled=False)
             drop_scalar_value_index = PatternMatcher([
                 (UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _drop_scalar_value_index),
+            ], compiled=False)
+            drop_const_reshape = PatternMatcher([
+                (UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _drop_const_reshape),
             ], compiled=False)
             broadcast_value_index = PatternMatcher([
                 (UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _broadcast_value_index),
@@ -814,6 +844,12 @@ class HamiltonianSystem:
                 drop_scalar_value_index,
                 ctx={},
                 name="drop_scalar_value_index",
+            )
+            kernel_sink = graph_rewrite(
+                kernel_sink,
+                drop_const_reshape,
+                ctx={},
+                name="drop_const_reshape",
             )
             kernel_sink = graph_rewrite(
                 kernel_sink,
