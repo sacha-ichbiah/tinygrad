@@ -200,3 +200,5 @@ The **Linear Symplectic Accelerator** is a specialized "fast path" in your compi
 * **When to avoid:** General N-body gravity, non-linear deep learning physics models.
 
 Implementing this gives `tinyphysics` a capability that almost no other differentiable physics engine exposes: **analytical time travel** for linear systems.
+
+

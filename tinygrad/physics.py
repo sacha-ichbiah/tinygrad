@@ -15,11 +15,13 @@ This is the "native language" of physics on AI hardware.
 from tinygrad.engine.jit import TinyJit, JitError
 from tinygrad.engine.realize import capturing
 from tinygrad.helpers import getenv
+from tinygrad.codegen.opt import Opt, OptOps
 from tinygrad.dtype import dtypes
 from tinygrad.tensor import Tensor
-from tinygrad.uop.ops import AxisType, KernelInfo, Ops, UOp, PatternMatcher, UPat, graph_rewrite, resolve
+from tinygrad.uop.ops import AxisType, GroupOp, KernelInfo, Ops, UOp, PatternMatcher, UPat, graph_rewrite, resolve
 from tinygrad.uop.symbolic import symbolic
 from typing import Callable
+import time
 
 # ============================================================================
 # CORE: HAMILTONIAN MECHANICS VIA AUTOGRAD
@@ -92,6 +94,11 @@ def _lower_reduce_axis(ctx: dict, x: UOp) -> UOp:
       name="reduce_reindex",
     )
   reduced = UOp(Ops.REDUCE, x.dtype, src=(src0,)+tuple(reduce_ranges), arg=x.arg[0])
+  if full_reduce and reduced.dtype.count > 1:
+    scalar = reduced.gep(0)
+    for i in range(1, reduced.dtype.count):
+      scalar = scalar + reduced.gep(i)
+    reduced = scalar.broadcast(reduced.dtype.count)
   if full_reduce:
     idx = tuple(UOp.const(dtypes.index, 0) for _ in range(len(ranges)))
   else:
@@ -189,6 +196,23 @@ def _drop_const_reshape(ctx: dict, x: UOp) -> UOp|None:
   if shape is None: return None
   if not all(resolve(s == 1) for s in shape): return None
   return base
+
+def _cse_uops(sink: UOp) -> UOp:
+  cse: dict[tuple, UOp] = {}
+  cache: dict[UOp, UOp] = {}
+  def visit(u: UOp) -> UOp:
+    src = tuple(cache[s] for s in u.src)
+    if src != u.src: u = u.replace(src=src)
+    if u.op not in GroupOp.ALU and u.op not in {
+      Ops.CONST, Ops.VCONST, Ops.CAST, Ops.BITCAST, Ops.GEP, Ops.WHERE, Ops.VECTORIZE, Ops.REDUCE,
+    }:
+      return u
+    key = (u.op, u.arg, u.dtype, src)
+    ret = cse.get(key)
+    if ret is not None: return ret
+    cse[key] = u
+    return u
+  return sink.topovisit(visit, cache)
 
 
 
@@ -333,8 +357,13 @@ class HamiltonianSystem:
         self._jit_step = TinyJit(self.step)
         self._jit_step_inplace = TinyJit(self.step_inplace)
         self._scan_kernel_cache: dict[tuple[float, int, int, int, str, tuple[int, ...], object], Callable] = {}
-        self._scan_kernel_coupled_cache: dict[tuple[float, int, str, tuple[int, ...], object], Callable] = {}
+        self._scan_kernel_coupled_cache: dict[tuple[float, int, int, int, str, tuple[int, ...], object], Callable] = {}
         self._step_kernel_coupled_cache: dict[tuple[float, str, tuple[int, ...], object], Callable] = {}
+        self._grad_kernel_coupled_cache: dict[tuple[str, tuple[int, ...], object], Callable] = {}
+        self._update_kernel_coupled_cache: dict[tuple[float, str, tuple[int, ...], object, int], Callable] = {}
+        self._update_kernel_coupled_p_cache: dict[tuple[float, str, tuple[int, ...], object, int], Callable] = {}
+        self._scan_kernel_coupled_tune_cache: dict[tuple[float, int, str, tuple[int, ...], object], int] = {}
+        self._grad_uop_cache: dict[tuple[object, str, tuple[int, ...], object], tuple[UOp, UOp, UOp, UOp]] = {}
 
     def step(self, q: Tensor, p: Tensor, dt: float = 0.01) -> tuple[Tensor, Tensor]:
         return self._step(q, p, self.H, dt)
@@ -427,7 +456,8 @@ class HamiltonianSystem:
 
     def evolve_scan_kernel(self, q: Tensor, p: Tensor, dt: float, steps: int, coupled: bool = False,
                            unroll_steps: int = 1, vector_width: int = 1, inplace: bool = False,
-                           coupled_fused: bool = False, double_buffer: bool = False) -> tuple[Tensor, Tensor, list]:
+                           coupled_fused: bool = False, double_buffer: bool = False, scan_tune: bool = False,
+                           tune_unrolls: tuple[int, ...] = (1, 2, 4, 8)) -> tuple[Tensor, Tensor, list]:
         """Single-kernel scan for leapfrog with static steps (elementwise H)."""
         if self.integrator_name != "leapfrog":
             raise ValueError("scan kernel only supports leapfrog")
@@ -440,7 +470,8 @@ class HamiltonianSystem:
         if coupled:
             if coupled_fused:
                 return self.evolve_scan_kernel_coupled_fused(
-                    q, p, dt, steps, unroll_steps=unroll_steps, double_buffer=double_buffer)
+                    q, p, dt, steps, unroll_steps=unroll_steps, vector_width=vector_width,
+                    double_buffer=double_buffer, scan_tune=scan_tune, tune_unrolls=tune_unrolls)
             return self.evolve_scan_kernel_coupled(q, p, dt, steps, unroll_steps=unroll_steps)
         if unroll_steps < 1:
             raise ValueError("unroll_steps must be >= 1")
@@ -519,7 +550,9 @@ class HamiltonianSystem:
         return q, p, history
 
     def evolve_scan_kernel_coupled_fused(self, q: Tensor, p: Tensor, dt: float, steps: int,
-                                         unroll_steps: int = 1, double_buffer: bool = False) -> tuple[Tensor, Tensor, list]:
+                                         unroll_steps: int = 1, vector_width: int = 1, double_buffer: bool = False,
+                                         scan_tune: bool = False,
+                                         tune_unrolls: tuple[int, ...] = (1, 2, 4, 8)) -> tuple[Tensor, Tensor, list]:
         """Single-kernel scan for coupled H."""
         if self.integrator_name != "leapfrog":
             raise ValueError("scan kernel only supports leapfrog")
@@ -539,10 +572,42 @@ class HamiltonianSystem:
             raise ValueError("unroll_steps must be >= 1")
         if steps % unroll_steps != 0:
             raise ValueError("steps must be divisible by unroll_steps")
+        if vector_width < 1:
+            raise ValueError("vector_width must be >= 1")
+        if vector_width > 1 and q.shape and q.shape[-1] % vector_width != 0:
+            raise ValueError("vector_width must divide the last dimension")
+        if double_buffer and scan_tune:
+            raise ValueError("scan_tune does not support double_buffer")
         if double_buffer and unroll_steps != 1:
             raise ValueError("double_buffer does not support unroll_steps > 1")
         q_start = q.detach()
         p_start = p.detach()
+        if scan_tune:
+            key = (dt, steps, q.device, q.shape, q.dtype, vector_width)
+            unroll_steps = self._scan_kernel_coupled_tune_cache.get(key, 0)
+            if unroll_steps == 0:
+                best_elapsed = float("inf")
+                best_unroll = 1
+                for unroll in tune_unrolls:
+                    if unroll < 1 or steps % unroll != 0:
+                        continue
+                    key_u = (dt, steps, unroll, vector_width, q.device, q.shape, q.dtype)
+                    kernel = self._scan_kernel_coupled_cache.get(key_u)
+                    if kernel is None:
+                        kernel = self._build_leapfrog_scan_kernel_coupled(dt, steps, q.device, q.shape, q.dtype,
+                                                                          unroll_steps=unroll, vector_width=vector_width)
+                        self._scan_kernel_coupled_cache[key_u] = kernel
+                    q_tmp = q_start.clone().realize()
+                    p_tmp = p_start.clone().realize()
+                    start = time.perf_counter()
+                    q_out, p_out = Tensor.custom_kernel(q_tmp, p_tmp, fxn=kernel)[:2]
+                    Tensor.realize(q_out, p_out)
+                    elapsed = time.perf_counter() - start
+                    if elapsed < best_elapsed:
+                        best_elapsed = elapsed
+                        best_unroll = unroll
+                self._scan_kernel_coupled_tune_cache[key] = best_unroll
+                unroll_steps = best_unroll
         if double_buffer:
             key = (dt, q.device, q.shape, q.dtype)
             kernel = self._step_kernel_coupled_cache.get(key)
@@ -559,13 +624,18 @@ class HamiltonianSystem:
                 q_a, p_a, q_b, p_b = q_next, p_next, q_a, p_a
             q_out, p_out = q_a, p_a
         else:
-            key = (dt, steps, unroll_steps, q.device, q.shape, q.dtype)
-            kernel = self._scan_kernel_coupled_cache.get(key)
-            if kernel is None:
-                kernel = self._build_leapfrog_scan_kernel_coupled(dt, steps, q.device, q.shape, q.dtype,
-                                                                  unroll_steps=unroll_steps)
-                self._scan_kernel_coupled_cache[key] = kernel
-            q_out, p_out = Tensor.custom_kernel(q, p, fxn=kernel)[:2]
+            if vector_width > 1 and unroll_steps != 1:
+                raise ValueError("vector_width with coupled_fused requires unroll_steps=1")
+            if vector_width > 1 and self._coupled_has_reduce(q.device, q.shape, q.dtype):
+                q_out, p_out = self._evolve_coupled_two_phase_vec(q, p, dt, steps, vector_width)
+            else:
+                key = (dt, steps, unroll_steps, vector_width, q.device, q.shape, q.dtype)
+                kernel = self._scan_kernel_coupled_cache.get(key)
+                if kernel is None:
+                    kernel = self._build_leapfrog_scan_kernel_coupled(dt, steps, q.device, q.shape, q.dtype,
+                                                                      unroll_steps=unroll_steps, vector_width=vector_width)
+                    self._scan_kernel_coupled_cache[key] = kernel
+                q_out, p_out = Tensor.custom_kernel(q, p, fxn=kernel)[:2]
         Tensor.realize(q_out, p_out)
 
         history = []
@@ -573,121 +643,32 @@ class HamiltonianSystem:
         history.append((q_out.numpy().copy(), p_out.numpy().copy(), self.energy(q_out, p_out)))
         return q_out, p_out, history
 
+    def _coupled_has_reduce(self, device: str, shape: tuple[int, ...], dtype) -> bool:
+        _, _, dHdq_uop, dHdp_uop = self._get_coupled_grad_uops(device, shape, dtype)
+        return any(u.op is Ops.REDUCE_AXIS for u in dHdq_uop.toposort()) or any(u.op is Ops.REDUCE_AXIS for u in dHdp_uop.toposort())
 
-    def _build_leapfrog_scan_kernel(self, dt: float, steps: int, unroll_steps: int, vector_width: int,
-                                    device: str, shape: tuple[int, ...], dtype) -> Callable:
-        q_sym = Tensor.empty((), device=device, dtype=dtype, requires_grad=True)
-        p_sym = Tensor.empty((), device=device, dtype=dtype, requires_grad=True)
-        H_sym = self.H(q_sym, p_sym)
-        dHdq_sym, dHdp_sym = H_sym.gradient(q_sym, p_sym)
+    def _build_coupled_grad_kernel(self, device: str, shape: tuple[int, ...], dtype) -> Callable:
+        q_sym_uop, p_sym_uop, dHdq_uop, dHdp_uop = self._get_coupled_grad_uops(device, shape, dtype)
         strip_device_consts = PatternMatcher([
             (UPat(Ops.CONST, src=(UPat(Ops.DEVICE),), name="c"), lambda c: UOp.const(c.dtype, c.arg)),
         ])
-        dHdq_uop = graph_rewrite(dHdq_sym.uop, strip_device_consts, name="strip_device_consts")
-        dHdq_uop = graph_rewrite(dHdq_uop, symbolic, name="symbolic_dHdq")
-        dHdp_uop = graph_rewrite(dHdp_sym.uop, strip_device_consts, name="strip_device_consts")
-        dHdp_uop = graph_rewrite(dHdp_uop, symbolic, name="symbolic_dHdp")
 
-        def grad_uop(q_uop: UOp, p_uop: UOp) -> tuple[UOp, UOp]:
-            sub = {q_sym.uop: q_uop, p_sym.uop: p_uop}
-            return dHdq_uop.substitute(sub), dHdp_uop.substitute(sub)
-
-        def kernel(q: UOp, p: UOp) -> UOp:
-            tile_steps = steps // unroll_steps
-            step = UOp.range(tile_steps, 0)
-            q_step = q.after(step)
-            p_step = p.after(step)
-
-            q_flat = q_step.flatten()
-            p_flat = p_step.flatten()
-            idx = UOp.range(q_flat.size, 1) if vector_width == 1 else None
-            if vector_width == 1:
-                q_elem = q_flat.after(step)[idx]
-                p_elem = p_flat.after(step)[idx]
-            else:
-                outer = q_flat.size // vector_width
-                oidx = UOp.range(outer, 1)
-                base = oidx * UOp.const(dtypes.index, vector_width)
-                q_ptr = q_flat.after(step).index(base, ptr=True)
-                p_ptr = p_flat.after(step).index(base, ptr=True)
-                q_vec_ptr = q_ptr.cast(q_flat.dtype.base.vec(vector_width).ptr(size=q_ptr.dtype.size, addrspace=q_ptr.dtype.addrspace))
-                p_vec_ptr = p_ptr.cast(p_flat.dtype.base.vec(vector_width).ptr(size=p_ptr.dtype.size, addrspace=p_ptr.dtype.addrspace))
-                q_elem = q_vec_ptr.load()
-                p_elem = p_vec_ptr.load()
-
-            for _ in range(unroll_steps):
-                dHdq_1, _ = grad_uop(q_elem, p_elem)
-                dt_uop = dHdq_1.const_like(dt)
-                half_dt = dHdq_1.const_like(0.5*dt)
-                p_half = p_elem - half_dt * dHdq_1
-                _, dHdp = grad_uop(q_elem, p_half)
-                q_elem = q_elem + dt_uop * dHdp
-                dHdq_2, _ = grad_uop(q_elem, p_half)
-                p_elem = p_half - half_dt * dHdq_2
-
-            if vector_width == 1:
-                store_q = q_flat.after(step)[idx].store(q_elem)
-                store_p = p_flat.after(step)[idx].store(p_elem)
-                return UOp.group(store_q, store_p).end(idx, step).sink(arg=KernelInfo(name=f"leapfrog_scan_{steps}", opts_to_apply=()))
-
-            store_q = q_vec_ptr.store(q_elem)
-            store_p = p_vec_ptr.store(p_elem)
-            return UOp.group(store_q, store_p).end(oidx, step).sink(arg=KernelInfo(name=f"leapfrog_scan_{steps}", opts_to_apply=()))
-
-        return kernel
-
-    def _build_leapfrog_scan_kernel_coupled(self, dt: float, steps: int, device: str, shape: tuple[int, ...], dtype,
-                                            unroll_steps: int = 1) -> Callable:
-        q_sym = Tensor.empty(*shape, device=device, dtype=dtype, requires_grad=True)
-        p_sym = Tensor.empty(*shape, device=device, dtype=dtype, requires_grad=True)
-        H_sym = self.H(q_sym, p_sym)
-        dHdq_sym, dHdp_sym = H_sym.gradient(q_sym, p_sym)
-        strip_device_consts = PatternMatcher([
-            (UPat(Ops.CONST, src=(UPat(Ops.DEVICE),), name="c"), lambda c: UOp.const(c.dtype, c.arg)),
-        ])
-        dHdq_uop = graph_rewrite(dHdq_sym.uop, strip_device_consts, name="strip_device_consts")
-        dHdq_uop = graph_rewrite(dHdq_uop, symbolic, name="symbolic_dHdq")
-        dHdp_uop = graph_rewrite(dHdp_sym.uop, strip_device_consts, name="strip_device_consts")
-        dHdp_uop = graph_rewrite(dHdp_uop, symbolic, name="symbolic_dHdp")
-
-        def kernel(q: UOp, p: UOp) -> UOp:
-            tile_steps = steps // unroll_steps
-            step = UOp.range(tile_steps, 0)
-            q_base = q.after(step)
-            p_base = p.after(step)
-
+        def kernel(q: UOp, p: UOp, dHdq_out: UOp, dHdp_out: UOp) -> UOp:
             ranges = [UOp.range(s, i+1) for i,s in enumerate(shape)]
             reduce_counter = [len(ranges) + 1]
             def grad_uop(q_uop: UOp, p_uop: UOp) -> tuple[UOp, UOp]:
-                sub = {q_sym.uop: q_uop, p_sym.uop: p_uop}
+                sub = {q_sym_uop: q_uop, p_sym_uop: p_uop}
                 dHdq = dHdq_uop.substitute(sub)
                 dHdp = dHdp_uop.substitute(sub)
                 return dHdq, dHdp
 
-            q_val = q_base.vindex(*ranges)
-            p_val = p_base.vindex(*ranges)
-            for _ in range(unroll_steps):
-                dHdq_1, _ = grad_uop(q_val, p_val)
-                dt_uop = dHdq_1.const_like(dt)
-                half_dt = dHdq_1.const_like(0.5*dt)
-                try:
-                    if dt_uop.shape is not None and len(dt_uop.shape) == len(ranges):
-                        dt_uop = dt_uop.vindex(*ranges)
-                    if half_dt.shape is not None and len(half_dt.shape) == len(ranges):
-                        half_dt = half_dt.vindex(*ranges)
-                except Exception:
-                    pass
-                p_half = p_val - half_dt * dHdq_1
-                _, dHdp = grad_uop(q_val, p_half)
-                q_new = q_val + dt_uop * dHdp
-                dHdq_2, _ = grad_uop(q_new, p_half)
-                p_new = p_half - half_dt * dHdq_2
-                q_val, p_val = q_new, p_new
-
-            store_q = q_base.index(*ranges, ptr=True).store(q_val)
-            store_p = p_base.index(*ranges, ptr=True).store(p_val)
-            kernel_sink = UOp.group(store_q, store_p).end(*ranges, step).sink(
-                arg=KernelInfo(name=f"leapfrog_scan_coupled_{steps}", opts_to_apply=()))
+            q_val = q.vindex(*ranges)
+            p_val = p.vindex(*ranges)
+            dHdq, dHdp = grad_uop(q_val, p_val)
+            store_dHdq = dHdq_out.index(*ranges, ptr=True).store(dHdq.vindex(*ranges))
+            store_dHdp = dHdp_out.index(*ranges, ptr=True).store(dHdp.vindex(*ranges))
+            kernel_sink = UOp.group(store_dHdq, store_dHdp).end(*ranges).sink(
+                arg=KernelInfo(name="coupled_grad", opts_to_apply=()))
             lower_reduce_axis = PatternMatcher([
                 (UPat(Ops.REDUCE_AXIS, name="x"), _lower_reduce_axis),
             ], compiled=False)
@@ -757,11 +738,169 @@ class HamiltonianSystem:
                 ctx={"ranges": ranges},
                 name="reindex_reduce_input",
             )
-            return graph_rewrite(kernel_sink, strip_device_consts, name="strip_device_consts")
+            kernel_sink = graph_rewrite(kernel_sink, strip_device_consts, name="strip_device_consts")
+            return _cse_uops(kernel_sink)
 
         return kernel
 
-    def _build_leapfrog_step_kernel_coupled(self, dt: float, device: str, shape: tuple[int, ...], dtype) -> Callable:
+    def _build_coupled_update_kernel(self, dt: float, device: str, shape: tuple[int, ...], dtype,
+                                     vector_width: int) -> Callable:
+        def kernel(q: UOp, p: UOp, dHdq: UOp, dHdp: UOp, q_out: UOp, p_half_out: UOp) -> UOp:
+            ranges = [UOp.range(s, i+1) for i,s in enumerate(shape[:-1])]
+            ranges.append(UOp.range(shape[-1] // vector_width, len(shape)))
+            base = ranges[-1] * UOp.const(dtypes.index, vector_width)
+            q_ptr = q.index(*ranges[:-1], base, ptr=True)
+            p_ptr = p.index(*ranges[:-1], base, ptr=True)
+            dHdq_ptr = dHdq.index(*ranges[:-1], base, ptr=True)
+            dHdp_ptr = dHdp.index(*ranges[:-1], base, ptr=True)
+            vec_dtype = q.dtype.base.vec(vector_width)
+            q_vec = q_ptr.cast(vec_dtype.ptr(size=q_ptr.dtype.size, addrspace=q_ptr.dtype.addrspace)).load()
+            p_vec = p_ptr.cast(vec_dtype.ptr(size=p_ptr.dtype.size, addrspace=p_ptr.dtype.addrspace)).load()
+            dHdq_vec = dHdq_ptr.cast(vec_dtype.ptr(size=dHdq_ptr.dtype.size, addrspace=dHdq_ptr.dtype.addrspace)).load()
+            dHdp_vec = dHdp_ptr.cast(vec_dtype.ptr(size=dHdp_ptr.dtype.size, addrspace=dHdp_ptr.dtype.addrspace)).load()
+            dt_uop = UOp.const(vec_dtype, dt)
+            half_dt = UOp.const(vec_dtype, 0.5*dt)
+            p_half = p_vec - half_dt * dHdq_vec
+            q_new = q_vec + dt_uop * dHdp_vec
+            q_out_ptr = q_out.index(*ranges[:-1], base, ptr=True)
+            p_half_ptr = p_half_out.index(*ranges[:-1], base, ptr=True)
+            store_q = q_out_ptr.cast(vec_dtype.ptr(size=q_out_ptr.dtype.size, addrspace=q_out_ptr.dtype.addrspace)).store(q_new)
+            store_p_half = p_half_ptr.cast(vec_dtype.ptr(size=p_half_ptr.dtype.size, addrspace=p_half_ptr.dtype.addrspace)).store(p_half)
+            return UOp.group(store_q, store_p_half).end(*ranges).sink(
+                arg=KernelInfo(name="coupled_update_qp", opts_to_apply=()))
+
+        return kernel
+
+    def _build_coupled_update_p_kernel(self, dt: float, device: str, shape: tuple[int, ...], dtype,
+                                       vector_width: int) -> Callable:
+        def kernel(p_half: UOp, dHdq: UOp, p_out: UOp) -> UOp:
+            ranges = [UOp.range(s, i+1) for i,s in enumerate(shape[:-1])]
+            ranges.append(UOp.range(shape[-1] // vector_width, len(shape)))
+            base = ranges[-1] * UOp.const(dtypes.index, vector_width)
+            p_half_ptr = p_half.index(*ranges[:-1], base, ptr=True)
+            dHdq_ptr = dHdq.index(*ranges[:-1], base, ptr=True)
+            vec_dtype = p_half.dtype.base.vec(vector_width)
+            p_half_vec = p_half_ptr.cast(vec_dtype.ptr(size=p_half_ptr.dtype.size, addrspace=p_half_ptr.dtype.addrspace)).load()
+            dHdq_vec = dHdq_ptr.cast(vec_dtype.ptr(size=dHdq_ptr.dtype.size, addrspace=dHdq_ptr.dtype.addrspace)).load()
+            half_dt = UOp.const(vec_dtype, 0.5*dt)
+            p_new = p_half_vec - half_dt * dHdq_vec
+            p_out_ptr = p_out.index(*ranges[:-1], base, ptr=True)
+            store_p = p_out_ptr.cast(vec_dtype.ptr(size=p_out_ptr.dtype.size, addrspace=p_out_ptr.dtype.addrspace)).store(p_new)
+            return store_p.end(*ranges).sink(arg=KernelInfo(name="coupled_update_p", opts_to_apply=()))
+
+        return kernel
+
+    def _evolve_coupled_two_phase_vec(self, q: Tensor, p: Tensor, dt: float, steps: int,
+                                      vector_width: int) -> tuple[Tensor, Tensor]:
+        if vector_width < 2:
+            raise ValueError("vector_width must be >= 2 for two-phase path")
+        if q.shape[-1] % vector_width != 0:
+            raise ValueError("vector_width must divide the last dimension")
+        key = (q.device, q.shape, q.dtype)
+        grad_kernel = self._grad_kernel_coupled_cache.get(key)
+        if grad_kernel is None:
+            grad_kernel = self._build_coupled_grad_kernel(q.device, q.shape, q.dtype)
+            self._grad_kernel_coupled_cache[key] = grad_kernel
+        key_u = (dt, q.device, q.shape, q.dtype, vector_width)
+        update_kernel = self._update_kernel_coupled_cache.get(key_u)
+        if update_kernel is None:
+            update_kernel = self._build_coupled_update_kernel(dt, q.device, q.shape, q.dtype, vector_width)
+            self._update_kernel_coupled_cache[key_u] = update_kernel
+        update_p_kernel = self._update_kernel_coupled_p_cache.get(key_u)
+        if update_p_kernel is None:
+            update_p_kernel = self._build_coupled_update_p_kernel(dt, q.device, q.shape, q.dtype, vector_width)
+            self._update_kernel_coupled_p_cache[key_u] = update_p_kernel
+
+        q_cur, p_cur = q, p
+        for _ in range(steps):
+            dHdq = Tensor.empty(*q.shape, device=q.device, dtype=q.dtype)
+            dHdp = Tensor.empty(*p.shape, device=p.device, dtype=p.dtype)
+            out = Tensor.custom_kernel(q_cur, p_cur, dHdq, dHdp, fxn=grad_kernel)
+            dHdq, dHdp = out[2], out[3]
+            q_new = Tensor.empty(*q.shape, device=q.device, dtype=q.dtype)
+            p_half = Tensor.empty(*p.shape, device=p.device, dtype=p.dtype)
+            out = Tensor.custom_kernel(q_cur, p_cur, dHdq, dHdp, q_new, p_half, fxn=update_kernel)
+            q_new, p_half = out[4], out[5]
+            Tensor.realize(q_new, p_half)
+            dHdq2 = Tensor.empty(*q.shape, device=q.device, dtype=q.dtype)
+            dHdp2 = Tensor.empty(*p.shape, device=p.device, dtype=p.dtype)
+            out = Tensor.custom_kernel(q_new, p_half, dHdq2, dHdp2, fxn=grad_kernel)
+            dHdq2 = out[2]
+            p_new = Tensor.empty(*p.shape, device=p.device, dtype=p.dtype)
+            out = Tensor.custom_kernel(p_half, dHdq2, p_new, fxn=update_p_kernel)
+            p_new = out[2]
+            Tensor.realize(p_new)
+            q_cur, p_cur = q_new, p_new
+        return q_cur, p_cur
+
+
+    def _build_leapfrog_scan_kernel(self, dt: float, steps: int, unroll_steps: int, vector_width: int,
+                                    device: str, shape: tuple[int, ...], dtype) -> Callable:
+        q_sym = Tensor.empty((), device=device, dtype=dtype, requires_grad=True)
+        p_sym = Tensor.empty((), device=device, dtype=dtype, requires_grad=True)
+        H_sym = self.H(q_sym, p_sym)
+        dHdq_sym, dHdp_sym = H_sym.gradient(q_sym, p_sym)
+        strip_device_consts = PatternMatcher([
+            (UPat(Ops.CONST, src=(UPat(Ops.DEVICE),), name="c"), lambda c: UOp.const(c.dtype, c.arg)),
+        ])
+        dHdq_uop = graph_rewrite(dHdq_sym.uop, strip_device_consts, name="strip_device_consts")
+        dHdq_uop = graph_rewrite(dHdq_uop, symbolic, name="symbolic_dHdq")
+        dHdp_uop = graph_rewrite(dHdp_sym.uop, strip_device_consts, name="strip_device_consts")
+        dHdp_uop = graph_rewrite(dHdp_uop, symbolic, name="symbolic_dHdp")
+
+        def grad_uop(q_uop: UOp, p_uop: UOp) -> tuple[UOp, UOp]:
+            sub = {q_sym.uop: q_uop, p_sym.uop: p_uop}
+            return dHdq_uop.substitute(sub), dHdp_uop.substitute(sub)
+
+        def kernel(q: UOp, p: UOp) -> UOp:
+            tile_steps = steps // unroll_steps
+            step = UOp.range(tile_steps, 0)
+            q_step = q.after(step)
+            p_step = p.after(step)
+
+            q_flat = q_step.flatten()
+            p_flat = p_step.flatten()
+            idx = UOp.range(q_flat.size, 1) if vector_width == 1 else None
+            if vector_width == 1:
+                q_elem = q_flat.after(step)[idx]
+                p_elem = p_flat.after(step)[idx]
+            else:
+                outer = q_flat.size // vector_width
+                oidx = UOp.range(outer, 1)
+                base = oidx * UOp.const(dtypes.index, vector_width)
+                q_ptr = q_flat.after(step).index(base, ptr=True)
+                p_ptr = p_flat.after(step).index(base, ptr=True)
+                q_vec_ptr = q_ptr.cast(q_flat.dtype.base.vec(vector_width).ptr(size=q_ptr.dtype.size, addrspace=q_ptr.dtype.addrspace))
+                p_vec_ptr = p_ptr.cast(p_flat.dtype.base.vec(vector_width).ptr(size=p_ptr.dtype.size, addrspace=p_ptr.dtype.addrspace))
+                q_elem = q_vec_ptr.load()
+                p_elem = p_vec_ptr.load()
+
+            for _ in range(unroll_steps):
+                dHdq_1, _ = grad_uop(q_elem, p_elem)
+                dt_uop = dHdq_1.const_like(dt)
+                half_dt = dHdq_1.const_like(0.5*dt)
+                p_half = p_elem - half_dt * dHdq_1
+                _, dHdp = grad_uop(q_elem, p_half)
+                q_elem = q_elem + dt_uop * dHdp
+                dHdq_2, _ = grad_uop(q_elem, p_half)
+                p_elem = p_half - half_dt * dHdq_2
+
+            if vector_width == 1:
+                store_q = q_flat.after(step)[idx].store(q_elem)
+                store_p = p_flat.after(step)[idx].store(p_elem)
+                return UOp.group(store_q, store_p).end(idx, step).sink(arg=KernelInfo(name=f"leapfrog_scan_{steps}", opts_to_apply=()))
+
+            store_q = q_vec_ptr.store(q_elem)
+            store_p = p_vec_ptr.store(p_elem)
+            return UOp.group(store_q, store_p).end(oidx, step).sink(arg=KernelInfo(name=f"leapfrog_scan_{steps}", opts_to_apply=()))
+
+        return kernel
+
+    def _get_coupled_grad_uops(self, device: str, shape: tuple[int, ...], dtype) -> tuple[UOp, UOp, UOp, UOp]:
+        key = (self.H, device, shape, dtype)
+        cached = self._grad_uop_cache.get(key)
+        if cached is not None:
+            return cached
         q_sym = Tensor.empty(*shape, device=device, dtype=dtype, requires_grad=True)
         p_sym = Tensor.empty(*shape, device=device, dtype=dtype, requires_grad=True)
         H_sym = self.H(q_sym, p_sym)
@@ -773,12 +912,167 @@ class HamiltonianSystem:
         dHdq_uop = graph_rewrite(dHdq_uop, symbolic, name="symbolic_dHdq")
         dHdp_uop = graph_rewrite(dHdp_sym.uop, strip_device_consts, name="strip_device_consts")
         dHdp_uop = graph_rewrite(dHdp_uop, symbolic, name="symbolic_dHdp")
+        self._grad_uop_cache[key] = (q_sym.uop, p_sym.uop, dHdq_uop, dHdp_uop)
+        return self._grad_uop_cache[key]
+
+    def _build_leapfrog_scan_kernel_coupled(self, dt: float, steps: int, device: str, shape: tuple[int, ...], dtype,
+                                            unroll_steps: int = 1, vector_width: int = 1) -> Callable:
+        q_sym_uop, p_sym_uop, dHdq_uop, dHdp_uop = self._get_coupled_grad_uops(device, shape, dtype)
+        has_reduce = any(u.op is Ops.REDUCE_AXIS for u in dHdq_uop.toposort()) or any(u.op is Ops.REDUCE_AXIS for u in dHdp_uop.toposort())
+        use_vec = vector_width > 1 and not has_reduce
+        strip_device_consts = PatternMatcher([
+            (UPat(Ops.CONST, src=(UPat(Ops.DEVICE),), name="c"), lambda c: UOp.const(c.dtype, c.arg)),
+        ])
+
+        def kernel(q: UOp, p: UOp) -> UOp:
+            tile_steps = steps // unroll_steps
+            step = UOp.range(tile_steps, 0)
+            q_base = q.after(step)
+            p_base = p.after(step)
+
+            if use_vec:
+                ranges = [UOp.range(s, i+1) for i,s in enumerate(shape[:-1])]
+                ranges.append(UOp.range(shape[-1] // vector_width, len(shape)))
+            else:
+                ranges = [UOp.range(s, i+1) for i,s in enumerate(shape)]
+            reduce_counter = [len(ranges) + 1]
+            def grad_uop(q_uop: UOp, p_uop: UOp) -> tuple[UOp, UOp]:
+                sub = {q_sym_uop: q_uop, p_sym_uop: p_uop}
+                dHdq = dHdq_uop.substitute(sub)
+                dHdp = dHdp_uop.substitute(sub)
+                return dHdq, dHdp
+
+            if use_vec:
+                base = ranges[-1] * UOp.const(dtypes.index, vector_width)
+                q_ptr = q_base.index(*ranges[:-1], base, ptr=True)
+                p_ptr = p_base.index(*ranges[:-1], base, ptr=True)
+                vec_dtype = q_base.dtype.base.vec(vector_width)
+                q_vec_ptr = q_ptr.cast(vec_dtype.ptr(size=q_ptr.dtype.size, addrspace=q_ptr.dtype.addrspace))
+                p_vec_ptr = p_ptr.cast(vec_dtype.ptr(size=p_ptr.dtype.size, addrspace=p_ptr.dtype.addrspace))
+                q_val = q_vec_ptr.load()
+                p_val = p_vec_ptr.load()
+            else:
+                q_val = q_base.vindex(*ranges)
+                p_val = p_base.vindex(*ranges)
+            for _ in range(unroll_steps):
+                dHdq_1, _ = grad_uop(q_val, p_val)
+                if use_vec:
+                    dt_uop = UOp.const(dHdq_1.dtype, dt)
+                    half_dt = UOp.const(dHdq_1.dtype, 0.5*dt)
+                else:
+                    dt_uop = dHdq_1.const_like(dt)
+                    half_dt = dHdq_1.const_like(0.5*dt)
+                try:
+                    if dt_uop.shape is not None and len(dt_uop.shape) == len(ranges):
+                        dt_uop = dt_uop.vindex(*ranges)
+                    if half_dt.shape is not None and len(half_dt.shape) == len(ranges):
+                        half_dt = half_dt.vindex(*ranges)
+                except Exception:
+                    pass
+                p_half = p_val - half_dt * dHdq_1
+                _, dHdp = grad_uop(q_val, p_half)
+                q_new = q_val + dt_uop * dHdp
+                dHdq_2, _ = grad_uop(q_new, p_half)
+                p_new = p_half - half_dt * dHdq_2
+                q_val, p_val = q_new, p_new
+
+            if use_vec:
+                store_q = q_vec_ptr.store(q_val)
+                store_p = p_vec_ptr.store(p_val)
+            else:
+                store_q = q_base.index(*ranges, ptr=True).store(q_val)
+                store_p = p_base.index(*ranges, ptr=True).store(p_val)
+            opts_to_apply = ()
+            if vector_width > 1:
+                axis = len(ranges) - 1
+                opts_to_apply = (Opt(OptOps.UNROLL, axis, vector_width),)
+            kernel_sink = UOp.group(store_q, store_p).end(*ranges, step).sink(
+                arg=KernelInfo(name=f"leapfrog_scan_coupled_{steps}", opts_to_apply=opts_to_apply))
+            lower_reduce_axis = PatternMatcher([
+                (UPat(Ops.REDUCE_AXIS, name="x"), _lower_reduce_axis),
+            ], compiled=False)
+            const_to_vindex = PatternMatcher([
+                (UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _const_to_vindex),
+            ], compiled=False)
+            drop_scalar_value_index = PatternMatcher([
+                (UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _drop_scalar_value_index),
+            ], compiled=False)
+            drop_const_reshape = PatternMatcher([
+                (UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _drop_const_reshape),
+            ], compiled=False)
+            broadcast_value_index = PatternMatcher([
+                (UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _broadcast_value_index),
+            ], compiled=False)
+            broadcast_scalar_index = PatternMatcher([
+                (UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _broadcast_scalar_index),
+            ], compiled=False)
+            broadcast_scalar_base = PatternMatcher([
+                (UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _broadcast_scalar_base),
+            ], compiled=False)
+            kernel_sink = graph_rewrite(
+                kernel_sink,
+                lower_reduce_axis,
+                ctx={"reduce_counter": reduce_counter, "ranges": ranges},
+                name="lower_reduce_axis",
+            )
+            kernel_sink = graph_rewrite(
+                kernel_sink,
+                const_to_vindex,
+                ctx={"ranges": ranges},
+                name="const_to_vindex",
+            )
+            kernel_sink = graph_rewrite(
+                kernel_sink,
+                drop_scalar_value_index,
+                ctx={},
+                name="drop_scalar_value_index",
+            )
+            kernel_sink = graph_rewrite(
+                kernel_sink,
+                drop_const_reshape,
+                ctx={},
+                name="drop_const_reshape",
+            )
+            kernel_sink = graph_rewrite(
+                kernel_sink,
+                broadcast_value_index,
+                ctx={"ranges": ranges},
+                name="broadcast_value_index",
+            )
+            kernel_sink = graph_rewrite(
+                kernel_sink,
+                broadcast_scalar_index,
+                ctx={"ranges": ranges},
+                name="broadcast_scalar_index",
+            )
+            kernel_sink = graph_rewrite(
+                kernel_sink,
+                broadcast_scalar_base,
+                ctx={"ranges": ranges},
+                name="broadcast_scalar_base",
+            )
+            kernel_sink = graph_rewrite(
+                kernel_sink,
+                PatternMatcher([(UPat(Ops.REDUCE, name="x"), _reindex_reduce_input)], compiled=False),
+                ctx={"ranges": ranges},
+                name="reindex_reduce_input",
+            )
+            kernel_sink = graph_rewrite(kernel_sink, strip_device_consts, name="strip_device_consts")
+            return _cse_uops(kernel_sink)
+
+        return kernel
+
+    def _build_leapfrog_step_kernel_coupled(self, dt: float, device: str, shape: tuple[int, ...], dtype) -> Callable:
+        q_sym_uop, p_sym_uop, dHdq_uop, dHdp_uop = self._get_coupled_grad_uops(device, shape, dtype)
+        strip_device_consts = PatternMatcher([
+            (UPat(Ops.CONST, src=(UPat(Ops.DEVICE),), name="c"), lambda c: UOp.const(c.dtype, c.arg)),
+        ])
 
         def kernel(q: UOp, p: UOp, q_out: UOp, p_out: UOp) -> UOp:
             ranges = [UOp.range(s, i+1) for i,s in enumerate(shape)]
             reduce_counter = [len(ranges) + 1]
             def grad_uop(q_uop: UOp, p_uop: UOp) -> tuple[UOp, UOp]:
-                sub = {q_sym.uop: q_uop, p_sym.uop: p_uop}
+                sub = {q_sym_uop: q_uop, p_sym_uop: p_uop}
                 dHdq = dHdq_uop.substitute(sub)
                 dHdp = dHdp_uop.substitute(sub)
                 return dHdq, dHdp
@@ -875,7 +1169,8 @@ class HamiltonianSystem:
                 ctx={"ranges": ranges},
                 name="reindex_reduce_input",
             )
-            return graph_rewrite(kernel_sink, strip_device_consts, name="strip_device_consts")
+            kernel_sink = graph_rewrite(kernel_sink, strip_device_consts, name="strip_device_consts")
+            return _cse_uops(kernel_sink)
 
         return kernel
 

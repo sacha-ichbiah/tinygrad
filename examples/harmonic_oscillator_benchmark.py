@@ -310,14 +310,14 @@ def main():
           if steps % unroll != 0:
             continue
           elapsed, steps_per_s = _bench_scan(coupled_system, steps, repeats, coupled=True, size=coupled_size,
-                                             unroll_steps=unroll, vector_width=1, inplace=scan_inplace,
+                                             unroll_steps=unroll, vector_width=scan_vec, inplace=scan_inplace,
                                              coupled_fused=True)
           if best is None or steps_per_s > best[1]:
             best = (unroll, steps_per_s, elapsed)
         scan_unroll, steps_per_s, elapsed = best
       else:
         elapsed, steps_per_s = _bench_scan(coupled_system, steps, repeats, coupled=True, size=coupled_size,
-                                           unroll_steps=scan_unroll, vector_width=1, inplace=scan_inplace,
+                                           unroll_steps=scan_unroll, vector_width=scan_vec, inplace=scan_inplace,
                                            coupled_fused=True)
       time_per_step_s = elapsed / steps
       print(f"{integrator:12s} {'scan_cpl_f':12s} {'-':5s} {'-':6s} {elapsed*1e3:10.2f} {steps_per_s:12,.0f}")
@@ -326,7 +326,7 @@ def main():
         "mode": "scan_coupled_fused",
         "hamiltonian": "coupled",
         "scan_unroll": scan_unroll,
-        "scan_vec": 1,
+        "scan_vec": scan_vec,
         "scan_tune": scan_tune,
         "scan_inplace": scan_inplace,
         "jit": False,
