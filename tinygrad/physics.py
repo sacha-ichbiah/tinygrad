@@ -1182,7 +1182,7 @@ class HamiltonianSystem:
         if vector_width > 1 and shape and shape[-1] % vector_width != 0:
             raise ValueError("vector_width must divide the last dimension")
 
-        def kernel(q: UOp, p: UOp, acc0_out: UOp, acc1_out: UOp, q_out: UOp, p_out: UOp) -> UOp:
+        def kernel(q: UOp, p: UOp, q_out: UOp, p_out: UOp) -> UOp:
             use_vec = vector_width > 1
             if use_vec:
                 ranges = [UOp.range(s, i+1) for i, s in enumerate(shape[:-1])]
@@ -1190,6 +1190,8 @@ class HamiltonianSystem:
             else:
                 ranges = [UOp.range(s, i+1) for i, s in enumerate(shape)]
             reduce_counter = [len(ranges) + 1]
+            acc0_reg = UOp(Ops.DEFINE_REG, q.dtype.ptr(size=unroll_steps, addrspace=AddrSpace.REG), arg=0)
+            acc1_reg = UOp(Ops.DEFINE_REG, q.dtype.ptr(size=unroll_steps, addrspace=AddrSpace.REG), arg=1)
             def rewrite_elem(uop: UOp) -> UOp:
                 uop = graph_rewrite(
                     uop,
@@ -1247,24 +1249,23 @@ class HamiltonianSystem:
                 vec_dtype = q.dtype.base.vec(vector_width)
                 q_vec_ptr = q_ptr.cast(vec_dtype.ptr(size=q_ptr.dtype.size, addrspace=q_ptr.dtype.addrspace))
                 p_vec_ptr = p_ptr.cast(vec_dtype.ptr(size=p_ptr.dtype.size, addrspace=p_ptr.dtype.addrspace))
-                q_vec = q_vec_ptr.load()
-                p_vec = p_vec_ptr.load()
-                q_lanes = [q_vec.gep(i) for i in range(vector_width)]
-                p_lanes = [p_vec.gep(i) for i in range(vector_width)]
+                q_val = q_vec_ptr.load()
+                p_val = p_vec_ptr.load()
             else:
                 q_val = q.vindex(*ranges)
                 p_val = p.vindex(*ranges)
             shape_vals = None if use_vec else tuple(r.vmax + 1 for r in ranges)
-            half_dt = UOp.const(q.dtype, 0.5 * dt, device=device, shape=shape_vals)
-            neg_one = UOp.const(q.dtype, -1.0, device=device, shape=shape_vals)
-            dt_uop = UOp.const(q.dtype, dt, device=device, shape=shape_vals)
+            const_dtype = vec_dtype if use_vec else q.dtype
+            half_dt = UOp.const(const_dtype, 0.5 * dt, device=device, shape=shape_vals)
+            neg_one = UOp.const(const_dtype, -1.0, device=device, shape=shape_vals)
+            dt_uop = UOp.const(const_dtype, dt, device=device, shape=shape_vals)
             for step in range(unroll_steps):
                 if use_vec:
-                    q_red = q_lanes[0]
-                    p_red = p_lanes[0]
+                    q_red = q_val.gep(0)
+                    p_red = p_val.gep(0)
                     for i in range(1, vector_width):
-                        q_red = q_red + q_lanes[i]
-                        p_red = p_red + p_lanes[i]
+                        q_red = q_red + q_val.gep(i)
+                        p_red = p_red + p_val.gep(i)
                     red0 = reduce_uop.substitute({q_sym_uop: q_red, p_sym_uop: p_red})
                 else:
                     red0 = reduce_uop.substitute({q_sym_uop: q_val, p_sym_uop: p_val})
@@ -1278,30 +1279,26 @@ class HamiltonianSystem:
                 # leave reduce inputs as-is to avoid invalid reshapes on full-reduce paths
                 reduce_ranges0 = [r for r in red0.ranges if r.arg[-1] == AxisType.REDUCE]
                 acc0_idx = UOp.const(dtypes.index, step, device=device)
-                acc0_store = acc0_out.index(acc0_idx, ptr=True).store(red0).end(*reduce_ranges0)
-                acc0_val = red0
+                acc0_store = acc0_reg.index(acc0_idx).store(red0).end(*reduce_ranges0)
+                acc0_val = acc0_reg.after(acc0_store).index(acc0_idx)
                 if not use_vec and shape_vals is not None and acc0_val.shape != shape_vals:
                     acc0_val = acc0_val._broadcast_to(shape_vals)
                 if use_vec:
-                    p_half_lanes = []
-                    q_new_lanes = []
-                    for i in range(vector_width):
-                        dHdq_1 = dHdq_elem_uop.substitute({q_sym_uop: q_lanes[i], p_sym_uop: p_lanes[i]})
-                        if placeholders_dHdq:
-                            acc_loads = {placeholders_dHdq[j]: acc0_val for j in range(len(placeholders_dHdq))}
-                            dHdq_1 = dHdq_1.substitute(acc_loads, name="reduce_placeholders")
-                        dHdq_1 = rewrite_elem(dHdq_1)
-                        p_half = p_lanes[i] + (half_dt * dHdq_1) * neg_one
-                        dHdp = dHdp_elem_uop.substitute({q_sym_uop: q_lanes[i], p_sym_uop: p_half})
-                        dHdp = rewrite_elem(dHdp)
-                        q_new = q_lanes[i] + dt_uop * dHdp
-                        p_half_lanes.append(p_half)
-                        q_new_lanes.append(q_new)
-                    q_new_red = q_new_lanes[0]
-                    p_half_red = p_half_lanes[0]
+                    acc0_vec = acc0_val if acc0_val.dtype.count == vector_width else acc0_val.broadcast(vector_width)
+                    dHdq_1 = dHdq_elem_uop.substitute({q_sym_uop: q_val, p_sym_uop: p_val})
+                    if placeholders_dHdq:
+                        acc_loads = {placeholders_dHdq[j]: acc0_vec for j in range(len(placeholders_dHdq))}
+                        dHdq_1 = dHdq_1.substitute(acc_loads, name="reduce_placeholders")
+                    dHdq_1 = rewrite_elem(dHdq_1)
+                    p_half = p_val + (half_dt * dHdq_1) * neg_one
+                    dHdp = dHdp_elem_uop.substitute({q_sym_uop: q_val, p_sym_uop: p_half})
+                    dHdp = rewrite_elem(dHdp)
+                    q_new = q_val + dt_uop * dHdp
+                    q_new_red = q_new.gep(0)
+                    p_half_red = p_half.gep(0)
                     for i in range(1, vector_width):
-                        q_new_red = q_new_red + q_new_lanes[i]
-                        p_half_red = p_half_red + p_half_lanes[i]
+                        q_new_red = q_new_red + q_new.gep(i)
+                        p_half_red = p_half_red + p_half.gep(i)
                     red1 = reduce_uop.substitute({q_sym_uop: q_new_red, p_sym_uop: p_half_red})
                 else:
                     dHdq_1 = dHdq_elem_uop.substitute({q_sym_uop: q_val, p_sym_uop: p_val})
@@ -1324,22 +1321,19 @@ class HamiltonianSystem:
                 # leave reduce inputs as-is to avoid invalid reshapes on full-reduce paths
                 reduce_ranges1 = [r for r in red1.ranges if r.arg[-1] == AxisType.REDUCE]
                 acc1_idx = UOp.const(dtypes.index, step, device=device)
-                acc1_store = acc1_out.index(acc1_idx, ptr=True).store(red1).end(*reduce_ranges1)
-                acc1_val = red1
+                acc1_store = acc1_reg.index(acc1_idx).store(red1).end(*reduce_ranges1)
+                acc1_val = acc1_reg.after(acc1_store).index(acc1_idx)
                 if not use_vec and shape_vals is not None and acc1_val.shape != shape_vals:
                     acc1_val = acc1_val._broadcast_to(shape_vals)
                 if use_vec:
-                    p_new_lanes = []
-                    for i in range(vector_width):
-                        dHdq_2 = dHdq_elem_uop.substitute({q_sym_uop: q_new_lanes[i], p_sym_uop: p_half_lanes[i]})
-                        if placeholders_dHdq:
-                            acc_loads = {placeholders_dHdq[j]: acc1_val for j in range(len(placeholders_dHdq))}
-                            dHdq_2 = dHdq_2.substitute(acc_loads, name="reduce_placeholders")
-                        dHdq_2 = rewrite_elem(dHdq_2)
-                        p_new = p_half_lanes[i] + (half_dt * dHdq_2) * neg_one
-                        p_new_lanes.append(p_new)
-                    q_lanes = q_new_lanes
-                    p_lanes = p_new_lanes
+                    acc1_vec = acc1_val if acc1_val.dtype.count == vector_width else acc1_val.broadcast(vector_width)
+                    dHdq_2 = dHdq_elem_uop.substitute({q_sym_uop: q_new, p_sym_uop: p_half})
+                    if placeholders_dHdq:
+                        acc_loads = {placeholders_dHdq[j]: acc1_vec for j in range(len(placeholders_dHdq))}
+                        dHdq_2 = dHdq_2.substitute(acc_loads, name="reduce_placeholders")
+                    dHdq_2 = rewrite_elem(dHdq_2)
+                    p_new = p_half + (half_dt * dHdq_2) * neg_one
+                    q_val, p_val = q_new, p_new
                 else:
                     dHdq_2 = dHdq_elem_uop.substitute({q_sym_uop: q_new, p_sym_uop: p_half})
                     if placeholders_dHdq:
@@ -1349,8 +1343,6 @@ class HamiltonianSystem:
                     p_new = p_half + (half_dt * dHdq_2) * neg_one
                     q_val, p_val = q_new, p_new
             if use_vec:
-                q_val = q_lanes[0].vectorize(*q_lanes[1:])
-                p_val = p_lanes[0].vectorize(*p_lanes[1:])
                 store_q = q_vec_ptr.store(q_val)
                 store_p = p_vec_ptr.store(p_val)
             else:
@@ -1464,7 +1456,6 @@ class HamiltonianSystem:
         p_cur = p
         q_buf = Tensor.empty(*q.shape, device=q.device, dtype=q.dtype)
         p_buf = Tensor.empty(*p.shape, device=p.device, dtype=p.dtype)
-        acc_dtype = q.dtype
 
         if unroll_steps < 1:
             raise ValueError("unroll_steps must be >= 1")
@@ -1476,10 +1467,8 @@ class HamiltonianSystem:
             raise ValueError("vector_width must divide the last dimension")
         if use_fused_qp:
             for _ in range(steps // unroll_steps):
-                acc0_buf = Tensor.empty(unroll_steps, device=q.device, dtype=acc_dtype)
-                acc1_buf = Tensor.empty(unroll_steps, device=q.device, dtype=acc_dtype)
-                out = Tensor.custom_kernel(q_cur, p_cur, acc0_buf, acc1_buf, q_buf, p_buf, fxn=kernel_qp_reduce)
-                q_new, p_new = out[4], out[5]
+                out = Tensor.custom_kernel(q_cur, p_cur, q_buf, p_buf, fxn=kernel_qp_reduce)
+                q_new, p_new = out[2], out[3]
                 Tensor.realize(q_new, p_new)
                 q_cur, p_cur = q_new, p_new
         else:
