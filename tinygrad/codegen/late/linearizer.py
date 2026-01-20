@@ -84,6 +84,7 @@ class CFGContext:
       for x,y in zipped:
         # TODO: this can happen! it causes infinite loop in shufflenet
         if x.op is Ops.RANGE and x.arg[-1] == AxisType.REDUCE: continue
+        if len(y.src) < 2 or len(x.src) < 2: continue
         assert y.src[1] not in x.backward_slice_with_self
         self.edges[y.src[1]] = x
 

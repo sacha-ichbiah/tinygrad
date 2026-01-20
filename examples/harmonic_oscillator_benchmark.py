@@ -125,6 +125,24 @@ def _energy_stats(history: list[tuple]) -> tuple[float, float]:
   return max_rel, rms_rel
 
 
+def _scan_energy_history(system: HamiltonianSystem, q: Tensor, p: Tensor, dt: float, steps: int, coupled: bool,
+                         vector_width: int, coupled_fused: bool) -> tuple[list[tuple], Tensor, Tensor]:
+  history = []
+  q_cur, p_cur = q, p
+  e0 = system.energy(q_cur, p_cur)
+  history.append((None, None, float(e0.numpy() if hasattr(e0, "numpy") else e0)))
+  for _ in range(steps):
+    q_cur, p_cur, _ = system.evolve_scan_kernel(q_cur, p_cur, dt=dt, steps=1, coupled=coupled,
+                                                unroll_steps=1, vector_width=vector_width, coupled_fused=coupled_fused)
+    e = system.energy(q_cur, p_cur)
+    history.append((None, None, float(e.numpy() if hasattr(e, "numpy") else e)))
+  return history, q_cur, p_cur
+
+
+def _max_abs_diff(a: Tensor, b: Tensor) -> float:
+  return float((a - b).abs().max().numpy())
+
+
 def _bench_scan(system: HamiltonianSystem, steps: int, repeats: int, coupled: bool, size: int,
                 unroll_steps: int, vector_width: int, inplace: bool, coupled_fused: bool = False) -> tuple[float, float]:
   def run_once() -> float:
@@ -339,7 +357,7 @@ def main():
 
     if stability:
       q, p = _make_state(size)
-      _, _, history = system.evolve(q, p, dt=stability_dt, steps=stability_steps, record_every=1)
+      q_ref, p_ref, history = system.evolve(q, p, dt=stability_dt, steps=stability_steps, record_every=1)
       max_rel, rms_rel = _energy_stats(history)
       stability_results.append({
         "integrator": integrator,
@@ -350,14 +368,32 @@ def main():
         "steps": stability_steps,
         "dt": stability_dt,
       })
+      if include_scan_coupled_fused and use_coupled_hamiltonian:
+        q_scan, p_scan = _make_state(size)
+        scan_history, q_scan, p_scan = _scan_energy_history(
+          system, q_scan, p_scan, dt=stability_dt, steps=stability_steps, coupled=True,
+          vector_width=scan_vec, coupled_fused=True)
+        max_rel, rms_rel = _energy_stats(scan_history)
+        stability_results.append({
+          "integrator": integrator,
+          "mode": "stability_scan_coupled_fused",
+          "hamiltonian": "coupled",
+          "max_rel_drift": max_rel,
+          "rms_rel_drift": rms_rel,
+          "max_abs_q": _max_abs_diff(q_ref, q_scan),
+          "max_abs_p": _max_abs_diff(p_ref, p_scan),
+          "scan_vec": scan_vec,
+          "steps": stability_steps,
+          "dt": stability_dt,
+        })
 
   if stability:
     print("-" * 72)
     print("NUMERICAL STABILITY (ENERGY DRIFT)")
     print("-" * 72)
-    print(f"{'integrator':12s} {'max_rel_ppm':>12s} {'rms_rel_ppm':>12s}")
+    print(f"{'integrator':12s} {'mode':22s} {'max_rel_ppm':>12s} {'rms_rel_ppm':>12s}")
     for row in stability_results:
-      print(f"{row['integrator']:12s} {row['max_rel_drift']*1e6:12.2f} {row['rms_rel_drift']*1e6:12.2f}")
+      print(f"{row['integrator']:12s} {row['mode']:22s} {row['max_rel_drift']*1e6:12.2f} {row['rms_rel_drift']*1e6:12.2f}")
     json_results.extend(stability_results)
 
   if json_path:
