@@ -472,6 +472,28 @@ def implicit_midpoint_inplace(q: Tensor, p: Tensor, H_func, dt: float = 0.01,
     return q, p
 
 
+def implicit_midpoint_into(q: Tensor, p: Tensor, q_out: Tensor, p_out: Tensor, H_func, dt: float = 0.01,
+                           tol: float = 1e-10, max_iter: int = 10) -> tuple[Tensor, Tensor]:
+    fixed_iters = _implicit_fixed_iters(dt, max_iter)
+    if fixed_iters <= 0:
+        q_next, p_next = implicit_midpoint(q, p, H_func, dt=dt, tol=tol, max_iter=max_iter)
+        q_out.assign(q_next)
+        p_out.assign(p_next)
+        return q_out, p_out
+
+    dHdq, dHdp = _grad_H(q, p, H_func)
+    half_dt = 0.5 * dt
+    q_mid = q + half_dt * dHdp
+    p_mid = p - half_dt * dHdq
+    for _ in range(fixed_iters):
+        dHdq_mid, dHdp_mid = _grad_H(q_mid, p_mid, H_func)
+        q_mid = q + half_dt * dHdp_mid
+        p_mid = p - half_dt * dHdq_mid
+    q_out.assign(q + dt * dHdp_mid)
+    p_out.assign(p - dt * dHdq_mid)
+    return q_out, p_out
+
+
 # ============================================================================
 # HAMILTONIAN SYSTEM - The "Compiler" Interface
 # ============================================================================
@@ -3585,6 +3607,24 @@ class HamiltonianSystem:
             for _ in range(unroll):
                 q, p = self.step_inplace(q, p, dt_inner)
             return q, p
+
+        return TinyJit(unrolled_step)
+
+    def compile_unrolled_step_buffered(self, dt: float, unroll: int):
+        """Unroll using two buffers to avoid in-place aliasing for implicit steps."""
+        if unroll < 1:
+            raise ValueError("unroll must be >= 1")
+
+        def unrolled_step(q: Tensor, p: Tensor, q_buf: Tensor, p_buf: Tensor):
+            q_a, p_a = q, p
+            q_b, p_b = q_buf, p_buf
+            for _ in range(unroll):
+                if self.integrator_name == "implicit":
+                    q_b, p_b = implicit_midpoint_into(q_a, p_a, q_b, p_b, self.H, dt)
+                else:
+                    q_b, p_b = self.step(q_a, p_a, dt)
+                q_a, p_a, q_b, p_b = q_b, p_b, q_a, p_a
+            return q_a, p_a
 
         return TinyJit(unrolled_step)
 

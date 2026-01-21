@@ -76,7 +76,7 @@ def _parse_float_pair(args, name: str) -> tuple[float, float]|None:
   return None
 
 
-def _choose_implicit_iters(system, dt: float, steps: int, unroll: int,
+def _choose_implicit_iters(system, dt: float, steps: int, unroll: int, buffered: bool,
                            iters_min: int, iters_max: int,
                            target_drift: float, target_steps: float):
   if steps % unroll != 0:
@@ -87,10 +87,19 @@ def _choose_implicit_iters(system, dt: float, steps: int, unroll: int,
     os.environ["TINYGRAD_IMPLICIT_ITERS"] = str(iters)
     q, p = _make_state()
     e0 = _energy(q, p, system.H)
-  step = system.compile_unrolled_step(dt, unroll)
-  start = time.perf_counter()
-  for _ in range(steps // unroll):
-    q, p = step(q, p)
+    q_buf = p_buf = None
+    if buffered:
+      step = system.compile_unrolled_step_buffered(dt, unroll)
+      q_buf = Tensor.empty(*q.shape, device=q.device, dtype=q.dtype)
+      p_buf = Tensor.empty(*p.shape, device=p.device, dtype=p.dtype)
+    else:
+      step = system.compile_unrolled_step(dt, unroll)
+    start = time.perf_counter()
+    for _ in range(steps // unroll):
+      if buffered:
+        q, p = step(q, p, q_buf, p_buf)
+      else:
+        q, p = step(q, p)
     q.numpy()
     p.numpy()
     elapsed = time.perf_counter() - start
@@ -108,7 +117,7 @@ def _choose_implicit_iters(system, dt: float, steps: int, unroll: int,
 
 
 def benchmark(integrator: str, steps: int, repeats: int, dt: float, jit: bool, unroll: int,
-              implicit_iters: int, report_energy: bool):
+              implicit_iters: int, report_energy: bool, buffered: bool):
   if unroll > 1 and steps % unroll != 0:
     raise ValueError("steps must be divisible by unroll")
 
@@ -119,8 +128,15 @@ def benchmark(integrator: str, steps: int, repeats: int, dt: float, jit: bool, u
     q, p = _make_state()
     e0 = _energy(q, p, H) if report_energy else None
     if unroll > 1:
-      step = system.compile_unrolled_step(dt, unroll)
-      q, p = step(q, p)
+      q_buf = p_buf = None
+      if integrator == "implicit" and buffered:
+        step = system.compile_unrolled_step_buffered(dt, unroll)
+        q_buf = Tensor.empty(*q.shape, device=q.device, dtype=q.dtype)
+        p_buf = Tensor.empty(*p.shape, device=p.device, dtype=p.dtype)
+        q, p = step(q, p, q_buf, p_buf)
+      else:
+        step = system.compile_unrolled_step(dt, unroll)
+        q, p = step(q, p)
       steps_per_call = unroll
     else:
       step = TinyJit(system.step) if jit else system.step
@@ -131,7 +147,10 @@ def benchmark(integrator: str, steps: int, repeats: int, dt: float, jit: bool, u
     start = time.perf_counter()
     for _ in range(steps // steps_per_call):
       if unroll > 1:
-        q, p = step(q, p)
+        if integrator == "implicit" and buffered:
+          q, p = step(q, p, q_buf, p_buf)
+        else:
+          q, p = step(q, p)
       else:
         q, p = step(q, p, dt)
     q.numpy()
@@ -167,6 +186,7 @@ if __name__ == "__main__":
   import sys
   args = sys.argv[1:]
   fast = _parse_bool_flag(args, "fast")
+  buffered = _parse_bool_flag(args, "buffered")
   sweep_iters = _parse_bool_flag(args, "sweep-iters")
   drift_target = _parse_float_flag(args, "drift", 1e-4)
   steps_target = _parse_float_flag(args, "min-steps", 0.0)
@@ -191,7 +211,7 @@ if __name__ == "__main__":
         it_min, it_max = int(iters_range[0]), int(iters_range[1])
       system = HamiltonianSystem(double_pendulum_hamiltonian(), integrator=integrator)
       implicit_iters, rows = _choose_implicit_iters(
-        system, dt, steps, unroll, it_min, it_max, drift_target, steps_target)
+        system, dt, steps, unroll, buffered, it_min, it_max, drift_target, steps_target)
       print("-" * 60)
       print("IMPLICIT ITERS SWEEP")
       print("-" * 60)
@@ -204,4 +224,4 @@ if __name__ == "__main__":
       import os
       os.environ["TINYGRAD_IMPLICIT_ITERS"] = str(implicit_iters)
   benchmark(integrator=integrator, steps=steps, repeats=repeats, dt=dt, jit=jit,
-            unroll=unroll, implicit_iters=implicit_iters, report_energy=report_energy)
+            unroll=unroll, implicit_iters=implicit_iters, report_energy=report_energy, buffered=buffered)
