@@ -17,7 +17,7 @@ from tinygrad.engine.jit import TinyJit, JitError
 from tinygrad.engine.realize import capturing
 from tinygrad.helpers import getenv, CAPTURING
 from tinygrad.codegen.opt import Opt, OptOps
-from tinygrad.dtype import dtypes, AddrSpace
+from tinygrad.dtype import dtypes, AddrSpace, PtrDType
 from tinygrad.tensor import Tensor
 from tinygrad.uop.ops import AxisType, GroupOp, KernelInfo, Ops, UOp, PatternMatcher, UPat, graph_rewrite, resolve
 from tinygrad.uop.symbolic import symbolic
@@ -29,6 +29,21 @@ import time
 # ============================================================================
 
 _grad_H_jit_cache: dict[tuple, TinyJit] = {}
+
+def _count_uops_limit(root: UOp, limit: int) -> int:
+    seen: set[int] = set()
+    stack = [root]
+    count = 0
+    while stack:
+        u = stack.pop()
+        if not isinstance(u, UOp): continue
+        uid = id(u)
+        if uid in seen: continue
+        seen.add(uid)
+        count += 1
+        if count >= limit: return count
+        stack.extend(u.src)
+    return count
 
 
 def _grad_H_key(q: Tensor, p: Tensor, H_func) -> tuple:
@@ -99,7 +114,7 @@ def _lower_reduce_axis(ctx: dict, x: UOp) -> UOp:
     scalar = reduced.gep(0)
     for i in range(1, reduced.dtype.count):
       scalar = scalar + reduced.gep(i)
-    reduced = scalar.broadcast(reduced.dtype.count)
+    reduced = scalar.vectorize(*([scalar] * (reduced.dtype.count - 1)))
   if full_reduce:
     idx = tuple(UOp.const(dtypes.index, 0) for _ in range(len(ranges)))
   else:
@@ -149,7 +164,10 @@ def _broadcast_value_index(ctx: dict, x: UOp) -> UOp|None:
     try:
         shape = x.shape
     except Exception:
-        return None
+        try:
+            shape = x.marg
+        except Exception:
+            return None
     ranges = ctx["ranges"]
     if any(r.op is not Ops.RANGE for r in ranges): return None
     if shape is None or len(shape) != len(ranges): return None
@@ -183,7 +201,13 @@ def _broadcast_scalar_index(ctx: dict, x: UOp) -> UOp|None:
     if src.src[0].op is Ops.DEFINE_REG: return None
     if src.src[0].op is Ops.AFTER and src.src[0].src[0].op is Ops.DEFINE_REG: return None
     if not all(s.op is Ops.CONST and s.arg == 0 for s in src.src[1:]): return None
-    shape = x.shape
+    try:
+        shape = x.shape
+    except Exception:
+        try:
+            shape = x.marg
+        except Exception:
+            return None
     ranges = ctx["ranges"]
     if any(r.op is not Ops.RANGE for r in ranges): return None
     if shape is None or len(shape) != len(ranges): return None
@@ -210,12 +234,44 @@ def _broadcast_scalar_base(ctx: dict, x: UOp) -> UOp|None:
     try:
         shape = x.shape
     except Exception:
-        return None
+        try:
+            shape = x.marg
+        except Exception:
+            return None
     ranges = ctx["ranges"]
     if any(r.op is not Ops.RANGE for r in ranges): return None
     if shape is None or len(shape) != len(ranges): return None
     idx = tuple(UOp.const(dtypes.index, 0) if resolve(s == 1) else ranges[i] for i, s in enumerate(shape))
     return base.src[0].vindex(*idx, dtype=x.dtype)
+
+def _broadcast_scalar_alu(ctx: dict, uop: UOp) -> UOp|None:
+    if uop.op not in GroupOp.Binary: return None
+    try:
+        shapes = [s.shape for s in uop.src]
+    except Exception:
+        return None
+    if any(s is None for s in shapes): return None
+    def shape_prod(s: tuple[int, ...]) -> int:
+        return math.prod(s) if len(s) else 1
+    target = max((s for s in shapes if s is not None), key=shape_prod, default=None)
+    if target is None or target == (): return None
+    new_src = []
+    changed = False
+    for s, shape in zip(uop.src, shapes):
+        is_scalar = shape == () or (len(shape) == len(target) and all(x == 1 for x in shape))
+        if shape == target: 
+            new_src.append(s)
+            continue
+        if is_scalar and target != ():
+            try:
+                s = s.forced_reshape(tuple(1 for _ in range(len(target))))
+                s = s._mop(Ops.EXPAND, target, same_shape_noop=True)
+                changed = True
+            except Exception:
+                return None
+        new_src.append(s)
+    if not changed: return None
+    return UOp(uop.op, uop.dtype, tuple(new_src), uop.arg, uop.tag)
 
 
 def _drop_reg_expand(ctx: dict, x: UOp) -> UOp|None:
@@ -260,8 +316,10 @@ def _drop_empty_reshape(ctx: dict, x: UOp) -> UOp|None:
     shape = x.shape
   except Exception:
     return None
-  if shape is None or len(shape) != 0: return None
-  return x.src[0]
+  if shape is None: return None
+  if len(shape) == 0: return x.src[0]
+  if shape == (1,): return x.src[0]
+  return None
 
 def _drop_zero_vec_shape(ctx: dict, x: UOp) -> UOp|None:
   if x.op not in (Ops.RESHAPE, Ops.EXPAND): return None
@@ -442,12 +500,26 @@ def _implicit_fixed_iters(dt: float, max_iter: int) -> int:
             elif dt <= 0.005:
                 fixed_iters = 3
             elif dt <= 0.01:
-                fixed_iters = 4
+                fixed_iters = 3
             elif dt <= 0.02:
                 fixed_iters = 6
             else:
                 fixed_iters = 8
     return fixed_iters
+
+
+def implicit_midpoint_fixed(q: Tensor, p: Tensor, H_func, dt: float, iters: int) -> tuple[Tensor, Tensor]:
+    dHdq, dHdp = _grad_H(q, p, H_func)
+    half_dt = 0.5 * dt
+    q_mid = q + half_dt * dHdp
+    p_mid = p - half_dt * dHdq
+    for _ in range(iters):
+        dHdq_mid, dHdp_mid = _grad_H(q_mid, p_mid, H_func)
+        q_mid = q + half_dt * dHdp_mid
+        p_mid = p - half_dt * dHdq_mid
+    q_next = q + dt * dHdp_mid
+    p_next = p - dt * dHdq_mid
+    return q_next, p_next
 
 
 def implicit_midpoint_inplace(q: Tensor, p: Tensor, H_func, dt: float = 0.01,
@@ -477,8 +549,8 @@ def implicit_midpoint_into(q: Tensor, p: Tensor, q_out: Tensor, p_out: Tensor, H
     fixed_iters = _implicit_fixed_iters(dt, max_iter)
     if fixed_iters <= 0:
         q_next, p_next = implicit_midpoint(q, p, H_func, dt=dt, tol=tol, max_iter=max_iter)
-        q_out.assign(q_next)
-        p_out.assign(p_next)
+        q_out = _assign_or_replace(q_out, q_next)
+        p_out = _assign_or_replace(p_out, p_next)
         return q_out, p_out
 
     dHdq, dHdp = _grad_H(q, p, H_func)
@@ -489,9 +561,15 @@ def implicit_midpoint_into(q: Tensor, p: Tensor, q_out: Tensor, p_out: Tensor, H
         dHdq_mid, dHdp_mid = _grad_H(q_mid, p_mid, H_func)
         q_mid = q + half_dt * dHdp_mid
         p_mid = p - half_dt * dHdq_mid
-    q_out.assign(q + dt * dHdp_mid)
-    p_out.assign(p - dt * dHdq_mid)
+    q_out = _assign_or_replace(q_out, q + dt * dHdp_mid)
+    p_out = _assign_or_replace(p_out, p - dt * dHdq_mid)
     return q_out, p_out
+
+
+def _assign_or_replace(dst: Tensor, src: Tensor) -> Tensor:
+    if getenv("TINYGRAD_IMPLICIT_INTO_REPLACE", 0):
+        return dst.replace(src)
+    return dst.assign(src)
 
 
 # ============================================================================
@@ -537,11 +615,13 @@ class HamiltonianSystem:
         self._update_kernel_coupled_cache: dict[tuple[float, str, tuple[int, ...], object, int], Callable] = {}
         self._update_kernel_coupled_p_cache: dict[tuple[float, str, tuple[int, ...], object, int], Callable] = {}
         self._scan_kernel_coupled_tune_cache: dict[tuple[float, int, str, tuple[int, ...], object], int] = {}
+        self._fused_kernel_coupled_tune_cache: dict[tuple[float, int, str, tuple[int, ...], object], tuple[int, int]] = {}
         self._reduce_kernel_coupled_cache: dict[tuple[UOp, str, tuple[int, ...], object], Callable] = {}
         self._reduce_kernel_coupled_multi_cache: dict[tuple[tuple[UOp, ...], str, tuple[int, ...], object, int], Callable] = {}
         self._reduce_kernel_coupled_qnew_cache: dict[tuple[tuple[UOp, ...], object, str, tuple[int, ...], object, float, int], Callable] = {}
         self._reduce_kernel_coupled_tune_cache: dict[tuple[str, tuple[int, ...], object], int] = {}
         self._reduce_kernel_coupled_unroll_tune_cache: dict[tuple[str, tuple[int, ...], object, int], int] = {}
+        self._reduce_kernel_coupled_tune_both_cache: dict[tuple[str, tuple[int, ...], object], tuple[int, int]] = {}
         self._reduce_acc_buf_cache_dHdq: dict[tuple[str, object, int], list[Tensor]] = {}
         self._reduce_acc_buf_cache_dHdp: dict[tuple[str, object, int], list[Tensor]] = {}
         self._scan_tmp_buf_cache: dict[tuple[str, object, tuple[int, ...]], tuple[Tensor, Tensor]] = {}
@@ -970,14 +1050,32 @@ class HamiltonianSystem:
         q_sym_uop, p_sym_uop, dHdq_uop, dHdp_uop = self._get_coupled_grad_uops(q.device, q.shape, q.dtype)
         dHdq_reduce_nodes = [u for u in dHdq_uop.toposort() if u.op is Ops.REDUCE_AXIS]
         dHdp_reduce_nodes = [u for u in dHdp_uop.toposort() if u.op is Ops.REDUCE_AXIS]
+        if not dHdq_reduce_nodes and not dHdp_reduce_nodes:
+            uses_sin = any(u.op is Ops.SIN for u in dHdq_uop.toposort()) or any(u.op is Ops.SIN for u in dHdp_uop.toposort())
+            if uses_sin:
+                q_cur, p_cur = q, p
+                for _ in range(steps):
+                    q_cur, p_cur = self.step(q_cur, p_cur, dt)
+                    Tensor.realize(q_cur, p_cur)
+                return q_cur, p_cur
+        if not dHdq_reduce_nodes and not dHdp_reduce_nodes:
+            q_cur, p_cur = q, p
+            for _ in range(steps):
+                q_cur, p_cur = self.step(q_cur, p_cur, dt)
+            return q_cur, p_cur
         if dHdq_reduce_nodes and dHdp_reduce_nodes:
             return self.evolve_scan_kernel_coupled(q, p, dt, steps, unroll_steps=unroll_steps)
         if not double_buffer:
             if vector_width > 1 and not getenv("TINYGRAD_COUPLED_FUSED_VEC_EXPERIMENTAL", 0):
                 q_out, p_out = self._evolve_coupled_two_phase_vec(q, p, dt, steps, vector_width)
             else:
-                q_out, p_out = self._evolve_scan_kernel_coupled_split(
-                    q, p, dt, steps, unroll_steps=unroll_steps, vector_width=vector_width)
+                try:
+                    q_out, p_out = self._evolve_scan_kernel_coupled_split(
+                        q, p, dt, steps, unroll_steps=unroll_steps, vector_width=vector_width)
+                except Exception as e:
+                    if getenv("TINYGRAD_COUPLED_FUSED_FALLBACK", 1):
+                        return self.evolve_scan_kernel_coupled(q, p, dt, steps, unroll_steps=unroll_steps)
+                    raise e
             Tensor.realize(q_out, p_out)
             history = []
             history.append((q_start.numpy().copy(), p_start.numpy().copy(), self.energy(q_start, p_start)))
@@ -1422,7 +1520,7 @@ class HamiltonianSystem:
                     scalar = reduced.gep(0)
                     for i in range(1, reduced.dtype.count):
                         scalar = scalar + reduced.gep(i)
-                    reduced = scalar.broadcast(reduced.dtype.count)
+                    reduced = scalar.vectorize(*([scalar] * (reduced.dtype.count - 1)))
                 idx = tuple(UOp.const(dtypes.index, 0) for _ in range(len(ranges)))
                 return reduced.vindex(*idx)
 
@@ -1510,6 +1608,19 @@ class HamiltonianSystem:
             ranges = [UOp.range(s, i+1) for i, s in enumerate(shape)]
             reduce_counter = [len(ranges) + 1]
             def rewrite_elem(uop: UOp) -> UOp:
+                def squeeze_unit_alu(ctx: dict, x: UOp) -> UOp|None:
+                    if x.op not in GroupOp.ALU: return None
+                    if any(s.op is Ops.RANGE for s in x.src): return None
+                    try:
+                        if x.shape != (1,): return None
+                    except Exception:
+                        return None
+                    for s in x.src:
+                        try:
+                            if s.shape not in ((), (1,)): return None
+                        except Exception:
+                            return None
+                    return x.forced_reshape(())
                 uop = graph_rewrite(
                     uop,
                     PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _const_to_vindex)], compiled=False),
@@ -1644,6 +1755,19 @@ class HamiltonianSystem:
                 p_half_val = p_half.vindex(*ranges)
             reduce_counter = [len(ranges) + 1]
             def rewrite_elem(uop: UOp) -> UOp:
+                def squeeze_unit_alu(ctx: dict, x: UOp) -> UOp|None:
+                    if x.op not in GroupOp.ALU: return None
+                    if any(s.op is Ops.RANGE for s in x.src): return None
+                    try:
+                        if x.shape != (1,): return None
+                    except Exception:
+                        return None
+                    for s in x.src:
+                        try:
+                            if s.shape not in ((), (1,)): return None
+                        except Exception:
+                            return None
+                    return x.forced_reshape(())
                 uop = graph_rewrite(
                     uop,
                     PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _const_to_vindex)], compiled=False),
@@ -1740,20 +1864,24 @@ class HamiltonianSystem:
             p_val = p.vindex(*ranges)
             def ensure_broadcast(uop: UOp, target: UOp) -> UOp:
                 try:
-                    if target.shape is None: return uop
+                    tshape = target.shape
                 except Exception:
                     return uop
+                if tshape is None: return uop
                 try:
-                    if uop.shape != target.shape:
-                        if (uop.shape == () or uop.shape is None) and target.shape is not None and len(target.shape) > 0:
-                            try:
-                                uop = uop.reshape(tuple(1 for _ in range(len(target.shape))))
-                            except Exception:
-                                pass
-                        return uop._broadcast_to(target.shape)
+                    ushape = uop.shape
                 except Exception:
-                    pass
-                return uop
+                    return uop
+                if ushape == tshape: return uop
+                try:
+                    if ushape in ((), (1,)) and len(tshape) > 0:
+                        uop = uop.forced_reshape(tuple(1 for _ in range(len(tshape))))
+                        return uop._mop(Ops.EXPAND, tshape, same_shape_noop=True)
+                    if ushape is None or len(ushape) != len(tshape):
+                        return uop
+                    return uop._mop(Ops.EXPAND, tshape, same_shape_noop=True)
+                except Exception:
+                    return uop
             expr = elem_uop.substitute({q_sym_uop: q_val, p_sym_uop: p_val})
             if placeholders:
                 acc_loads = {
@@ -1828,66 +1956,165 @@ class HamiltonianSystem:
             p_out = accs_and_out[-1]
             accs_dHdp = accs_and_out[:-2]
             ranges = [UOp.range(s, i+1) for i, s in enumerate(shape)]
+            def broadcast_scalar_const(ctx: dict, uop: UOp) -> UOp|None:
+                if uop.op not in GroupOp.Binary: return None
+                def maybe_broadcast(c: UOp, other: UOp) -> UOp|None:
+                    if c.op not in (Ops.CONST, Ops.VCONST): return None
+                    try:
+                        cshape = c.shape
+                    except Exception:
+                        return None
+                    if cshape not in ((), (1,)): return None
+                    try:
+                        oshape = other.shape
+                    except Exception:
+                        return None
+                    if oshape is None or oshape == cshape or oshape == (1,): return None
+                    return UOp.const(c.dtype, c.arg, shape=oshape)
+                a, b = uop.src
+                na = maybe_broadcast(a, b)
+                if na is None: na = a
+                nb = maybe_broadcast(b, a)
+                if nb is None: nb = b
+                if na is a and nb is b: return None
+                return UOp(uop.op, uop.dtype, (na, nb), uop.arg, uop.tag)
             def rewrite_elem(uop: UOp) -> UOp:
+                if getenv("TINYGRAD_COUPLED_FUSED_DEBUG", 0):
+                    print("qp_new_rewrite_enter", flush=True)
+                def squeeze_unit_alu(ctx: dict, x: UOp) -> UOp|None:
+                    if x.op not in GroupOp.ALU: return None
+                    if any(s.op is Ops.RANGE for s in x.src): return None
+                    try:
+                        if x.shape != (1,): return None
+                    except Exception:
+                        return None
+                    for s in x.src:
+                        try:
+                            if s.shape not in ((), (1,)): return None
+                        except Exception:
+                            return None
+                    return x.forced_reshape(())
                 uop = graph_rewrite(
                     uop,
                     PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _const_to_vindex)], compiled=False),
-                    ctx={"ranges": ranges, "device": q.device},
+                    ctx={"ranges": ranges, "device": device},
                     name="const_to_vindex",
                 )
+                if getenv("TINYGRAD_COUPLED_FUSED_DEBUG", 0):
+                    print("qp_new_after_const_to_vindex", flush=True)
                 uop = graph_rewrite(
                     uop,
                     PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _drop_scalar_value_index)], compiled=False),
                     ctx={},
                     name="drop_scalar_value_index",
                 )
+                if getenv("TINYGRAD_COUPLED_FUSED_DEBUG", 0):
+                    print("qp_new_after_drop_scalar_value_index", flush=True)
                 uop = graph_rewrite(
                     uop,
                     PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _drop_empty_reshape)], compiled=False),
                     ctx={},
                     name="drop_empty_reshape",
                 )
+                if getenv("TINYGRAD_COUPLED_FUSED_DEBUG", 0):
+                    print("qp_new_after_drop_empty_reshape", flush=True)
                 uop = graph_rewrite(
                     uop,
                     PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _drop_zero_vec_shape)], compiled=False),
                     ctx={},
                     name="drop_zero_vec_shape",
                 )
+                if getenv("TINYGRAD_COUPLED_FUSED_DEBUG", 0):
+                    print("qp_new_after_drop_zero_vec_shape", flush=True)
                 uop = graph_rewrite(
                     uop,
                     PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _broadcast_value_index)], compiled=False),
-                    ctx={"ranges": ranges, "device": q.device},
+                    ctx={"ranges": ranges, "device": device},
                     name="broadcast_value_index",
                 )
+                if getenv("TINYGRAD_COUPLED_FUSED_DEBUG", 0):
+                    print("qp_new_after_broadcast_value_index", flush=True)
                 uop = graph_rewrite(
                     uop,
                     PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _broadcast_scalar_index)], compiled=False),
                     ctx={"ranges": ranges},
                     name="broadcast_scalar_index",
                 )
+                if getenv("TINYGRAD_COUPLED_FUSED_DEBUG", 0):
+                    print("qp_new_after_broadcast_scalar_index", flush=True)
                 uop = graph_rewrite(
                     uop,
                     PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _broadcast_scalar_base)], compiled=False),
                     ctx={"ranges": ranges},
                     name="broadcast_scalar_base",
                 )
+                if getenv("TINYGRAD_COUPLED_FUSED_DEBUG", 0):
+                    print("qp_new_after_broadcast_scalar_base", flush=True)
                 uop = graph_rewrite(
                     uop,
                     PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _drop_reg_expand)], compiled=False),
                     ctx={},
                     name="drop_reg_expand",
                 )
+                if getenv("TINYGRAD_COUPLED_FUSED_DEBUG", 0):
+                    print("qp_new_after_drop_reg_expand", flush=True)
                 uop = graph_rewrite(
                     uop,
-                    PatternMatcher([(UPat((Ops.CONST, Ops.VCONST), name="c"), _strip_device_const)], compiled=False),
+                    PatternMatcher([(UPat(GroupOp.Binary, name="uop"), _broadcast_scalar_alu)], compiled=False),
                     ctx={},
-                    name="strip_device_consts",
+                    name="broadcast_scalar_alu",
                 )
+                if getenv("TINYGRAD_COUPLED_FUSED_DEBUG", 0):
+                    print("qp_new_after_broadcast_scalar_alu", flush=True)
+                uop = graph_rewrite(
+                    uop,
+                    PatternMatcher([(UPat(GroupOp.Binary, name="uop"), broadcast_scalar_const)], compiled=False),
+                    ctx={"device": device},
+                    name="broadcast_scalar_const",
+                )
+                uop = graph_rewrite(
+                    uop,
+                    PatternMatcher([(UPat(GroupOp.ALU, name="x"), squeeze_unit_alu)], compiled=False),
+                    ctx={},
+                    name="squeeze_unit_alu",
+                )
+                if getenv("TINYGRAD_COUPLED_FUSED_DEBUG", 0):
+                    print("qp_new_after_broadcast_scalar_const", flush=True)
+                return uop
+            def ensure_broadcast(uop: UOp, target: UOp) -> UOp:
+                try:
+                    tshape = target.shape
+                except Exception:
+                    return uop
+                if tshape is None: return uop
+                try:
+                    ushape = uop.shape
+                except Exception:
+                    return uop
+                if ushape == tshape: return uop
+                try:
+                    if ushape in ((), (1,)) and len(tshape) > 0:
+                        uop = uop.forced_reshape(tuple(1 for _ in range(len(tshape))))
+                        return uop._mop(Ops.EXPAND, tshape, same_shape_noop=True)
+                    if ushape is None or len(ushape) != len(tshape):
+                        return uop
+                    return uop._mop(Ops.EXPAND, tshape, same_shape_noop=True)
+                except Exception:
+                    return uop
+            def squeeze_unit(uop: UOp) -> UOp:
+                try:
+                    if uop.shape == (1,): return uop.forced_reshape(())
+                except Exception:
+                    return uop
                 return uop
             q_val = q.vindex(*ranges)
             p_val = p.vindex(*ranges)
             dHdq_1 = dHdq_elem_uop.substitute({q_sym_uop: q_val, p_sym_uop: p_val})
             dHdq_1 = rewrite_elem(dHdq_1)
+            dHdq_1 = squeeze_unit(dHdq_1)
+            dHdq_1 = ensure_broadcast(dHdq_1, p_val)
+            if getenv("TINYGRAD_COUPLED_FUSED_DEBUG", 0):
+                print("qp_new_after_dHdq_1", flush=True)
             half_dt = UOp.const(dHdq_1.dtype, 0.5 * dt, shape=tuple(r.vmax + 1 for r in ranges))
             neg_one = UOp.const(dHdq_1.dtype, -1.0, shape=tuple(r.vmax + 1 for r in ranges))
             p_half = p_val + (half_dt * dHdq_1) * neg_one
@@ -1899,14 +2126,39 @@ class HamiltonianSystem:
                 }
                 dHdp = dHdp.substitute(acc_loads, name="reduce_placeholders")
             dHdp = rewrite_elem(dHdp)
+            dHdp = squeeze_unit(dHdp)
+            dHdp = ensure_broadcast(dHdp, q_val)
+            if getenv("TINYGRAD_COUPLED_FUSED_DEBUG", 0):
+                print("qp_new_after_dHdp", flush=True)
             dt_uop = UOp.const(dHdp.dtype, dt, shape=tuple(r.vmax + 1 for r in ranges))
             q_new = q_val + dt_uop * dHdp
             dHdq_2 = dHdq_elem_uop.substitute({q_sym_uop: q_new, p_sym_uop: p_half})
             dHdq_2 = rewrite_elem(dHdq_2)
+            dHdq_2 = squeeze_unit(dHdq_2)
+            dHdq_2 = ensure_broadcast(dHdq_2, p_half)
+            if getenv("TINYGRAD_COUPLED_FUSED_DEBUG", 0):
+                print("qp_new_after_dHdq_2", flush=True)
             p_new = p_half + (half_dt * dHdq_2) * neg_one
             store_q = q_out.index(*ranges, ptr=True).store(q_new)
             store_p = p_out.index(*ranges, ptr=True).store(p_new)
-            return UOp.group(store_q, store_p).end(*ranges).sink(arg=KernelInfo(name="coupled_qp_new", opts_to_apply=()))
+            sink = UOp.group(store_q, store_p).end(*ranges).sink(arg=KernelInfo(name="coupled_qp_new", opts_to_apply=()))
+            if getenv("TINYGRAD_COUPLED_FUSED_DEBUG", 0):
+                print("qp_new_before_sink_rewrites", flush=True)
+            sink = graph_rewrite(
+                sink,
+                PatternMatcher([(UPat(GroupOp.Binary, name="uop"), _broadcast_scalar_alu)], compiled=False),
+                ctx={},
+                name="broadcast_scalar_alu_sink",
+            )
+            if getenv("TINYGRAD_COUPLED_FUSED_DEBUG", 0):
+                print("qp_new_after_broadcast_scalar_alu_sink", flush=True)
+            sink = _cse_uops(sink)
+            if getenv("TINYGRAD_COUPLED_FUSED_DEBUG", 0):
+                limit = getenv("TINYGRAD_COUPLED_FUSED_DEBUG_LIMIT", 20000)
+                count = _count_uops_limit(sink, limit)
+                print(f"fused_qp_reduce_uops~{count}")
+                raise RuntimeError("fused debug stop")
+            return sink
 
         return kernel
 
@@ -1922,11 +2174,40 @@ class HamiltonianSystem:
             accs_dHdp = accs[:len(placeholders_dHdp)]
             accs_dHdq_2 = accs[len(placeholders_dHdp):]
             ranges = [UOp.range(s, i+1) for i, s in enumerate(shape)]
+            def broadcast_scalar_const(ctx: dict, uop: UOp) -> UOp|None:
+                if uop.op not in GroupOp.Binary: return None
+                def maybe_broadcast(c: UOp, other: UOp) -> UOp|None:
+                    if c.op not in (Ops.CONST, Ops.VCONST): return None
+                    try:
+                        cshape = c.shape
+                    except Exception:
+                        return None
+                    if cshape not in ((), (1,)): return None
+                    try:
+                        oshape = other.shape
+                    except Exception:
+                        return None
+                    if oshape is None or oshape == cshape: return None
+                    return UOp.const(c.dtype, c.arg, shape=oshape)
+                a, b = uop.src
+                na = maybe_broadcast(a, b)
+                if na is None: na = a
+                nb = maybe_broadcast(b, a)
+                if nb is None: nb = b
+                if na is a and nb is b: return None
+                return UOp(uop.op, uop.dtype, (na, nb), uop.arg, uop.tag)
             def rewrite_elem(uop: UOp) -> UOp:
+                def squeeze_unit_alu(ctx: dict, x: UOp) -> UOp|None:
+                    if x.op not in GroupOp.ALU: return None
+                    try:
+                        if x.shape == (1,): return x.forced_reshape(())
+                    except Exception:
+                        return None
+                    return None
                 uop = graph_rewrite(
                     uop,
                     PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _const_to_vindex)], compiled=False),
-                    ctx={"ranges": ranges, "device": q.device},
+                    ctx={"ranges": ranges, "device": device},
                     name="const_to_vindex",
                 )
                 uop = graph_rewrite(
@@ -1950,7 +2231,7 @@ class HamiltonianSystem:
                 uop = graph_rewrite(
                     uop,
                     PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _broadcast_value_index)], compiled=False),
-                    ctx={"ranges": ranges, "device": q.device},
+                    ctx={"ranges": ranges, "device": device},
                     name="broadcast_value_index",
                 )
                 uop = graph_rewrite(
@@ -1977,23 +2258,45 @@ class HamiltonianSystem:
                     ctx={},
                     name="strip_device_consts",
                 )
+                uop = graph_rewrite(
+                    uop,
+                    PatternMatcher([(UPat(GroupOp.Binary, name="uop"), _broadcast_scalar_alu)], compiled=False),
+                    ctx={},
+                    name="broadcast_scalar_alu",
+                )
+                uop = graph_rewrite(
+                    uop,
+                    PatternMatcher([(UPat(GroupOp.Binary, name="uop"), broadcast_scalar_const)], compiled=False),
+                    ctx={"device": device},
+                    name="broadcast_scalar_const",
+                )
+                uop = graph_rewrite(
+                    uop,
+                    PatternMatcher([(UPat(GroupOp.ALU, name="x"), squeeze_unit_alu)], compiled=False),
+                    ctx={},
+                    name="squeeze_unit_alu",
+                )
                 return uop
             def ensure_broadcast(uop: UOp, target: UOp) -> UOp:
                 try:
-                    if target.shape is None: return uop
+                    tshape = target.shape
                 except Exception:
                     return uop
+                if tshape is None: return uop
                 try:
-                    if uop.shape != target.shape:
-                        if (uop.shape == () or uop.shape is None) and target.shape is not None and len(target.shape) > 0:
-                            try:
-                                uop = uop.reshape(tuple(1 for _ in range(len(target.shape))))
-                            except Exception:
-                                pass
-                        return uop._broadcast_to(target.shape)
+                    ushape = uop.shape
                 except Exception:
-                    pass
-                return uop
+                    return uop
+                if ushape == tshape: return uop
+                try:
+                    if ushape in ((), (1,)) and len(tshape) > 0:
+                        uop = uop.forced_reshape(tuple(1 for _ in range(len(tshape))))
+                        return uop._mop(Ops.EXPAND, tshape, same_shape_noop=True)
+                    if ushape is None or len(ushape) != len(tshape):
+                        return uop
+                    return uop._mop(Ops.EXPAND, tshape, same_shape_noop=True)
+                except Exception:
+                    return uop
             q_val = q.vindex(*ranges)
             p_half_val = p_half.vindex(*ranges)
             dHdp = dHdp_elem_uop.substitute({q_sym_uop: q_val, p_sym_uop: p_half_val})
@@ -2022,7 +2325,16 @@ class HamiltonianSystem:
             p_new = p_half_val + (half_dt * dHdq_2) * neg_one
             store_q = q_out.index(*ranges, ptr=True).store(q_new)
             store_p = p_out.index(*ranges, ptr=True).store(p_new)
-            return UOp.group(store_q, store_p).end(*ranges).sink(arg=KernelInfo(name="coupled_qp_update", opts_to_apply=()))
+            sink = UOp.group(store_q, store_p).end(*ranges).sink(arg=KernelInfo(name="coupled_qp_update", opts_to_apply=()))
+            sink = graph_rewrite(
+                sink,
+                PatternMatcher([(UPat(GroupOp.Binary, name="uop"), _broadcast_scalar_alu)], compiled=False),
+                ctx={},
+                name="broadcast_scalar_alu_sink",
+            )
+            if getenv("TINYGRAD_COUPLED_FUSED_DEBUG", 0):
+                print("qp_new_before_cse", flush=True)
+            return _cse_uops(sink)
 
         return kernel
 
@@ -2039,11 +2351,40 @@ class HamiltonianSystem:
             accs_dHdp = accs[len(placeholders_dHdq):len(placeholders_dHdq) + len(placeholders_dHdp)]
             accs_dHdq_2 = accs[len(placeholders_dHdq) + len(placeholders_dHdp):]
             ranges = [UOp.range(s, i+1) for i, s in enumerate(shape)]
+            def broadcast_scalar_const(ctx: dict, uop: UOp) -> UOp|None:
+                if uop.op not in GroupOp.Binary: return None
+                def maybe_broadcast(c: UOp, other: UOp) -> UOp|None:
+                    if c.op not in (Ops.CONST, Ops.VCONST): return None
+                    try:
+                        cshape = c.shape
+                    except Exception:
+                        return None
+                    if cshape not in ((), (1,)): return None
+                    try:
+                        oshape = other.shape
+                    except Exception:
+                        return None
+                    if oshape is None or oshape == cshape: return None
+                    return UOp.const(c.dtype, c.arg, shape=oshape)
+                a, b = uop.src
+                na = maybe_broadcast(a, b)
+                if na is None: na = a
+                nb = maybe_broadcast(b, a)
+                if nb is None: nb = b
+                if na is a and nb is b: return None
+                return UOp(uop.op, uop.dtype, (na, nb), uop.arg, uop.tag)
             def rewrite_elem(uop: UOp) -> UOp:
+                def squeeze_unit_alu(ctx: dict, x: UOp) -> UOp|None:
+                    if x.op not in GroupOp.ALU: return None
+                    try:
+                        if x.shape == (1,): return x.forced_reshape(())
+                    except Exception:
+                        return None
+                    return None
                 uop = graph_rewrite(
                     uop,
                     PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _const_to_vindex)], compiled=False),
-                    ctx={"ranges": ranges, "device": q.device},
+                    ctx={"ranges": ranges, "device": device},
                     name="const_to_vindex",
                 )
                 uop = graph_rewrite(
@@ -2067,7 +2408,7 @@ class HamiltonianSystem:
                 uop = graph_rewrite(
                     uop,
                     PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _broadcast_value_index)], compiled=False),
-                    ctx={"ranges": ranges, "device": q.device},
+                    ctx={"ranges": ranges, "device": device},
                     name="broadcast_value_index",
                 )
                 uop = graph_rewrite(
@@ -2094,7 +2435,45 @@ class HamiltonianSystem:
                     ctx={},
                     name="strip_device_consts",
                 )
+                uop = graph_rewrite(
+                    uop,
+                    PatternMatcher([(UPat(GroupOp.Binary, name="uop"), _broadcast_scalar_alu)], compiled=False),
+                    ctx={},
+                    name="broadcast_scalar_alu",
+                )
+                uop = graph_rewrite(
+                    uop,
+                    PatternMatcher([(UPat(GroupOp.Binary, name="uop"), broadcast_scalar_const)], compiled=False),
+                    ctx={"device": device},
+                    name="broadcast_scalar_const",
+                )
+                uop = graph_rewrite(
+                    uop,
+                    PatternMatcher([(UPat(GroupOp.ALU, name="x"), squeeze_unit_alu)], compiled=False),
+                    ctx={},
+                    name="squeeze_unit_alu",
+                )
                 return uop
+            def ensure_broadcast(uop: UOp, target: UOp) -> UOp:
+                try:
+                    tshape = target.shape
+                except Exception:
+                    return uop
+                if tshape is None: return uop
+                try:
+                    ushape = uop.shape
+                except Exception:
+                    return uop
+                if ushape == tshape: return uop
+                try:
+                    if ushape in ((), (1,)) and len(tshape) > 0:
+                        uop = uop.forced_reshape(tuple(1 for _ in range(len(tshape))))
+                        return uop._mop(Ops.EXPAND, tshape, same_shape_noop=True)
+                    if ushape is None or len(ushape) != len(tshape):
+                        return uop
+                    return uop._mop(Ops.EXPAND, tshape, same_shape_noop=True)
+                except Exception:
+                    return uop
             q_val = q.vindex(*ranges)
             p_val = p.vindex(*ranges)
             dHdq_1 = dHdq_elem_uop.substitute({q_sym_uop: q_val, p_sym_uop: p_val})
@@ -2105,6 +2484,7 @@ class HamiltonianSystem:
                 }
                 dHdq_1 = dHdq_1.substitute(acc_loads, name="reduce_placeholders")
             dHdq_1 = rewrite_elem(dHdq_1)
+            dHdq_1 = ensure_broadcast(dHdq_1, p_val)
             half_dt = UOp.const(dHdq_1.dtype, 0.5 * dt, shape=tuple(r.vmax + 1 for r in ranges))
             neg_one = UOp.const(dHdq_1.dtype, -1.0, shape=tuple(r.vmax + 1 for r in ranges))
             p_half = p_val + (half_dt * dHdq_1) * neg_one
@@ -2116,6 +2496,7 @@ class HamiltonianSystem:
                 }
                 dHdp = dHdp.substitute(acc_loads, name="reduce_placeholders")
             dHdp = rewrite_elem(dHdp)
+            dHdp = ensure_broadcast(dHdp, q_val)
             dt_uop = UOp.const(dHdp.dtype, dt, shape=tuple(r.vmax + 1 for r in ranges))
             q_new = q_val + dt_uop * dHdp
             dHdq_2 = dHdq_elem_uop.substitute({q_sym_uop: q_new, p_sym_uop: p_half})
@@ -2126,10 +2507,18 @@ class HamiltonianSystem:
                 }
                 dHdq_2 = dHdq_2.substitute(acc_loads, name="reduce_placeholders")
             dHdq_2 = rewrite_elem(dHdq_2)
+            dHdq_2 = ensure_broadcast(dHdq_2, p_half)
             p_new = p_half + (half_dt * dHdq_2) * neg_one
             store_q = q_out.index(*ranges, ptr=True).store(q_new)
             store_p = p_out.index(*ranges, ptr=True).store(p_new)
-            return UOp.group(store_q, store_p).end(*ranges).sink(arg=KernelInfo(name="coupled_qp_update_qp", opts_to_apply=()))
+            sink = UOp.group(store_q, store_p).end(*ranges).sink(arg=KernelInfo(name="coupled_qp_update_qp", opts_to_apply=()))
+            sink = graph_rewrite(
+                sink,
+                PatternMatcher([(UPat(GroupOp.Binary, name="uop"), _broadcast_scalar_alu)], compiled=False),
+                ctx={},
+                name="broadcast_scalar_alu_sink",
+            )
+            return _cse_uops(sink)
 
         return kernel
 
@@ -2179,8 +2568,84 @@ class HamiltonianSystem:
                 UOp(Ops.DEFINE_REG, acc_dtype.ptr(size=unroll_steps, addrspace=AddrSpace.REG), arg=i+len(dHdq_reduce_uops)*2)
                 for i in range(len(dHdp_reduce_uops))
             ]
+            def broadcast_scalar_const(ctx: dict, uop: UOp) -> UOp|None:
+                if uop.op not in GroupOp.Binary: return None
+                def maybe_broadcast(c: UOp, other: UOp) -> UOp|None:
+                    if c.op not in (Ops.CONST, Ops.VCONST): return None
+                    try:
+                        cshape = c.shape
+                    except Exception:
+                        return None
+                    if cshape not in ((), (1,)): return None
+                    try:
+                        oshape = other.shape
+                    except Exception:
+                        return None
+                    if oshape is None or oshape == cshape: return None
+                    return UOp.const(c.dtype, c.arg, shape=oshape)
+                a, b = uop.src
+                na = maybe_broadcast(a, b)
+                if na is None: na = a
+                nb = maybe_broadcast(b, a)
+                if nb is None: nb = b
+                if na is a and nb is b: return None
+                return UOp(uop.op, uop.dtype, (na, nb), uop.arg, uop.tag)
             def rewrite_elem(uop: UOp, ranges_override: list[UOp]|None = None) -> UOp:
                 ranges_use = ranges_override if ranges_override is not None else ranges
+                def strip_device_const_noptr(ctx: dict, c: UOp) -> UOp|None:
+                    if c.op not in (Ops.CONST, Ops.VCONST): return None
+                    if len(c.src) == 0 or c.src[0].op is not Ops.DEVICE: return None
+                    if isinstance(c.dtype, PtrDType): return None
+                    return UOp.const(c.dtype, c.arg)
+                def const_ptr_index_to_const(ctx: dict, x: UOp) -> UOp|None:
+                    if x.op is not Ops.INDEX or x.arg != "value": return None
+                    base = x.src[0]
+                    if base.op is not Ops.CONST: return None
+                    if not isinstance(base.dtype, PtrDType): return None
+                    return UOp.const(x.dtype, base.arg)
+                def drop_redundant_expand(ctx: dict, x: UOp) -> UOp|None:
+                    if x.op is not Ops.EXPAND: return None
+                    base = x.src[0]
+                    if base.op is not Ops.RESHAPE: return None
+                    if base.marg != (1,): return None
+                    if base.src[0].op in GroupOp.ALU: return base.src[0]
+                    return None
+                def drop_empty_expand(ctx: dict, x: UOp) -> UOp|None:
+                    if x.op is not Ops.EXPAND: return None
+                    try:
+                        shp = x.shape
+                    except Exception:
+                        return x.src[0]
+                    if shp is None: return x.src[0]
+                    return None
+                def drop_unit_expand(ctx: dict, x: UOp) -> UOp|None:
+                    if x.op is not Ops.EXPAND: return None
+                    try:
+                        if x.marg == (1,): return x.src[0]
+                    except Exception:
+                        return None
+                    return None
+                def normalize_expand_arg(ctx: dict, x: UOp) -> UOp|None:
+                    if x.op is not Ops.EXPAND: return None
+                    if x.arg is not None: return None
+                    if len(x.src) != 2: return None
+                    try:
+                        marg = x.marg
+                    except Exception:
+                        return None
+                    try:
+                        if len(marg) == 1 and x.src[0].shape == ():
+                            return x.src[0].forced_reshape((1,))._mop(Ops.EXPAND, marg, same_shape_noop=True)
+                        if x.src[0].shape == ():
+                            return x.src[0].forced_reshape(tuple(1 for _ in range(len(marg))))._mop(
+                                Ops.EXPAND, marg, same_shape_noop=True)
+                    except Exception:
+                        pass
+                    return x.src[0]._mop(Ops.EXPAND, marg, same_shape_noop=True)
+                def drop_bad_reshape(ctx: dict, x: UOp) -> UOp|None:
+                    if x.op is not Ops.RESHAPE: return None
+                    if x.marg != (1,): return None
+                    return x.src[0]
                 if any(r.op is not Ops.RANGE for r in ranges_use):
                     uop = graph_rewrite(
                         uop,
@@ -2190,9 +2655,9 @@ class HamiltonianSystem:
                     )
                 uop = graph_rewrite(
                     uop,
-                    PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _const_to_vindex)], compiled=False),
-                    ctx={"ranges": ranges_use},
-                    name="const_to_vindex",
+                    PatternMatcher([(UPat(Ops.INDEX, name="x"), const_ptr_index_to_const)], compiled=False),
+                    ctx={},
+                    name="const_ptr_index_to_const",
                 )
                 uop = graph_rewrite(
                     uop,
@@ -2202,9 +2667,51 @@ class HamiltonianSystem:
                 )
                 uop = graph_rewrite(
                     uop,
+                    PatternMatcher([(UPat(Ops.RESHAPE, name="x"), drop_bad_reshape)], compiled=False),
+                    ctx={},
+                    name="drop_bad_reshape",
+                )
+                uop = graph_rewrite(
+                    uop,
                     PatternMatcher([(UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _drop_empty_reshape)], compiled=False),
                     ctx={},
                     name="drop_empty_reshape",
+                )
+                uop = graph_rewrite(
+                    uop,
+                    PatternMatcher([(UPat(Ops.EXPAND, name="x"), drop_redundant_expand)], compiled=False),
+                    ctx={},
+                    name="drop_redundant_expand",
+                )
+                uop = graph_rewrite(
+                    uop,
+                    PatternMatcher([(UPat(Ops.EXPAND, name="x"), drop_empty_expand)], compiled=False),
+                    ctx={},
+                    name="drop_empty_expand",
+                )
+                uop = graph_rewrite(
+                    uop,
+                    PatternMatcher([(UPat(Ops.EXPAND, name="x"), drop_unit_expand)], compiled=False),
+                    ctx={},
+                    name="drop_unit_expand",
+                )
+                uop = graph_rewrite(
+                    uop,
+                    PatternMatcher([(UPat(Ops.EXPAND, name="x"), normalize_expand_arg)], compiled=False),
+                    ctx={},
+                    name="normalize_expand_arg",
+                )
+                uop = graph_rewrite(
+                    uop,
+                    PatternMatcher([(UPat(Ops.EXPAND, name="x"), fix_scalar_expand)], compiled=False),
+                    ctx={},
+                    name="fix_scalar_expand",
+                )
+                uop = graph_rewrite(
+                    uop,
+                    PatternMatcher([(UPat(Ops.EXPAND, name="x"), fix_reshape_expand)], compiled=False),
+                    ctx={},
+                    name="fix_reshape_expand",
                 )
                 uop = graph_rewrite(
                     uop,
@@ -2232,7 +2739,13 @@ class HamiltonianSystem:
                 )
                 uop = graph_rewrite(
                     uop,
-                    PatternMatcher([(UPat((Ops.CONST, Ops.VCONST), name="c"), _strip_device_const)], compiled=False),
+                    PatternMatcher([(UPat(GroupOp.Binary, name="uop"), _broadcast_scalar_alu)], compiled=False),
+                    ctx={},
+                    name="broadcast_scalar_alu",
+                )
+                uop = graph_rewrite(
+                    uop,
+                    PatternMatcher([(UPat((Ops.CONST, Ops.VCONST), name="c"), strip_device_const_noptr)], compiled=False),
                     ctx={},
                     name="strip_device_consts",
                 )
@@ -2246,19 +2759,62 @@ class HamiltonianSystem:
 
             def ensure_broadcast(uop: UOp, target: UOp) -> UOp:
                 try:
-                    if target.shape is None: return uop
+                    tshape = target.shape
                 except Exception:
                     return uop
+                if tshape is None: return uop
                 try:
-                    if uop.shape != target.shape:
-                        if (uop.shape == () or uop.shape is None) and target.shape is not None and len(target.shape) > 0:
-                            try:
-                                uop = uop.reshape(tuple(1 for _ in range(len(target.shape))))
-                            except Exception:
-                                pass
-                        return uop._broadcast_to(target.shape)
+                    ushape = uop.shape
                 except Exception:
-                    pass
+                    return uop
+                if ushape == tshape: return uop
+                try:
+                    if ushape in ((), (1,)) and len(tshape) > 0:
+                        uop = uop.forced_reshape(tuple(1 for _ in range(len(tshape))))
+                        return uop._mop(Ops.EXPAND, tshape, same_shape_noop=True)
+                    if ushape is None or len(ushape) != len(tshape):
+                        return uop
+                    return uop._mop(Ops.EXPAND, tshape, same_shape_noop=True)
+                except Exception:
+                    return uop
+            def fix_scalar_expand(ctx: dict, x: UOp) -> UOp|None:
+                if x.op is not Ops.EXPAND: return None
+                try:
+                    base_shape = x.base._shape
+                except Exception:
+                    return None
+                if base_shape != (): return None
+                marg = x.marg
+                if marg is None: return None
+                try:
+                    reshaped = x.base.forced_reshape(tuple(1 for _ in range(len(marg))))
+                    return reshaped._mop(Ops.EXPAND, marg, same_shape_noop=True)
+                except Exception:
+                    return None
+            def fix_reshape_expand(ctx: dict, x: UOp) -> UOp|None:
+                if x.op is not Ops.EXPAND: return None
+                src0 = x.src[0]
+                if src0.op is not Ops.RESHAPE: return None
+                try:
+                    base_shape = src0.src[0]._shape
+                except Exception:
+                    return None
+                if base_shape != (): return None
+                marg = x.marg
+                if marg is None: return None
+                try:
+                    reshaped = src0.src[0].forced_reshape(tuple(1 for _ in range(len(marg))))
+                    return reshaped._mop(Ops.EXPAND, marg, same_shape_noop=True)
+                except Exception:
+                    return None
+            def broadcast_scalar(uop: UOp) -> UOp:
+                if shape_vals is None: return uop
+                try:
+                    if uop.shape in ((), (1,)):
+                        uop = uop.forced_reshape(tuple(1 for _ in range(len(shape_vals))))
+                        return uop._mop(Ops.EXPAND, shape_vals, same_shape_noop=True)
+                except Exception:
+                    return uop
                 return uop
             if use_vec:
                 base = ranges[-1] * UOp.const(dtypes.index, vector_width)
@@ -2269,6 +2825,8 @@ class HamiltonianSystem:
                 p_vec_ptr = p_ptr.cast(vec_dtype.ptr(size=p_ptr.dtype.size, addrspace=p_ptr.dtype.addrspace))
                 q_val = q_vec_ptr.load()
                 p_val = p_vec_ptr.load()
+                q_vec = q_val
+                p_vec = p_val
                 q_lanes = [q_val.gep(i) for i in range(vector_width)]
                 p_lanes = [p_val.gep(i) for i in range(vector_width)]
             else:
@@ -2276,23 +2834,20 @@ class HamiltonianSystem:
                 p_val = p.vindex(*ranges)
             shape_vals = None if use_vec else tuple(r.vmax + 1 for r in ranges)
             const_dtype = q_lanes[0].dtype if use_vec else q.dtype
-            half_dt = UOp.const(const_dtype, 0.5 * dt, shape=shape_vals)
-            neg_one = UOp.const(const_dtype, -1.0, shape=shape_vals)
-            dt_uop = UOp.const(const_dtype, dt, shape=shape_vals)
+            if use_vec:
+                half_dt = UOp.const(const_dtype, 0.5 * dt, shape=shape_vals)
+                neg_one = UOp.const(const_dtype, -1.0, shape=shape_vals)
+                dt_uop = UOp.const(const_dtype, dt, shape=shape_vals)
+            else:
+                half_dt = UOp.const(const_dtype, 0.5 * dt).vindex(*ranges)
+                neg_one = UOp.const(const_dtype, -1.0).vindex(*ranges)
+                dt_uop = UOp.const(const_dtype, dt).vindex(*ranges)
             for step in range(unroll_steps):
-                q_red = None
-                p_red = None
-                if use_vec:
-                    q_red = q_lanes[0]
-                    p_red = p_lanes[0]
-                    for j in range(1, vector_width):
-                        q_red = q_red + q_lanes[j]
-                        p_red = p_red + p_lanes[j]
                 acc0_vals = []
                 acc0_idx = UOp.const(dtypes.index, step)
                 for i, reduce_uop in enumerate(dHdq_reduce_uops):
                     if use_vec:
-                        red0 = reduce_uop.substitute({q_sym_uop: q_red, p_sym_uop: p_red})
+                        red0 = reduce_uop.substitute({q_sym_uop: q_vec, p_sym_uop: p_vec})
                     else:
                         red0 = reduce_uop.substitute({q_sym_uop: q_val, p_sym_uop: p_val})
                     red0 = graph_rewrite(
@@ -2301,11 +2856,22 @@ class HamiltonianSystem:
                         ctx={"reduce_counter": reduce_counter, "ranges": ranges},
                         name="lower_reduce_axis",
                     )
+                    red0 = graph_rewrite(
+                        red0,
+                        PatternMatcher([(UPat(GroupOp.Binary, name="uop"), _broadcast_scalar_alu)], compiled=False),
+                        ctx={},
+                        name="broadcast_scalar_alu_red0",
+                    )
                     reduce_ranges0 = [r for r in red0.ranges if r.arg[-1] == AxisType.REDUCE]
                     acc0_store = acc0_regs[i].index(acc0_idx).store(red0).end(*reduce_ranges0)
-                    acc0_val = acc0_regs[i].after(acc0_store).index(acc0_idx)
+                    acc0_val = acc0_regs[i].after(acc0_store).vindex(acc0_idx)
                     if not use_vec:
+                        try:
+                            if acc0_val.shape == (1,): acc0_val = acc0_val.forced_reshape(())
+                        except Exception:
+                            pass
                         acc0_val = ensure_broadcast(acc0_val, p_val)
+                        acc0_val = broadcast_scalar(acc0_val)
                     acc0_vals.append(acc0_val)
                 if use_vec:
                     p_half_lanes = []
@@ -2320,9 +2886,7 @@ class HamiltonianSystem:
                         dHdq_1 = ensure_broadcast(dHdq_1, p_lanes[i])
                         p_half = p_lanes[i] + (half_dt * dHdq_1) * neg_one
                         p_half_lanes.append(p_half)
-                    p_half_red = p_half_lanes[0]
-                    for i in range(1, vector_width):
-                        p_half_red = p_half_red + p_half_lanes[i]
+                    p_half_vec = p_half_lanes[0].vectorize(*p_half_lanes[1:])
                 else:
                     dHdq_1 = dHdq_elem_uop.substitute({q_sym_uop: q_val, p_sym_uop: p_val})
                     if placeholders_dHdq:
@@ -2336,7 +2900,7 @@ class HamiltonianSystem:
                     acc_hdp_idx = UOp.const(dtypes.index, step)
                     for i, reduce_uop in enumerate(dHdp_reduce_uops):
                         if use_vec:
-                            red_hdp = reduce_uop.substitute({q_sym_uop: q_red, p_sym_uop: p_half_red})
+                            red_hdp = reduce_uop.substitute({q_sym_uop: q_vec, p_sym_uop: p_half_vec})
                         else:
                             red_hdp = reduce_uop.substitute({q_sym_uop: q_val, p_sym_uop: p_half})
                         red_hdp = graph_rewrite(
@@ -2345,11 +2909,22 @@ class HamiltonianSystem:
                             ctx={"reduce_counter": reduce_counter, "ranges": ranges},
                             name="lower_reduce_axis",
                         )
+                        red_hdp = graph_rewrite(
+                            red_hdp,
+                            PatternMatcher([(UPat(GroupOp.Binary, name="uop"), _broadcast_scalar_alu)], compiled=False),
+                            ctx={},
+                            name="broadcast_scalar_alu_red_hdp",
+                        )
                         reduce_ranges_hdp = [r for r in red_hdp.ranges if r.arg[-1] == AxisType.REDUCE]
                         acc_hdp_store = acc_hdp_regs[i].index(acc_hdp_idx).store(red_hdp).end(*reduce_ranges_hdp)
-                        acc_hdp_val = acc_hdp_regs[i].after(acc_hdp_store).index(acc_hdp_idx)
+                        acc_hdp_val = acc_hdp_regs[i].after(acc_hdp_store).vindex(acc_hdp_idx)
                         if not use_vec:
+                            try:
+                                if acc_hdp_val.shape == (1,): acc_hdp_val = acc_hdp_val.forced_reshape(())
+                            except Exception:
+                                pass
                             acc_hdp_val = ensure_broadcast(acc_hdp_val, p_val)
+                            acc_hdp_val = broadcast_scalar(acc_hdp_val)
                         acc_hdp_vals.append(acc_hdp_val)
                 if use_vec:
                     q_new_lanes = []
@@ -2364,11 +2939,7 @@ class HamiltonianSystem:
                         dHdp = ensure_broadcast(dHdp, q_lanes[i])
                         q_new = q_lanes[i] + dt_uop * dHdp
                         q_new_lanes.append(q_new)
-                    q_new_red = q_new_lanes[0]
-                    p_half_red = p_half_lanes[0]
-                    for i in range(1, vector_width):
-                        q_new_red = q_new_red + q_new_lanes[i]
-                        p_half_red = p_half_red + p_half_lanes[i]
+                    q_new_vec = q_new_lanes[0].vectorize(*q_new_lanes[1:])
                 else:
                     dHdp = dHdp_elem_uop.substitute({q_sym_uop: q_val, p_sym_uop: p_half})
                     if placeholders_dHdp:
@@ -2380,18 +2951,32 @@ class HamiltonianSystem:
                 acc1_vals = []
                 acc1_idx = UOp.const(dtypes.index, step)
                 for i, reduce_uop in enumerate(dHdq_reduce_uops):
-                    red1 = reduce_uop.substitute({q_sym_uop: q_new_red if use_vec else q_new, p_sym_uop: p_half_red if use_vec else p_half})
+                    red1 = reduce_uop.substitute({
+                        q_sym_uop: q_new_vec if use_vec else q_new,
+                        p_sym_uop: p_half_vec if use_vec else p_half,
+                    })
                     red1 = graph_rewrite(
                         red1,
                         PatternMatcher([(UPat(Ops.REDUCE_AXIS, name="x"), _lower_reduce_axis)], compiled=False),
                         ctx={"reduce_counter": reduce_counter, "ranges": ranges},
                         name="lower_reduce_axis",
                     )
+                    red1 = graph_rewrite(
+                        red1,
+                        PatternMatcher([(UPat(GroupOp.Binary, name="uop"), _broadcast_scalar_alu)], compiled=False),
+                        ctx={},
+                        name="broadcast_scalar_alu_red1",
+                    )
                     reduce_ranges1 = [r for r in red1.ranges if r.arg[-1] == AxisType.REDUCE]
                     acc1_store = acc1_regs[i].index(acc1_idx).store(red1).end(*reduce_ranges1)
-                    acc1_val = acc1_regs[i].after(acc1_store).index(acc1_idx)
+                    acc1_val = acc1_regs[i].after(acc1_store).vindex(acc1_idx)
                     if not use_vec:
+                        try:
+                            if acc1_val.shape == (1,): acc1_val = acc1_val.forced_reshape(())
+                        except Exception:
+                            pass
                         acc1_val = ensure_broadcast(acc1_val, p_val)
+                        acc1_val = broadcast_scalar(acc1_val)
                     acc1_vals.append(acc1_val)
                 if use_vec:
                     p_new_lanes = []
@@ -2408,6 +2993,8 @@ class HamiltonianSystem:
                         p_new_lanes.append(p_new)
                     q_lanes = q_new_lanes
                     p_lanes = p_new_lanes
+                    q_vec = q_new_vec
+                    p_vec = p_new_lanes[0].vectorize(*p_new_lanes[1:])
                 else:
                     dHdq_2 = dHdq_elem_uop.substitute({q_sym_uop: q_new, p_sym_uop: p_half})
                     if placeholders_dHdq:
@@ -2431,17 +3018,117 @@ class HamiltonianSystem:
                 store_p = p_out.index(*ranges, ptr=True).store(p_val)
             sink = UOp.group(store_q, store_p).end(*ranges).sink(
                 arg=KernelInfo(name=f"coupled_qp_new_with_reduce_{unroll_steps}", opts_to_apply=()))
+            def strip_const_ptr_index(ctx: dict, x: UOp) -> UOp|None:
+                if x.op is not Ops.INDEX: return None
+                base = x.src[0]
+                if base.op is not Ops.CONST: return None
+                if not isinstance(base.dtype, PtrDType): return None
+                if x.arg == "value": return UOp.const(x.dtype, base.arg)
+                if x.arg is None: return base
+                return None
+            def drop_bad_reshape_sink(ctx: dict, x: UOp) -> UOp|None:
+                if x.op is not Ops.RESHAPE: return None
+                if x.marg != (1,): return None
+                return x.src[0]
+            def drop_empty_expand_sink(ctx: dict, x: UOp) -> UOp|None:
+                if x.op is not Ops.EXPAND: return None
+                try:
+                    shp = x.shape
+                except Exception:
+                    return x.src[0]
+                if shp is None: return x.src[0]
+                return None
+            def drop_unit_expand_sink(ctx: dict, x: UOp) -> UOp|None:
+                if x.op is not Ops.EXPAND: return None
+                try:
+                    if x.marg == (1,): return x.src[0]
+                except Exception:
+                    return None
+                return None
+            def normalize_expand_arg_sink(ctx: dict, x: UOp) -> UOp|None:
+                if x.op is not Ops.EXPAND: return None
+                if x.arg is not None: return None
+                if len(x.src) != 2: return None
+                try:
+                    marg = x.marg
+                except Exception:
+                    return None
+                try:
+                    if len(marg) == 1 and x.src[0].shape == ():
+                        return x.src[0].forced_reshape((1,))._mop(Ops.EXPAND, marg, same_shape_noop=True)
+                    if x.src[0].shape == ():
+                        return x.src[0].forced_reshape(tuple(1 for _ in range(len(marg))))._mop(
+                            Ops.EXPAND, marg, same_shape_noop=True)
+                except Exception:
+                    pass
+                return x.src[0]._mop(Ops.EXPAND, marg, same_shape_noop=True)
+            sink = graph_rewrite(
+                sink,
+                PatternMatcher([(UPat(Ops.INDEX, name="x"), strip_const_ptr_index)], compiled=False),
+                ctx={},
+                name="strip_const_ptr_index",
+            )
+            sink = graph_rewrite(
+                sink,
+                PatternMatcher([(UPat(Ops.RESHAPE, name="x"), drop_bad_reshape_sink)], compiled=False),
+                ctx={},
+                name="drop_bad_reshape_sink",
+            )
+            sink = graph_rewrite(
+                sink,
+                PatternMatcher([(UPat(Ops.EXPAND, name="x"), drop_empty_expand_sink)], compiled=False),
+                ctx={},
+                name="drop_empty_expand_sink",
+            )
+            sink = graph_rewrite(
+                sink,
+                PatternMatcher([(UPat(Ops.EXPAND, name="x"), drop_unit_expand_sink)], compiled=False),
+                ctx={},
+                name="drop_unit_expand_sink",
+            )
+            sink = graph_rewrite(
+                sink,
+                PatternMatcher([(UPat(Ops.EXPAND, name="x"), normalize_expand_arg_sink)], compiled=False),
+                ctx={},
+                name="normalize_expand_arg_sink",
+            )
+            sink = graph_rewrite(
+                sink,
+                PatternMatcher([(UPat(Ops.EXPAND, name="x"), fix_scalar_expand)], compiled=False),
+                ctx={},
+                name="fix_scalar_expand_sink",
+            )
+            sink = graph_rewrite(
+                sink,
+                PatternMatcher([(UPat(Ops.EXPAND, name="x"), fix_reshape_expand)], compiled=False),
+                ctx={},
+                name="fix_reshape_expand_sink",
+            )
+            sink = graph_rewrite(
+                sink,
+                PatternMatcher([(UPat(GroupOp.Binary, name="uop"), _broadcast_scalar_alu)], compiled=False),
+                ctx={},
+                name="broadcast_scalar_alu_sink",
+            )
+            sink = graph_rewrite(
+                sink,
+                PatternMatcher([(UPat(Ops.RESHAPE, name="x"), drop_bad_reshape_sink)], compiled=False),
+                ctx={},
+                name="drop_bad_reshape_sink_post",
+            )
             return _cse_uops(sink)
 
         return kernel
 
     def _evolve_scan_kernel_coupled_split(self, q: Tensor, p: Tensor, dt: float, steps: int,
                                           unroll_steps: int = 1, vector_width: int = 1) -> tuple[Tensor, Tensor]:
+        if any(u.op is Ops.SIN for u in self.H(q, p).uop.toposort()):
+            return self.evolve_scan_kernel_coupled(q, p, dt, steps)[0:2]
         q_sym_uop, p_sym_uop, dHdq_uop, dHdp_uop = self._get_coupled_grad_uops(q.device, q.shape, q.dtype)
         dHdq_reduce_nodes = [u for u in dHdq_uop.toposort() if u.op is Ops.REDUCE_AXIS]
         dHdp_reduce_nodes = [u for u in dHdp_uop.toposort() if u.op is Ops.REDUCE_AXIS]
-        reduce_placeholders_dHdq = {red: UOp.unique_const(red.dtype, 0, q.device) for red in dHdq_reduce_nodes}
-        reduce_placeholders_dHdp = {red: UOp.unique_const(red.dtype, 0, q.device) for red in dHdp_reduce_nodes}
+        reduce_placeholders_dHdq = {red: UOp.const(red.dtype, 0, q.device) for red in dHdq_reduce_nodes}
+        reduce_placeholders_dHdp = {red: UOp.const(red.dtype, 0, q.device) for red in dHdp_reduce_nodes}
         if reduce_placeholders_dHdq or reduce_placeholders_dHdp:
             def replace_reduce(ctx: dict, uop: UOp) -> UOp|None:
                 repl = ctx["reduce_placeholders"].get(uop)
@@ -2459,12 +3146,109 @@ class HamiltonianSystem:
         dHdq_placeholders = [reduce_placeholders_dHdq[r] for r in dHdq_reduce_nodes]
         dHdp_placeholders = [reduce_placeholders_dHdp[r] for r in dHdp_reduce_nodes]
 
-        use_fused_qp = ((len(dHdq_reduce_nodes) >= 1 and len(dHdp_reduce_nodes) == 0) or
-                        (len(dHdp_reduce_nodes) >= 1 and len(dHdq_reduce_nodes) == 0))
+        use_fused_qp = bool(dHdq_reduce_nodes or dHdp_reduce_nodes)
+        if use_fused_qp and getenv("TINYGRAD_COUPLED_FUSED_TUNE", 0):
+            tune_key = (dt, steps, q.device, q.shape, q.dtype)
+            cached = self._fused_kernel_coupled_tune_cache.get(tune_key)
+            if cached is not None:
+                vector_width, unroll_steps = cached
+            else:
+                cand_vw = [1, 2, 4, 8]
+                if vector_width > 1:
+                    max_vw = vector_width
+                else:
+                    max_vw = max(cand_vw)
+                cand_vw = [v for v in cand_vw if v <= max_vw and (not q.shape or q.shape[-1] % v == 0)]
+                if vector_width > 1 and vector_width not in cand_vw and (not q.shape or q.shape[-1] % vector_width == 0):
+                    cand_vw.append(vector_width)
+                cand_unroll = [1, 2, 4, 8, 16]
+                if unroll_steps > 1:
+                    max_unroll = unroll_steps
+                else:
+                    max_unroll = max(cand_unroll)
+                cand_unroll = [u for u in cand_unroll if u <= max_unroll and steps % u == 0]
+                if unroll_steps > 1 and unroll_steps not in cand_unroll and steps % unroll_steps == 0:
+                    cand_unroll.append(unroll_steps)
+                if not cand_vw:
+                    cand_vw = [vector_width]
+                if not cand_unroll:
+                    cand_unroll = [unroll_steps]
+                best_time = float("inf")
+                best = (vector_width, unroll_steps)
+                for vw in cand_vw:
+                    for unroll in cand_unroll:
+                        key_qp = (self.H, q.device, q.shape, q.dtype, "qp_new_reduce", dt, unroll,
+                                  vw, tuple(dHdq_reduce_nodes), tuple(dHdp_reduce_nodes))
+                        kernel = self._elem_kernel_coupled_cache.get(key_qp)
+                        if kernel is None:
+                            kernel = self._build_coupled_kernel_qp_new_with_reduce(
+                                dt, q.device, q.shape, q.dtype, dHdq_elem_uop, dHdp_elem_uop,
+                                dHdq_reduce_nodes, dHdp_reduce_nodes, dHdq_placeholders, dHdp_placeholders,
+                                unroll_steps=unroll, vector_width=vw)
+                            self._elem_kernel_coupled_cache[key_qp] = kernel
+                        q_tmp = q.detach().clone().realize()
+                        p_tmp = p.detach().clone().realize()
+                        q_out = Tensor.empty(*q.shape, device=q.device, dtype=q.dtype)
+                        p_out = Tensor.empty(*p.shape, device=p.device, dtype=p.dtype)
+                        start = time.perf_counter()
+                        out = Tensor.custom_kernel(q_tmp, p_tmp, q_out, p_out, fxn=kernel)
+                        Tensor.realize(out[2], out[3])
+                        elapsed = time.perf_counter() - start
+                        if elapsed < best_time:
+                            best_time = elapsed
+                            best = (vw, unroll)
+                vector_width, unroll_steps = best
+                self._fused_kernel_coupled_tune_cache[tune_key] = best
         reduce_vector_width = 1
         if vector_width > 1 and q.shape and q.shape[-1] % vector_width == 0:
             reduce_vector_width = vector_width
-        if getenv("TINYGRAD_COUPLED_REDUCE_TUNE", 0):
+        reduce_unroll = 1
+        if getenv("TINYGRAD_COUPLED_REDUCE_TUNE_BOTH", 0) and (dHdq_reduce_nodes or dHdp_reduce_nodes):
+            tune_key = (q.device, q.shape, q.dtype)
+            cached = self._reduce_kernel_coupled_tune_both_cache.get(tune_key)
+            if cached is not None:
+                reduce_vector_width, reduce_unroll = cached
+            else:
+                cand_vw = [1, 2, 4, 8]
+                cand_vw = [c for c in cand_vw if q.shape and q.shape[-1] % c == 0]
+                if not cand_vw:
+                    cand_vw = [1]
+                cand_ru = [1, 2, 4, 8]
+                cand_ru = [u for u in cand_ru if u >= 1]
+                best = (reduce_vector_width, reduce_unroll)
+                best_time = float("inf")
+                for vw in cand_vw:
+                    for ru in cand_ru:
+                        kernel = None
+                        kernel_hdp = None
+                        if dHdq_reduce_nodes:
+                            key = (tuple(dHdq_reduce_nodes), q.device, q.shape, q.dtype, vw, ru)
+                            kernel = self._reduce_kernel_coupled_multi_cache.get(key)
+                            if kernel is None:
+                                kernel = self._build_coupled_reduce_kernel_multi(
+                                    tuple(dHdq_reduce_nodes), q.device, q.shape, q.dtype, vector_width=vw, reduce_unroll=ru)
+                                self._reduce_kernel_coupled_multi_cache[key] = kernel
+                        if dHdp_reduce_nodes:
+                            key = (tuple(dHdp_reduce_nodes), q.device, q.shape, q.dtype, vw, ru)
+                            kernel_hdp = self._reduce_kernel_coupled_multi_cache.get(key)
+                            if kernel_hdp is None:
+                                kernel_hdp = self._build_coupled_reduce_kernel_multi(
+                                    tuple(dHdp_reduce_nodes), q.device, q.shape, q.dtype, vector_width=vw, reduce_unroll=ru)
+                                self._reduce_kernel_coupled_multi_cache[key] = kernel_hdp
+                        start = time.perf_counter()
+                        if kernel is not None:
+                            tmp_outs = [Tensor.empty(1, device=q.device, dtype=q.dtype) for _ in dHdq_reduce_nodes]
+                            Tensor.realize(*Tensor.custom_kernel(q, p, *tmp_outs, fxn=kernel)[2:])
+                        if kernel_hdp is not None:
+                            tmp_outs = [Tensor.empty(1, device=q.device, dtype=q.dtype) for _ in dHdp_reduce_nodes]
+                            Tensor.realize(*Tensor.custom_kernel(q, p, *tmp_outs, fxn=kernel_hdp)[2:])
+                        elapsed = time.perf_counter() - start
+                        if elapsed < best_time:
+                            best_time = elapsed
+                            best = (vw, ru)
+                reduce_vector_width, reduce_unroll = best
+                self._reduce_kernel_coupled_tune_both_cache[tune_key] = best
+        if not getenv("TINYGRAD_COUPLED_REDUCE_TUNE_BOTH", 0) and getenv("TINYGRAD_COUPLED_REDUCE_TUNE", 0):
             tune_key = (q.device, q.shape, q.dtype)
             cached = self._reduce_kernel_coupled_tune_cache.get(tune_key)
             if cached is not None:
@@ -2506,8 +3290,7 @@ class HamiltonianSystem:
                         best_vw = vw
                 self._reduce_kernel_coupled_tune_cache[tune_key] = best_vw
                 reduce_vector_width = best_vw
-        reduce_unroll = 1
-        if getenv("TINYGRAD_COUPLED_REDUCE_UNROLL_TUNE", 0):
+        if not getenv("TINYGRAD_COUPLED_REDUCE_TUNE_BOTH", 0) and getenv("TINYGRAD_COUPLED_REDUCE_UNROLL_TUNE", 0):
             tune_key = (q.device, q.shape, q.dtype, reduce_vector_width)
             cached = self._reduce_kernel_coupled_unroll_tune_cache.get(tune_key)
             if cached is not None:
@@ -2594,12 +3377,26 @@ class HamiltonianSystem:
             kernel_qp_update = None
             kernel_qp_update_qp = None
             if not dHdq_reduce_nodes and not dHdp_reduce_nodes:
-                key_qp_new = (self.H, q.device, q.shape, q.dtype, "qp_new", dt)
-                kernel_qp_new = self._elem_kernel_coupled_cache.get(key_qp_new)
-                if kernel_qp_new is None:
-                    kernel_qp_new = self._build_coupled_elem_kernel_qp_new(
-                        dt, q.device, q.shape, q.dtype, dHdq_elem_uop, dHdp_elem_uop, dHdp_placeholders)
-                    self._elem_kernel_coupled_cache[key_qp_new] = kernel_qp_new
+                key_half = (self.H, q.device, q.shape, q.dtype, "p_half", dt)
+                kernel_p_half = self._elem_kernel_coupled_cache.get(key_half)
+                if kernel_p_half is None:
+                    kernel_p_half = self._build_coupled_elem_kernel(
+                        dt, q.device, q.shape, q.dtype, dHdq_elem_uop, dHdq_placeholders, "p_half")
+                    self._elem_kernel_coupled_cache[key_half] = kernel_p_half
+                key_qp_update = (self.H, q.device, q.shape, q.dtype, "qp_update", dt)
+                kernel_qp_update = self._elem_kernel_coupled_cache.get(key_qp_update)
+                if kernel_qp_update is None:
+                    kernel_qp_update = self._build_coupled_elem_kernel_qp_update(
+                        dt, q.device, q.shape, q.dtype, dHdq_elem_uop, dHdp_elem_uop,
+                        dHdq_placeholders, dHdp_placeholders)
+                    self._elem_kernel_coupled_cache[key_qp_update] = kernel_qp_update
+                key_qp_update_qp = (self.H, q.device, q.shape, q.dtype, "qp_update_qp", dt)
+                kernel_qp_update_qp = self._elem_kernel_coupled_cache.get(key_qp_update_qp)
+                if kernel_qp_update_qp is None:
+                    kernel_qp_update_qp = self._build_coupled_elem_kernel_qp_update_from_qp(
+                        dt, q.device, q.shape, q.dtype, dHdq_elem_uop, dHdp_elem_uop,
+                        dHdq_placeholders, dHdp_placeholders)
+                    self._elem_kernel_coupled_cache[key_qp_update_qp] = kernel_qp_update_qp
             else:
                 key_half = (self.H, q.device, q.shape, q.dtype, "p_half", dt)
                 kernel_p_half = self._elem_kernel_coupled_cache.get(key_half)
@@ -2672,31 +3469,31 @@ class HamiltonianSystem:
                 if len(acc_bufs_dHdp) != len(dHdp_reduce_nodes):
                     acc_bufs_dHdp = [Tensor.empty(1, device=q.device, dtype=q.dtype) for _ in dHdp_reduce_nodes]
                     self._reduce_acc_buf_cache_dHdp[key] = acc_bufs_dHdp
+            def run_split_step(q_cur: Tensor, p_cur: Tensor) -> tuple[Tensor, Tensor]:
+                accs_dHdq = []
+                if kernel_reduce_dHdq is not None:
+                    out = Tensor.custom_kernel(q_cur, p_cur, *acc_bufs_dHdq, fxn=kernel_reduce_dHdq)
+                    accs_dHdq = list(out[2:2+len(acc_bufs_dHdq)])
+                p_half = Tensor.custom_kernel(q_cur, p_cur, *accs_dHdq, p_buf, fxn=kernel_p_half)[-1]
+                accs_dHdp = []
+                if kernel_reduce_dHdp is not None:
+                    out = Tensor.custom_kernel(q_cur, p_half, *acc_bufs_dHdp, fxn=kernel_reduce_dHdp)
+                    accs_dHdp = list(out[2:2+len(acc_bufs_dHdp)])
+                accs_dHdq_2 = []
+                if kernel_reduce_qnew is not None:
+                    red_out = Tensor.custom_kernel(q_cur, p_half, *accs_dHdp, *acc_bufs_dHdq, fxn=kernel_reduce_qnew)
+                    accs_dHdq_2 = list(red_out[2:2+len(acc_bufs_dHdq)])
+                if getenv("TINYGRAD_COUPLED_QP_UPDATE_QP", 0):
+                    q_new, p_new = Tensor.custom_kernel(
+                        q_cur, p_cur, *accs_dHdq, *accs_dHdp, *accs_dHdq_2, q_buf, p_buf,
+                        fxn=kernel_qp_update_qp)[-2:]
+                else:
+                    q_new, p_new = Tensor.custom_kernel(
+                        q_cur, p_half, *accs_dHdp, *accs_dHdq_2, q_buf, p_buf, fxn=kernel_qp_update)[-2:]
+                return q_new, p_new
             for _ in range(steps // unroll_steps):
                 for _ in range(unroll_steps):
-                    if kernel_qp_new is not None:
-                        q_new, p_new = Tensor.custom_kernel(q_cur, p_cur, q_buf, p_buf, fxn=kernel_qp_new)[-2:]
-                    else:
-                        accs_dHdq = []
-                        if kernel_reduce_dHdq is not None:
-                            out = Tensor.custom_kernel(q_cur, p_cur, *acc_bufs_dHdq, fxn=kernel_reduce_dHdq)
-                            accs_dHdq = list(out[2:2+len(acc_bufs_dHdq)])
-                        p_half = Tensor.custom_kernel(q_cur, p_cur, *accs_dHdq, p_buf, fxn=kernel_p_half)[-1]
-                        accs_dHdp = []
-                        if kernel_reduce_dHdp is not None:
-                            out = Tensor.custom_kernel(q_cur, p_half, *acc_bufs_dHdp, fxn=kernel_reduce_dHdp)
-                            accs_dHdp = list(out[2:2+len(acc_bufs_dHdp)])
-                        accs_dHdq_2 = []
-                        if kernel_reduce_qnew is not None:
-                            red_out = Tensor.custom_kernel(q_cur, p_half, *accs_dHdp, *acc_bufs_dHdq, fxn=kernel_reduce_qnew)
-                            accs_dHdq_2 = list(red_out[2:2+len(acc_bufs_dHdq)])
-                        if getenv("TINYGRAD_COUPLED_QP_UPDATE_QP", 0):
-                            q_new, p_new = Tensor.custom_kernel(
-                                q_cur, p_cur, *accs_dHdq, *accs_dHdp, *accs_dHdq_2, q_buf, p_buf,
-                                fxn=kernel_qp_update_qp)[-2:]
-                        else:
-                            q_new, p_new = Tensor.custom_kernel(
-                                q_cur, p_half, *accs_dHdp, *accs_dHdq_2, q_buf, p_buf, fxn=kernel_qp_update)[-2:]
+                    q_new, p_new = run_split_step(q_cur, p_cur)
                     Tensor.realize(q_new, p_new)
                     q_cur, p_cur = q_new, p_new
 
@@ -3015,8 +3812,8 @@ class HamiltonianSystem:
         strip_device_consts = PatternMatcher([
             (UPat((Ops.CONST, Ops.VCONST), name="c"), _strip_device_const),
         ])
-        reduce_placeholders_dHdq = {red: UOp.unique_const(red.dtype, 0, device) for red in dHdq_reduce_nodes} if has_reduce else {}
-        reduce_placeholders_dHdp = {red: UOp.unique_const(red.dtype, 0, device) for red in dHdp_reduce_nodes} if has_reduce else {}
+        reduce_placeholders_dHdq = {red: UOp.const(red.dtype, 0, device) for red in dHdq_reduce_nodes} if has_reduce else {}
+        reduce_placeholders_dHdp = {red: UOp.const(red.dtype, 0, device) for red in dHdp_reduce_nodes} if has_reduce else {}
         if reduce_placeholders_dHdq or reduce_placeholders_dHdp:
             def replace_reduce(ctx: dict, uop: UOp) -> UOp|None:
                 repl = ctx["reduce_placeholders"].get(uop)
@@ -3627,6 +4424,32 @@ class HamiltonianSystem:
             return q_a, p_a
 
         return TinyJit(unrolled_step)
+
+    def compile_unrolled_step_implicit(self, dt: float, unroll: int, iters: int, realize_steps: bool = False):
+        """Unroll implicit midpoint with fixed iterations, optionally realizing between steps."""
+        if unroll < 1:
+            raise ValueError("unroll must be >= 1")
+        if iters < 1:
+            raise ValueError("iters must be >= 1 for implicit unroll")
+
+        def unrolled_step(q: Tensor, p: Tensor):
+            for _ in range(unroll):
+                q, p = implicit_midpoint_fixed(q, p, self.H, dt, iters)
+                if realize_steps:
+                    q, p = q.realize(), p.realize()
+            return q, p
+
+        return TinyJit(unrolled_step)
+
+    def compile_implicit_step_fixed(self, dt: float, iters: int):
+        """Single implicit midpoint step with fixed iterations, compiled."""
+        if iters < 1:
+            raise ValueError("iters must be >= 1 for implicit step")
+
+        def step_fn(q: Tensor, p: Tensor):
+            return implicit_midpoint_fixed(q, p, self.H, dt, iters)
+
+        return TinyJit(step_fn)
 
     def evolve_unrolled(self, q: Tensor, p: Tensor, dt: float, steps: int, unroll: int = 8,
                         record_every: int = 1) -> tuple[Tensor, Tensor, list]:

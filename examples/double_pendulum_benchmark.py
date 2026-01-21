@@ -60,7 +60,7 @@ def _default_implicit_iters(dt: float) -> int:
   if dt <= 0.005:
     return 3
   if dt <= 0.01:
-    return 4
+    return 3
   if dt <= 0.02:
     return 6
   return 8
@@ -76,7 +76,7 @@ def _parse_float_pair(args, name: str) -> tuple[float, float]|None:
   return None
 
 
-def _choose_implicit_iters(system, dt: float, steps: int, unroll: int, buffered: bool,
+def _choose_implicit_iters(system, dt: float, steps: int, unroll: int, buffered: bool, functional: bool,
                            iters_min: int, iters_max: int,
                            target_drift: float, target_steps: float):
   if steps % unroll != 0:
@@ -92,6 +92,8 @@ def _choose_implicit_iters(system, dt: float, steps: int, unroll: int, buffered:
       step = system.compile_unrolled_step_buffered(dt, unroll)
       q_buf = Tensor.empty(*q.shape, device=q.device, dtype=q.dtype)
       p_buf = Tensor.empty(*p.shape, device=p.device, dtype=p.dtype)
+    elif functional:
+      step = system.compile_unrolled_step_implicit(dt, unroll, iters)
     else:
       step = system.compile_unrolled_step(dt, unroll)
     start = time.perf_counter()
@@ -117,7 +119,7 @@ def _choose_implicit_iters(system, dt: float, steps: int, unroll: int, buffered:
 
 
 def benchmark(integrator: str, steps: int, repeats: int, dt: float, jit: bool, unroll: int,
-              implicit_iters: int, report_energy: bool, buffered: bool):
+              implicit_iters: int, report_energy: bool, buffered: bool, functional: bool, mixed: bool):
   if unroll > 1 and steps % unroll != 0:
     raise ValueError("steps must be divisible by unroll")
 
@@ -134,6 +136,12 @@ def benchmark(integrator: str, steps: int, repeats: int, dt: float, jit: bool, u
         q_buf = Tensor.empty(*q.shape, device=q.device, dtype=q.dtype)
         p_buf = Tensor.empty(*p.shape, device=p.device, dtype=p.dtype)
         q, p = step(q, p, q_buf, p_buf)
+      elif integrator == "implicit" and functional:
+        step = system.compile_unrolled_step_implicit(dt, unroll, implicit_iters)
+        q, p = step(q, p)
+      elif integrator == "implicit" and mixed:
+        step = system.compile_implicit_step_fixed(dt, implicit_iters)
+        q, p = step(q, p)
       else:
         step = system.compile_unrolled_step(dt, unroll)
         q, p = step(q, p)
@@ -149,6 +157,9 @@ def benchmark(integrator: str, steps: int, repeats: int, dt: float, jit: bool, u
       if unroll > 1:
         if integrator == "implicit" and buffered:
           q, p = step(q, p, q_buf, p_buf)
+        elif integrator == "implicit" and mixed:
+          for _ in range(unroll):
+            q, p = step(q, p)
         else:
           q, p = step(q, p)
       else:
@@ -187,6 +198,8 @@ if __name__ == "__main__":
   args = sys.argv[1:]
   fast = _parse_bool_flag(args, "fast")
   buffered = _parse_bool_flag(args, "buffered")
+  functional = _parse_bool_flag(args, "functional")
+  mixed = _parse_bool_flag(args, "mixed")
   sweep_iters = _parse_bool_flag(args, "sweep-iters")
   drift_target = _parse_float_flag(args, "drift", 1e-4)
   steps_target = _parse_float_flag(args, "min-steps", 0.0)
@@ -211,7 +224,7 @@ if __name__ == "__main__":
         it_min, it_max = int(iters_range[0]), int(iters_range[1])
       system = HamiltonianSystem(double_pendulum_hamiltonian(), integrator=integrator)
       implicit_iters, rows = _choose_implicit_iters(
-        system, dt, steps, unroll, buffered, it_min, it_max, drift_target, steps_target)
+        system, dt, steps, unroll, buffered, functional, it_min, it_max, drift_target, steps_target)
       print("-" * 60)
       print("IMPLICIT ITERS SWEEP")
       print("-" * 60)
@@ -224,4 +237,5 @@ if __name__ == "__main__":
       import os
       os.environ["TINYGRAD_IMPLICIT_ITERS"] = str(implicit_iters)
   benchmark(integrator=integrator, steps=steps, repeats=repeats, dt=dt, jit=jit,
-            unroll=unroll, implicit_iters=implicit_iters, report_energy=report_energy, buffered=buffered)
+            unroll=unroll, implicit_iters=implicit_iters, report_energy=report_energy,
+            buffered=buffered, functional=functional, mixed=mixed)

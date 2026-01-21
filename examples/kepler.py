@@ -16,6 +16,7 @@ from tinygrad.tensor import Tensor
 from tinygrad.physics import HamiltonianSystem
 import json
 import os
+import time
 
 
 # ============================================================================
@@ -58,7 +59,9 @@ def kepler_hamiltonian(GM: float = 1.0, m: float = 1.0, softening: float = 0.0):
 # SIMULATION
 # ============================================================================
 
-def run_simulation(integrator="yoshida4", dt=0.01, steps=5000, eccentricity=0.6):
+def run_simulation(integrator="yoshida4", dt=0.01, steps=5000, eccentricity=0.6,
+                   use_scan=False, use_unroll=False, unroll_steps=1,
+                   vector_width=1, scan_tune=False, render=True):
     """
     Simulate the Kepler problem using the TinyPhysics compiler approach.
 
@@ -77,6 +80,9 @@ def run_simulation(integrator="yoshida4", dt=0.01, steps=5000, eccentricity=0.6)
     # Initial state
     q = Tensor([r_aphelion, 0.0], requires_grad=True)
     p = Tensor([0.0, m * v_aphelion], requires_grad=True)
+    if use_scan:
+        q = q.detach()
+        p = p.detach()
 
     # Expected orbital period
     T_orbital = 2 * np.pi * np.sqrt(a**3 / GM)
@@ -106,7 +112,35 @@ def run_simulation(integrator="yoshida4", dt=0.01, steps=5000, eccentricity=0.6)
     print(f"Initial Angular Momentum: {L_start:.6f}")
 
     # EVOLVE THE SYSTEM
-    q, p, history = system.evolve(q, p, dt=dt, steps=steps, record_every=10)
+    start_time = time.perf_counter()
+    history = None
+    if use_scan and integrator == "leapfrog":
+        if steps % unroll_steps != 0:
+            raise ValueError("steps must be divisible by unroll_steps for scan")
+        try:
+            q, p, history = system.evolve_scan_kernel(
+                q, p, dt=dt, steps=steps, coupled=True, coupled_fused=True,
+                unroll_steps=unroll_steps, vector_width=vector_width, scan_tune=scan_tune,
+            )
+        except Exception as e:
+            print(f"Scan kernel failed ({e}); falling back to unrolled step.")
+            use_scan = False
+            use_unroll = True
+    if use_unroll and integrator == "leapfrog":
+        if steps % unroll_steps != 0:
+            raise ValueError("steps must be divisible by unroll_steps for unroll")
+        step = system.compile_unrolled_step(dt, unroll_steps)
+        for _ in range(steps // unroll_steps):
+            q, p = step(q, p)
+        q.numpy()
+        p.numpy()
+        history = []
+        history.append((q.numpy().copy(), p.numpy().copy(), system.energy(q, p)))
+    if history is None:
+        q, p, history = system.evolve(q, p, dt=dt, steps=steps, record_every=10)
+
+    elapsed = time.perf_counter() - start_time
+    steps_s = steps / elapsed if elapsed > 0 else float("inf")
 
     # Final state
     E_end = system.energy(q, p)
@@ -120,11 +154,15 @@ def run_simulation(integrator="yoshida4", dt=0.01, steps=5000, eccentricity=0.6)
     print(f"Final Angular Momentum: {L_end:.6f}")
     print(f"Energy Drift: {E_drift:.2e}")
     print(f"Angular Momentum Drift: {L_drift:.2e}")
+    print(f"Performance: {steps_s:,.1f} steps/s")
 
     # Generate viewer
-    history_q = [h[0].tolist() for h in history]
-    history_E = [h[2] for h in history]
-    generate_viewer(history_q, a, e, history_E, E_start)
+    if render and history is not None and len(history) > 2:
+        history_q = [h[0].tolist() for h in history]
+        history_E = [h[2] for h in history]
+        generate_viewer(history_q, a, e, history_E, E_start)
+    elif render and use_scan:
+        print("Viewer disabled for scan mode (history is too sparse).")
 
     return E_start, E_end, E_drift, L_drift
 
@@ -621,7 +659,15 @@ def compare_integrators():
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "--compare":
+    args = sys.argv[1:]
+    if len(args) > 0 and args[0] == "--compare":
         compare_integrators()
+    elif "--fast" in args:
+        run_simulation(
+            integrator="leapfrog",
+            use_unroll=True,
+            unroll_steps=8,
+            render=False,
+        )
     else:
         run_simulation("yoshida4")

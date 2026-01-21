@@ -238,6 +238,19 @@ class Tensor(OpMixin):
 
     This API is alpha and may change.
     """
+    if getenv("TINYGRAD_COUPLED_FUSED_DEBUG", 0) and getenv("TINYGRAD_COUPLED_FUSED_DEBUG_INPUTS", 0):
+      from tinygrad.physics import _count_uops_limit
+      limit = getenv("TINYGRAD_COUPLED_FUSED_DEBUG_LIMIT", 20000)
+      try:
+        placeholders = UOp.custom_kernel(*[t.uop for t in (self,)+lst], fxn=lambda *args: args[0], grad_fxn=grad_fxn)
+        if isinstance(placeholders, list):
+          count = sum(_count_uops_limit(p, limit) for p in placeholders if isinstance(p, UOp))
+        else:
+          count = _count_uops_limit(placeholders, limit)
+        print(f"custom_kernel_inputs_uops~{count}")
+      except Exception as e:
+        print(f"custom_kernel_inputs_uops_error={type(e).__name__} {e}")
+      raise RuntimeError("fused debug stop")
     return [Tensor(u, device=u.device) for u in UOp.custom_kernel(*[t.uop for t in (self,)+lst], fxn=fxn, grad_fxn=grad_fxn)]
 
   def schedule_with_vars(self, *lst:Tensor) -> tuple[list[ExecItem], dict[str, int]]:

@@ -131,6 +131,20 @@ def full_rewrite_to_sink(sink:UOp, ren:Renderer|None=None, optimize:bool=True) -
     ]),
     name="strip const reshape/expand (late)",
   )
+  def drop_scalar_expand(ctx, u: UOp) -> UOp|None:
+    if u.op is not Ops.EXPAND: return None
+    if u.arg is not None: return None
+    if len(u.src) != 2: return None
+    try:
+      if u.src[0].shape == (): return u.src[0]
+    except Exception:
+      return None
+    return None
+  sink = graph_rewrite(
+    sink,
+    PatternMatcher([(UPat(Ops.EXPAND, name="u"), drop_scalar_expand)]),
+    name="drop scalar expand (late)",
+  )
 
   # this was the linearizer
   sink = graph_rewrite(sink, pm_add_control_flow, ctx=CFGContext(sink), name="add control flow", bottom_up=True)
