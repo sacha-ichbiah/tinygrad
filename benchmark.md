@@ -1,0 +1,81 @@
+# Double Pendulum Benchmark Learnings
+
+Date: 2026-01-21
+
+## Setup
+- Script: `examples/double_pendulum_benchmark.py`
+- Steps: 2000
+- Repeats: 1 (single-run sweep)
+- dt: 0.01
+
+## Peak Result
+Best observed speed:
+- **Integrator:** `leapfrog`
+- **Unroll:** `4`
+- **JIT flag:** `--jit` not used (unroll path uses TinyJit internally)
+- **Steps/s:** **9,493.2**
+- **Command:** `python examples/double_pendulum_benchmark.py leapfrog --steps=2000 --repeats=1 --unroll=4`
+
+## Sweep Notes
+- `implicit` with `--jit` or `--unroll > 1` failed with:
+  `RuntimeError: shape requested, but Ops.VCONST doesn't have a shape`
+- `leapfrog` and `yoshida4` improved significantly with unroll or `--jit`.
+- Single-run results vary; use `--repeats=3` for more stable comparisons.
+
+## Observed Results (steps/s)
+- implicit, unroll=1, jit=False: 237.4
+- implicit, unroll=1, jit=True: ERROR (VCONST shape)
+- implicit, unroll=2/4/8: ERROR (VCONST shape)
+- leapfrog, unroll=1, jit=False: 522.8
+- leapfrog, unroll=1, jit=True: 3941.8
+- leapfrog, unroll=2: 7074.9
+- leapfrog, unroll=4: 9493.2  <-- best
+- leapfrog, unroll=8: 7797.8
+- yoshida4, unroll=1, jit=False: 150.9
+- yoshida4, unroll=1, jit=True: 3053.1
+- yoshida4, unroll=2: 4248.6
+- yoshida4, unroll=4: 3947.7
+- yoshida4, unroll=8: 3211.9
+
+# Harmonic Oscillator Benchmark Learnings
+
+Date: 2026-01-21
+
+## Setup
+- Script: `examples/harmonic_oscillator.py --bench`
+- Steps: 2000
+- Repeats: 1 (single-run sweep)
+- dt: 0.01
+
+## Peak Result
+Best observed speed:
+- **Integrator:** `euler`
+- **Unroll:** `16`
+- **JIT flag:** `--jit` not used (unroll path uses TinyJit internally)
+- **Steps/s:** **35,265.0**
+- **Command:** `python examples/harmonic_oscillator.py --bench euler --steps=2000 --repeats=1 --unroll=16`
+
+## Sweep Notes
+- Unrolling dominates performance for this small system.
+- Peak speed depends on integrator cost; euler is fastest but least accurate.
+- Single-run results vary; use `--repeats=3` for more stable comparisons.
+
+## Observed Results (steps/s)
+- euler, unroll=1, jit=False: 857.0
+- euler, unroll=1, jit=True: 6091.0
+- euler, unroll=2: 14880.0
+- euler, unroll=4: 25231.0
+- euler, unroll=8: 34917.0
+- euler, unroll=16: 35265.0  <-- best
+- leapfrog, unroll=1, jit=False: 542.0
+- leapfrog, unroll=1, jit=True: 5832.0
+- leapfrog, unroll=2: 13911.0
+- leapfrog, unroll=4: 22781.0
+- leapfrog, unroll=8: 30902.0
+- leapfrog, unroll=16: 23221.0
+- yoshida4, unroll=1, jit=False: 166.0
+- yoshida4, unroll=1, jit=True: 5239.0
+- yoshida4, unroll=2: 8441.0
+- yoshida4, unroll=4: 16758.0
+- yoshida4, unroll=8: 17292.0
+- yoshida4, unroll=16: 7085.0

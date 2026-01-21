@@ -168,6 +168,25 @@ def test_leapfrog_scan_kernel_coupled_fused_full_reduce_vec_experimental():
   np.testing.assert_allclose(p1.numpy(), p2.numpy(), rtol=1e-3, atol=1e-6)
 
 
+def test_leapfrog_scan_kernel_coupled_fused_dHdp_reduce_only():
+  def H(q, p):
+    psum = p.sum()
+    return (q * q).sum() / 2 + (psum * psum) / 2
+
+  system = HamiltonianSystem(H, integrator="leapfrog")
+
+  q1 = Tensor([0.1 * i for i in range(8)])
+  p1 = Tensor([0.0 for _ in range(8)])
+  q2 = Tensor([0.1 * i for i in range(8)])
+  p2 = Tensor([0.0 for _ in range(8)])
+
+  q1, p1, _ = system.evolve(q1, p1, dt=0.01, steps=12, record_every=12)
+  q2, p2, _ = system.evolve_scan_kernel(q2, p2, dt=0.01, steps=12, coupled=True, coupled_fused=True)
+
+  np.testing.assert_allclose(q1.numpy(), q2.numpy(), rtol=1e-3, atol=1e-6)
+  np.testing.assert_allclose(p1.numpy(), p2.numpy(), rtol=1e-3, atol=1e-6)
+
+
 def test_leapfrog_scan_kernel_coupled_multi_reduce_large():
   def H(q, p):
     qsum = q.sum()
