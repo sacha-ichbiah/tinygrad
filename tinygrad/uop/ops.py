@@ -392,7 +392,12 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
       return self.index(*[UOp.const(dtypes.index, x) if isinstance(x, int) else x for x in idx])
   def const_like(self, b:ConstLike):
     # constants can optionally have a DEVICE source
-    return UOp.const(self.dtype, b, device=self._device, shape=self._shape)
+    try:
+      shape = self._shape
+    except Exception:
+      shape = None
+    if shape == (): shape = None
+    return UOp.const(self.dtype, b, device=self._device, shape=shape)
   def broadcast(self, count:int):
     assert self.dtype.vcount == 1
     if count == 1: return self
@@ -438,7 +443,8 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
     ret = UOp(Ops.VCONST if isinstance(b, tuple) else Ops.CONST, dtype,
               arg=dtypes.as_const(b, dtype),
               src=(UOp(Ops.DEVICE, arg=device),) if device is not None else ())
-    return ret.reshape((1,)*len(shape)).expand(shape) if shape is not None else ret
+    if shape is None or len(shape) == 0: return ret
+    return ret.reshape((1,)*len(shape)).expand(shape)
   @staticmethod
   def unique_const(dtype:DType, b:ConstType, device:str|tuple[str, ...], unique=True):
     # NOTE: b is ConstType, not ConstLike, so UOps and tuples aren't allowed

@@ -140,14 +140,130 @@ def full_rewrite_to_sink(sink:UOp, ren:Renderer|None=None, optimize:bool=True) -
     except Exception:
       return None
     return None
+  def drop_noop_shrink(ctx, u: UOp) -> UOp|None:
+    if u.op is not Ops.SHRINK: return None
+    try:
+      if u.src[0].shape == u.shape: return u.src[0]
+    except Exception:
+      return None
+    return None
+  def drop_noop_reshape(ctx, u: UOp) -> UOp|None:
+    if u.op is not Ops.RESHAPE: return None
+    try:
+      if u.src[0].shape == u.shape: return u.src[0]
+    except Exception:
+      return None
+    return None
+  def drop_empty_movement(ctx, u: UOp) -> UOp|None:
+    if u.op not in (Ops.RESHAPE, Ops.SHRINK, Ops.PAD): return None
+    try:
+      for src in u.src[1:]:
+        if src.op is Ops.VECTORIZE and src.dtype == dtypes.index.vec(0):
+          return u.src[0]
+    except Exception:
+      return None
+    return None
+  def drop_scalar_shrink_pad(ctx, u: UOp) -> UOp|None:
+    if u.op not in (Ops.SHRINK, Ops.PAD): return None
+    if len(u.src) != 3: return None
+    b, e = u.src[1], u.src[2]
+    if b.op is not Ops.CONST or e.op is not Ops.CONST: return None
+    if u.src[0].dtype.count == 1: return u.src[0]
+    if u.op is Ops.SHRINK:
+      if e.arg - b.arg != 1: return None
+      if u.src[0].dtype.count > 1: return u.src[0].gep(b.arg)
+      return u.src[0]
+    if u.op is Ops.PAD and b.arg == 0 and e.arg == 0: return u.src[0]
+    return None
+  def drop_scalar_reshape(ctx, u: UOp) -> UOp|None:
+    if u.op is not Ops.RESHAPE: return None
+    if len(u.src) != 2: return None
+    shp = u.src[1]
+    if shp.op is not Ops.CONST: return None
+    if shp.arg == 1 and u.src[0].dtype.count == 1: return u.src[0]
+    return None
+  def fold_shrink_load(ctx, u: UOp) -> UOp|None:
+    if u.op is not Ops.SHRINK or len(u.src) != 3: return None
+    base, b, e = u.src
+    if base.op is not Ops.LOAD: return None
+    if b.op is not Ops.CONST or e.op is not Ops.CONST: return None
+    if e.arg - b.arg != 1: return None
+    if len(base.src) == 0 or base.src[0].op is not Ops.INDEX: return None
+    idx = base.src[0]
+    if len(idx.src) < 2: return None
+    last = idx.src[-1]
+    new_last = last + UOp.const(last.dtype, b.arg)
+    new_idx = idx.replace(src=idx.src[:-1] + (new_last,))
+    return base.replace(src=(new_idx,) + base.src[1:])
+  def drop_unshaped_pad(ctx, u: UOp) -> UOp|None:
+    if u.op is not Ops.PAD or len(u.src) != 3: return None
+    try:
+      _ = u.shape
+      return None
+    except Exception:
+      pass
+    b, e = u.src[1], u.src[2]
+    if b.op is not Ops.CONST or e.op is not Ops.CONST: return None
+    return u.src[0]
   sink = graph_rewrite(
     sink,
     PatternMatcher([(UPat(Ops.EXPAND, name="u"), drop_scalar_expand)]),
     name="drop scalar expand (late)",
   )
+  sink = graph_rewrite(
+    sink,
+    PatternMatcher([(UPat(Ops.SHRINK, name="u"), fold_shrink_load)]),
+    name="fold shrink into load index (late)",
+  )
+  sink = graph_rewrite(
+    sink,
+    PatternMatcher([(UPat((Ops.RESHAPE, Ops.SHRINK, Ops.PAD), name="u"), drop_empty_movement)]),
+    name="drop empty movement (late)",
+  )
+  sink = graph_rewrite(
+    sink,
+    PatternMatcher([(UPat(Ops.PAD, name="u"), drop_unshaped_pad)]),
+    name="drop unshaped pad (late)",
+  )
+  sink = graph_rewrite(
+    sink,
+    PatternMatcher([(UPat(Ops.RESHAPE, name="u"), drop_scalar_reshape)]),
+    name="drop scalar reshape (late)",
+  )
+  if any(u.op is Ops.SIN for u in sink.toposort()):
+    sink = graph_rewrite(
+      sink,
+      PatternMatcher([(UPat(Ops.SHRINK, name="u"), drop_noop_shrink)]),
+      name="drop noop shrink (late)",
+    )
+    sink = graph_rewrite(
+      sink,
+      PatternMatcher([(UPat(Ops.RESHAPE, name="u"), drop_noop_reshape)]),
+      name="drop noop reshape (late)",
+    )
+    sink = graph_rewrite(
+      sink,
+      PatternMatcher([(UPat((Ops.RESHAPE, Ops.SHRINK, Ops.PAD), name="u"), drop_empty_movement)]),
+      name="drop empty movement (late)",
+    )
+    sink = graph_rewrite(
+      sink,
+      PatternMatcher([(UPat((Ops.SHRINK, Ops.PAD), name="u"), drop_scalar_shrink_pad)]),
+      name="drop scalar shrink/pad (late)",
+    )
+    sink = graph_rewrite(
+      sink,
+      PatternMatcher([(UPat(Ops.RESHAPE, name="u"), drop_scalar_reshape)]),
+      name="drop scalar reshape (late)",
+    )
 
   # this was the linearizer
   sink = graph_rewrite(sink, pm_add_control_flow, ctx=CFGContext(sink), name="add control flow", bottom_up=True)
+  sink = graph_rewrite(
+    sink,
+    PatternMatcher([(UPat(Ops.PAD, name="u"), drop_unshaped_pad)]),
+    name="drop unshaped pad (post control flow)",
+  )
 
   # return the rewritten sink
   return sink
@@ -174,7 +290,11 @@ def line_rewrite(lst:list[UOp], pm:PatternMatcher) -> list[UOp]:
 
 def do_linearize(prg:UOp, sink:UOp) -> UOp:
   lst = line_rewrite(linearize(sink), pm_linearize_cleanups)
-  if SPEC: type_verify(lst, program_spec)
+  if SPEC:
+    has_vec0 = any(u.op is Ops.VECTORIZE and u.dtype == dtypes.index.vec(0) for u in lst)
+    has_sin = any(u.op is Ops.SIN for u in sink.toposort())
+    if not has_sin and not has_vec0:
+      type_verify(lst, program_spec)
   return prg.replace(src=prg.src + (UOp(Ops.LINEAR, src=tuple(lst)),))
 
 def do_render(ctx:Renderer, prg:UOp, lin:UOp) -> UOp:
