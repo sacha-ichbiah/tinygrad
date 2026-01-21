@@ -15,7 +15,7 @@ This is the "native language" of physics on AI hardware.
 import math
 from tinygrad.engine.jit import TinyJit, JitError
 from tinygrad.engine.realize import capturing
-from tinygrad.helpers import getenv
+from tinygrad.helpers import getenv, CAPTURING
 from tinygrad.codegen.opt import Opt, OptOps
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.tensor import Tensor
@@ -401,22 +401,75 @@ def implicit_midpoint(q: Tensor, p: Tensor, H_func, dt: float = 0.01,
                       tol: float = 1e-10, max_iter: int = 10) -> tuple[Tensor, Tensor]:
     """Implicit Midpoint Rule - truly symplectic for ANY Hamiltonian. Order: O(dt²)"""
     dHdq, dHdp = _grad_H(q, p, H_func)
-    q_next = q + dt * dHdp
-    p_next = p - dt * dHdq
+    half_dt = 0.5 * dt
+    q_mid = q + half_dt * dHdp
+    p_mid = p - half_dt * dHdq
 
-    for _ in range(max_iter):
-        q_mid = 0.5 * (q + q_next)
-        p_mid = 0.5 * (p + p_next)
-        dHdq_mid, dHdp_mid = _grad_H(q_mid, p_mid, H_func)
-        q_new = q + dt * dHdp_mid
-        p_new = p - dt * dHdq_mid
-        diff_q = (q_new - q_next).abs().max().numpy()
-        diff_p = (p_new - p_next).abs().max().numpy()
-        if diff_q < tol and diff_p < tol:
-            break
-        q_next, p_next = q_new, p_new
+    fixed_iters = _implicit_fixed_iters(dt, max_iter)
+    if fixed_iters > 0:
+        for _ in range(fixed_iters):
+            dHdq_mid, dHdp_mid = _grad_H(q_mid, p_mid, H_func)
+            q_mid = q + half_dt * dHdp_mid
+            p_mid = p - half_dt * dHdq_mid
+        q_next = q + dt * dHdp_mid
+        p_next = p - dt * dHdq_mid
+    else:
+        q_next = q + dt * dHdp
+        p_next = p - dt * dHdq
+        for _ in range(max_iter):
+            dHdq_mid, dHdp_mid = _grad_H(q_mid, p_mid, H_func)
+            q_new = q + dt * dHdp_mid
+            p_new = p - dt * dHdq_mid
+            diff_q = (q_new - q_next).abs().max().numpy()
+            diff_p = (p_new - p_next).abs().max().numpy()
+            if diff_q < tol and diff_p < tol:
+                break
+            q_next, p_next = q_new, p_new
+            q_mid = q + half_dt * dHdp_mid
+            p_mid = p - half_dt * dHdq_mid
 
     return q_next.realize(), p_next.realize()
+
+
+def _implicit_fixed_iters(dt: float, max_iter: int) -> int:
+    fixed_iters = getenv("TINYGRAD_IMPLICIT_ITERS", 0)
+    if fixed_iters <= 0:
+        if CAPTURING and len(capturing):
+            fixed_iters = max_iter
+        elif getenv("TINYGRAD_IMPLICIT_HEURISTIC", 1):
+            if dt <= 0.0025:
+                fixed_iters = 2
+            elif dt <= 0.005:
+                fixed_iters = 3
+            elif dt <= 0.01:
+                fixed_iters = 4
+            elif dt <= 0.02:
+                fixed_iters = 6
+            else:
+                fixed_iters = 8
+    return fixed_iters
+
+
+def implicit_midpoint_inplace(q: Tensor, p: Tensor, H_func, dt: float = 0.01,
+                              tol: float = 1e-10, max_iter: int = 10) -> tuple[Tensor, Tensor]:
+    fixed_iters = _implicit_fixed_iters(dt, max_iter)
+    if fixed_iters <= 0:
+        q_next, p_next = implicit_midpoint(q, p, H_func, dt=dt, tol=tol, max_iter=max_iter)
+        q.assign(q_next)
+        p.assign(p_next)
+        return q, p
+
+    dHdq, dHdp = _grad_H(q, p, H_func)
+    half_dt = 0.5 * dt
+    q_mid = q + half_dt * dHdp
+    p_mid = p - half_dt * dHdq
+    for _ in range(fixed_iters):
+        dHdq_mid, dHdp_mid = _grad_H(q_mid, p_mid, H_func)
+        q_mid = q + half_dt * dHdp_mid
+        p_mid = p - half_dt * dHdq_mid
+    q.assign(q + dt * dHdp_mid)
+    p.assign(p - dt * dHdq_mid)
+    return q, p
 
 
 # ============================================================================
@@ -454,6 +507,9 @@ class HamiltonianSystem:
         self._ho_mode_cache: dict[tuple[float, int, str, tuple[int, ...], object], bool] = {}
         self._ho_vec_cache: dict[tuple[float, int, str, tuple[int, ...], object], int] = {}
         self._scan_vec_cache: dict[tuple[float, int, int, str, tuple[int, ...], object], int] = {}
+        self._ho_trig_cache: dict[tuple[float, int, str, object, float, float], tuple[float, float, float, float]] = {}
+        self._ho_shift_cache: dict[tuple[str, object, float, float, float, float], tuple[float, float]] = {}
+        self._scan_vec_shape_cache: dict[tuple[str, object, int], int] = {}
         self._step_kernel_coupled_cache: dict[tuple[float, str, tuple[int, ...], object], Callable] = {}
         self._grad_kernel_coupled_cache: dict[tuple[str, tuple[int, ...], object], Callable] = {}
         self._update_kernel_coupled_cache: dict[tuple[float, str, tuple[int, ...], object, int], Callable] = {}
@@ -475,6 +531,8 @@ class HamiltonianSystem:
 
     def step_inplace(self, q: Tensor, p: Tensor, dt: float = 0.01) -> tuple[Tensor, Tensor]:
         """In-place step for scan loops; updates q and p buffers via assign."""
+        if self.integrator_name == "implicit":
+            return implicit_midpoint_inplace(q, p, self.H, dt)
         q_new, p_new = self.step(q, p, dt)
         q.assign(q_new)
         p.assign(p_new)
@@ -588,6 +646,19 @@ class HamiltonianSystem:
             raise ValueError("vector_width must divide the number of elements")
         if vector_width > 1 and q.numel() % vector_width != 0:
             raise ValueError("vector_width must divide the number of elements")
+        if not scan_tune and getenv("TINYGRAD_SCAN_UNROLL_HEURISTIC", 1):
+            if steps >= 1024 and q.numel() >= 1024:
+                guess = 8
+            elif steps >= 256:
+                guess = 4
+            elif steps >= 64:
+                guess = 2
+            else:
+                guess = 1
+            for u in (guess, 4, 2, 1):
+                if steps % u == 0:
+                    unroll_steps = u
+                    break
         q = q.contiguous().realize()
         p = p.contiguous().realize()
 
@@ -617,10 +688,47 @@ class HamiltonianSystem:
                 for v in candidates_vec:
                     for u in candidates_unroll:
                         key_u = (dt, steps, u, v, False, q.device, q.shape, q.dtype)
+                        try:
+                            kernel = self._scan_kernel_cache.get(key_u)
+                            if kernel is None:
+                                kernel = self._build_leapfrog_scan_kernel(
+                                    dt, steps, u, v, q.device, q.shape, q.dtype, ho_closed_form=False)
+                                self._scan_kernel_cache[key_u] = kernel
+                            q_tmp = q_start.clone().realize()
+                            p_tmp = p_start.clone().realize()
+                            start = time.perf_counter()
+                            q_out, p_out = Tensor.custom_kernel(q_tmp, p_tmp, fxn=kernel)[:2]
+                            Tensor.realize(q_out, p_out)
+                            elapsed = time.perf_counter() - start
+                        except Exception:
+                            continue
+                        if elapsed < best_time:
+                            best_time = elapsed
+                            best_u, best_v = u, v
+                if best_time == float("inf"):
+                    best_u, best_v = unroll_steps, 1
+                self._scan_kernel_tune_cache[key] = (best_u, best_v)
+                unroll_steps, vector_width = best_u, best_v
+
+        if vector_width == 1 and getenv("TINYGRAD_SCAN_VEC_SHAPE_AUTO", 1):
+            key = (q.device, q.dtype, q.numel())
+            cached = self._scan_vec_shape_cache.get(key)
+            if cached is not None:
+                vector_width = cached
+            else:
+                candidates_vec = [1, 2, 4, 8]
+                candidates_vec = [v for v in candidates_vec if q.numel() % v == 0]
+                if not candidates_vec:
+                    candidates_vec = [1]
+                best_v = 1
+                best_time = float("inf")
+                for v in candidates_vec:
+                    key_u = (dt, steps, unroll_steps, v, False, q.device, q.shape, q.dtype)
+                    try:
                         kernel = self._scan_kernel_cache.get(key_u)
                         if kernel is None:
                             kernel = self._build_leapfrog_scan_kernel(
-                                dt, steps, u, v, q.device, q.shape, q.dtype, ho_closed_form=False)
+                                dt, steps, unroll_steps, v, q.device, q.shape, q.dtype, ho_closed_form=False)
                             self._scan_kernel_cache[key_u] = kernel
                         q_tmp = q_start.clone().realize()
                         p_tmp = p_start.clone().realize()
@@ -628,11 +736,19 @@ class HamiltonianSystem:
                         q_out, p_out = Tensor.custom_kernel(q_tmp, p_tmp, fxn=kernel)[:2]
                         Tensor.realize(q_out, p_out)
                         elapsed = time.perf_counter() - start
-                        if elapsed < best_time:
-                            best_time = elapsed
-                            best_u, best_v = u, v
-                self._scan_kernel_tune_cache[key] = (best_u, best_v)
-                unroll_steps, vector_width = best_u, best_v
+                    except Exception:
+                        continue
+                    if elapsed < best_time:
+                        best_time = elapsed
+                        best_v = v
+                self._scan_vec_shape_cache[key] = best_v
+                vector_width = best_v
+
+        if ho_coeffs is None and getenv("TINYGRAD_SCAN_VEC_SHAPE_ALWAYS", 0):
+            key = (q.device, q.dtype, q.numel())
+            cached = self._scan_vec_shape_cache.get(key)
+            if cached is not None:
+                vector_width = cached
 
         if vector_width == 1 and getenv("TINYGRAD_SCAN_VEC_AUTO", 0):
             key = (dt, steps, unroll_steps, q.device, q.shape, q.dtype)
@@ -648,17 +764,20 @@ class HamiltonianSystem:
                 best_time = float("inf")
                 for v in candidates_vec:
                     key_u = (dt, steps, unroll_steps, v, False, q.device, q.shape, q.dtype)
-                    kernel = self._scan_kernel_cache.get(key_u)
-                    if kernel is None:
-                        kernel = self._build_leapfrog_scan_kernel(
-                            dt, steps, unroll_steps, v, q.device, q.shape, q.dtype, ho_closed_form=False)
-                        self._scan_kernel_cache[key_u] = kernel
-                    q_tmp = q_start.clone().realize()
-                    p_tmp = p_start.clone().realize()
-                    start = time.perf_counter()
-                    q_out, p_out = Tensor.custom_kernel(q_tmp, p_tmp, fxn=kernel)[:2]
-                    Tensor.realize(q_out, p_out)
-                    elapsed = time.perf_counter() - start
+                    try:
+                        kernel = self._scan_kernel_cache.get(key_u)
+                        if kernel is None:
+                            kernel = self._build_leapfrog_scan_kernel(
+                                dt, steps, unroll_steps, v, q.device, q.shape, q.dtype, ho_closed_form=False)
+                            self._scan_kernel_cache[key_u] = kernel
+                        q_tmp = q_start.clone().realize()
+                        p_tmp = p_start.clone().realize()
+                        start = time.perf_counter()
+                        q_out, p_out = Tensor.custom_kernel(q_tmp, p_tmp, fxn=kernel)[:2]
+                        Tensor.realize(q_out, p_out)
+                        elapsed = time.perf_counter() - start
+                    except Exception:
+                        continue
                     if elapsed < best_time:
                         best_time = elapsed
                         best_v = v
@@ -703,31 +822,36 @@ class HamiltonianSystem:
             if force in (0, 1):
                 ho_closed_form = bool(force)
             else:
-                key = (dt, steps, q.device, q.shape, q.dtype)
-                cached = self._ho_mode_cache.get(key)
-                if cached is not None:
-                    ho_closed_form = cached
-                else:
+                max_steps = getenv("TINYGRAD_HO_TUNE_MAX_STEPS", 512)
+                if steps >= max_steps:
                     ho_closed_form = True
-                    best_cf = True
-                    best_time = float("inf")
-                    for cf in (True, False):
-                        key_u = (dt, steps, unroll_steps, vector_width, cf, q.device, q.shape, q.dtype)
-                        kernel = self._scan_kernel_cache.get(key_u)
-                        if kernel is None:
-                            kernel = self._build_leapfrog_scan_kernel(
-                                dt, steps, unroll_steps, vector_width, q.device, q.shape, q.dtype, ho_closed_form=cf)
-                            self._scan_kernel_cache[key_u] = kernel
-                        q_tmp = q_start.clone().realize()
-                        p_tmp = p_start.clone().realize()
-                        start = time.perf_counter()
-                        q_out, p_out = Tensor.custom_kernel(q_tmp, p_tmp, fxn=kernel)[:2]
-                        Tensor.realize(q_out, p_out)
-                        elapsed = time.perf_counter() - start
-                        if elapsed < best_time:
-                            best_time = elapsed
-                            best_cf = cf
-                    self._ho_mode_cache[key] = best_cf
+                    self._ho_mode_cache[(dt, steps, q.device, q.shape, q.dtype)] = True
+                else:
+                    key = (dt, steps, q.device, q.shape, q.dtype)
+                    cached = self._ho_mode_cache.get(key)
+                    if cached is not None:
+                        ho_closed_form = cached
+                    else:
+                        ho_closed_form = True
+                        best_cf = True
+                        best_time = float("inf")
+                        for cf in (True, False):
+                            key_u = (dt, steps, unroll_steps, vector_width, cf, q.device, q.shape, q.dtype)
+                            kernel = self._scan_kernel_cache.get(key_u)
+                            if kernel is None:
+                                kernel = self._build_leapfrog_scan_kernel(
+                                    dt, steps, unroll_steps, vector_width, q.device, q.shape, q.dtype, ho_closed_form=cf)
+                                self._scan_kernel_cache[key_u] = kernel
+                            q_tmp = q_start.clone().realize()
+                            p_tmp = p_start.clone().realize()
+                            start = time.perf_counter()
+                            q_out, p_out = Tensor.custom_kernel(q_tmp, p_tmp, fxn=kernel)[:2]
+                            Tensor.realize(q_out, p_out)
+                            elapsed = time.perf_counter() - start
+                            if elapsed < best_time:
+                                best_time = elapsed
+                                best_cf = cf
+                        self._ho_mode_cache[key] = best_cf
 
         key = (dt, steps, unroll_steps, vector_width, ho_closed_form, q.device, q.shape, q.dtype)
         kernel = self._scan_kernel_cache.get(key)
@@ -2700,19 +2824,43 @@ class HamiltonianSystem:
                 c = q_elem.const_like(ho_c)
                 d = q_elem.const_like(ho_d)
                 ab_one = (ho_dHdq == 1.0 and ho_dHdp == 1.0)
-                use_rotate = ho_closed_form and ho_dHdq != 0.0 and ho_dHdp != 0.0
+                trig_key = (dt, unroll_steps, device, dtype, ho_dHdq, ho_dHdp)
+                trig = self._ho_trig_cache.get(trig_key)
+                if trig is None:
+                    if ho_closed_form and ho_dHdq != 0.0 and ho_dHdp != 0.0:
+                        w2 = ho_dHdq * ho_dHdp
+                        if w2 > 0.0 and math.isfinite(w2):
+                            w = math.sqrt(w2)
+                            theta = dt * unroll_steps * w
+                            if math.isfinite(theta):
+                                sin_t = math.sin(theta)
+                                cos_t = math.cos(theta)
+                                a_over_w = ho_dHdq / w
+                                b_over_w = ho_dHdp / w
+                                if all(math.isfinite(x) for x in (sin_t, cos_t, a_over_w, b_over_w)):
+                                    trig = (sin_t, cos_t, a_over_w, b_over_w)
+                                    self._ho_trig_cache[trig_key] = trig
+                use_rotate = trig is not None and ho_closed_form and ho_dHdq != 0.0 and ho_dHdp != 0.0
                 if use_rotate:
-                    w = (a * b).sqrt()
-                    steps_u = q_elem.const_like(unroll_steps)
-                    theta = dt_uop * steps_u * w
-                    pi2 = q_elem.const_like(math.pi * 0.5)
-                    sin_t = theta.sin()
-                    cos_t = (pi2 - theta).sin()
-                    w_inv = w.reciprocal()
-                    a_over_w = a * w_inv
-                    b_over_w = b * w_inv
-                    q_off = c / a
-                    p_off = d / b
+                    sin_t = q_elem.const_like(trig[0])
+                    cos_t = q_elem.const_like(trig[1])
+                    a_over_w = q_elem.const_like(trig[2])
+                    b_over_w = q_elem.const_like(trig[3])
+                    shift_key = (device, dtype, ho_dHdq, ho_dHdp, ho_c, ho_d)
+                    shift = self._ho_shift_cache.get(shift_key)
+                    if shift is None:
+                        if ho_dHdq != 0.0 and ho_dHdp != 0.0:
+                            q_off = ho_c / ho_dHdq
+                            p_off = ho_d / ho_dHdp
+                            if math.isfinite(q_off) and math.isfinite(p_off):
+                                shift = (q_off, p_off)
+                                self._ho_shift_cache[shift_key] = shift
+                    if shift is None:
+                        q_off = c / a
+                        p_off = d / b
+                    else:
+                        q_off = q_elem.const_like(shift[0])
+                        p_off = q_elem.const_like(shift[1])
                     q_shift = q_elem + q_off
                     p_shift = p_elem + p_off
                     q_next = q_shift * cos_t + (b_over_w * p_shift) * sin_t
@@ -2730,10 +2878,10 @@ class HamiltonianSystem:
                             q_elem = q_elem + dt_uop * (b * p_elem + d)
                             p_elem = p_elem - half_dt * (a * q_elem + c)
             else:
+                dt_uop = q_elem.const_like(dt)
+                half_dt = q_elem.const_like(0.5*dt)
                 for _ in range(unroll_steps):
                     dHdq_1, _ = grad_uop(q_elem, p_elem)
-                    dt_uop = dHdq_1.const_like(dt)
-                    half_dt = dHdq_1.const_like(0.5*dt)
                     p_half = p_elem - half_dt * dHdq_1
                     _, dHdp = grad_uop(q_elem, p_half)
                     q_elem = q_elem + dt_uop * dHdp

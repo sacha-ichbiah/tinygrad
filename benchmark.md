@@ -17,15 +17,21 @@ Best observed speed:
 - **Command:** `python examples/double_pendulum_benchmark.py leapfrog --steps=2000 --repeats=1 --unroll=4`
 
 ## Sweep Notes
-- `implicit` with `--jit` or `--unroll > 1` failed with:
-  `RuntimeError: shape requested, but Ops.VCONST doesn't have a shape`
-- `leapfrog` and `yoshida4` improved significantly with unroll or `--jit`.
+- `implicit` now supports fixed iteration counts via `--implicit-iters=N` (enables JIT/unroll).
+- `--energy-drift` adds an accuracy metric (relative energy drift) per run.
+- `--fast` enables `--jit`, sets `--unroll=4` (if not provided), and turns on `--energy-drift`.
+- `--sweep-iters` auto-selects `implicit-iters` using drift and speed targets.
+  - `--drift=1e-4` sets the drift target (relative).
+  - `--min-steps=0` sets a minimum steps/s target.
+  - `--iters-range=2,10` sets the candidate range.
+  - Prints an iters table and the chosen iteration count.
+- `leapfrog` and `yoshida4` improve significantly with unroll or `--jit`.
 - Single-run results vary; use `--repeats=3` for more stable comparisons.
 
 ## Observed Results (steps/s)
 - implicit, unroll=1, jit=False: 237.4
-- implicit, unroll=1, jit=True: ERROR (VCONST shape)
-- implicit, unroll=2/4/8: ERROR (VCONST shape)
+- implicit, unroll=1, jit=True: OK with `--implicit-iters`
+- implicit, unroll=2/4/8: OK with `--implicit-iters`
 - leapfrog, unroll=1, jit=False: 522.8
 - leapfrog, unroll=1, jit=True: 3941.8
 - leapfrog, unroll=2: 7074.9
