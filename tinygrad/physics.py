@@ -50,6 +50,7 @@ class SymplecticPolicy:
         self._last_report: dict[tuple, dict] = {}
         self._vec_cache: dict[tuple, int] = {}
         self._proj_cache: dict[tuple, int] = {}
+        self._tile_cache: dict[tuple, int] = {}
 
     def _record(self, steps: int, shape: tuple[int, ...], device: str, extra: dict):
         key = (steps, shape, device, self.accuracy, self.scan, self.tune, self.max_unroll, self.min_unroll)
@@ -161,10 +162,45 @@ class SymplecticPolicy:
         self._vec_cache[key] = 1
         return 1
 
+    def choose_batch_tile(self, shape: tuple[int, ...], device: str, vec_dim: int) -> int:
+        key = (shape, device, vec_dim, self.accuracy, self.drift_target)
+        cached = self._tile_cache.get(key)
+        if cached is not None:
+            return cached
+        env_tile = int(getenv("TINYGRAD_PHYSICS_BATCH_TILE", 0))
+        if env_tile > 1:
+            self._tile_cache[key] = env_tile
+            return env_tile
+        if not shape or len(shape) != 2 or shape[-1] != vec_dim:
+            self._tile_cache[key] = 1
+            return 1
+        if "CPU" not in device.upper():
+            self._tile_cache[key] = 1
+            return 1
+        try:
+            batch = int(shape[0])
+        except Exception:
+            self._tile_cache[key] = 1
+            return 1
+        if batch <= 0:
+            self._tile_cache[key] = 1
+            return 1
+        if batch <= 128 and batch % 8 == 0:
+            self._tile_cache[key] = 8
+            return 8
+        if batch <= 64 and batch % 4 == 0:
+            self._tile_cache[key] = 4
+            return 4
+        if batch <= 32 and batch % 2 == 0:
+            self._tile_cache[key] = 2
+            return 2
+        self._tile_cache[key] = 1
+        return 1
+
     def choose_projection_stride(self, steps: int, shape: tuple[int, ...], device: str, constraint: str,
                                  state: tuple[Tensor, ...], step_fn: Callable, constraint_fn: Callable,
                                  candidates: tuple[int, ...] = (1, 2, 4, 8)) -> int:
-        if not self.tune and not getenv("TINYGRAD_PHYSICS_PROJ_TUNE", 0):
+        if self.drift_target is None and not self.tune and not getenv("TINYGRAD_PHYSICS_PROJ_TUNE", 0):
             stride = self.projection_stride(constraint)
             key = (constraint, steps, shape, device, self.accuracy, self.drift_target, candidates)
             self._proj_cache[key] = stride
@@ -174,7 +210,9 @@ class SymplecticPolicy:
         if cached is not None:
             return cached
         strict_drift = self.drift_target is not None and self.drift_target <= 1e-6
-        if self.accuracy in ("precise", "ultra_precise") or strict_drift:
+        if self.drift_target is not None:
+            target = max(self.drift_target, 1e-8)
+        elif self.accuracy in ("precise", "ultra_precise") or strict_drift:
             target = 1e-6
         elif self.accuracy == "fast":
             target = 1e-3
@@ -648,8 +686,17 @@ def _drop_const_expand_any(ctx: dict, x: UOp) -> UOp|None:
 def _hreduce_vector(uop: UOp, op: Ops) -> UOp:
   if uop.dtype.count <= 1:
     return uop
+  count = uop.dtype.count
+  if count & (count - 1) == 0:
+    vals = [uop.gep(i) for i in range(count)]
+    while len(vals) > 1:
+      nxt = []
+      for i in range(0, len(vals), 2):
+        nxt.append(vals[i].alu(op, vals[i+1]))
+      vals = nxt
+    return vals[0]
   scalar = uop.gep(0)
-  for i in range(1, uop.dtype.count):
+  for i in range(1, count):
     scalar = scalar.alu(op, uop.gep(i))
   return scalar
 
@@ -4917,6 +4964,8 @@ class HamiltonianSystem:
         dHdq_uop = graph_rewrite(dHdq_uop, symbolic, name="symbolic_dHdq")
         dHdp_uop = graph_rewrite(dHdp_sym.uop, strip_device_consts, name="strip_device_consts")
         dHdp_uop = graph_rewrite(dHdp_uop, symbolic, name="symbolic_dHdp")
+        cse_group = _cse_uops(UOp.group(dHdq_uop, dHdp_uop))
+        dHdq_uop, dHdp_uop = cse_group.src
         self._grad_uop_cache[key] = (q_sym.uop, p_sym.uop, dHdq_uop, dHdp_uop)
         return self._grad_uop_cache[key]
 
@@ -5725,16 +5774,37 @@ def _reshape_from_vec(z: Tensor, orig: tuple[int, ...] | None) -> Tensor:
   return z.reshape(orig) if orig is not None else z
 
 
-def cross(a: Tensor, b: Tensor) -> Tensor:
-  """Cross product a × b for 3-vectors (supports leading batch dims)."""
+def _reshape_for_batch_tile(z: Tensor, tile: int, vec_dim: int) -> tuple[Tensor, tuple[int, ...] | None]:
+  if tile <= 1:
+    return z, None
+  if not z.shape or z.shape[-1] != vec_dim:
+    return z, None
+  if len(z.shape) != 2:
+    return z, None
+  try:
+    batch = int(z.shape[0])
+  except Exception:
+    return z, None
+  if batch % tile != 0:
+    return z, None
+  orig = z.shape
+  return z.reshape(batch // tile, tile, vec_dim), orig
+
+
+def _reshape_from_batch_tile(z: Tensor, orig: tuple[int, ...] | None) -> Tensor:
+  return z.reshape(orig) if orig is not None else z
+
+
+def _cross_components(a: Tensor, b: Tensor) -> tuple[Tensor, Tensor, Tensor]:
   ax, ay, az = a[..., 0], a[..., 1], a[..., 2]
   bx, by, bz = b[..., 0], b[..., 1], b[..., 2]
-  return Tensor.stack(
-    ay * bz - az * by,
-    az * bx - ax * bz,
-    ax * by - ay * bx,
-    dim=-1,
-  )
+  return (ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx)
+
+
+def cross(a: Tensor, b: Tensor) -> Tensor:
+  """Cross product a × b for 3-vectors (supports leading batch dims)."""
+  cx, cy, cz = _cross_components(a, b)
+  return Tensor.stack(cx, cy, cz, dim=-1)
 
 
 def lie_poisson_euler_so3(L: Tensor, H_func, dt: float = 0.01) -> Tensor:
@@ -5777,21 +5847,41 @@ def lie_poisson_splitting_so3(L: Tensor, I_inv: Tensor, dt: float = 0.01) -> Ten
   Explicit splitting method for free rigid body.
   Preserves |L|² exactly (Casimir). 2nd order via Strang splitting.
   """
-  def rotate_axis(L_val: Tensor, axis: int, angle: Tensor) -> Tensor:
-    j, k = (axis + 1) % 3, (axis + 2) % 3
-    c, s = angle.cos(), angle.sin()
-    L_j_new = c * L_val[..., j] - s * L_val[..., k]
-    L_k_new = s * L_val[..., j] + c * L_val[..., k]
-    if axis == 0: return Tensor.stack([L_val[..., 0], L_j_new, L_k_new], dim=-1)
-    if axis == 1: return Tensor.stack([L_k_new, L_val[..., 1], L_j_new], dim=-1)
-    return Tensor.stack([L_j_new, L_k_new, L_val[..., 2]], dim=-1)
+  def sin_cos(angle: Tensor) -> tuple[Tensor, Tensor]:
+    if getenv("TINYGRAD_PHYSICS_FAST_TRIG", 0) and angle.dtype == dtypes.float64:
+      ang32 = angle.cast(dtypes.float32)
+      return ang32.sin().cast(angle.dtype), ang32.cos().cast(angle.dtype)
+    return angle.sin(), angle.cos()
+
+  Lx, Ly, Lz = L[..., 0], L[..., 1], L[..., 2]
+
+  def rotate_x(Ly_in: Tensor, Lz_in: Tensor, angle: Tensor) -> tuple[Tensor, Tensor]:
+    s, c = sin_cos(angle)
+    return c * Ly_in - s * Lz_in, s * Ly_in + c * Lz_in
+
+  def rotate_y(Lx_in: Tensor, Lz_in: Tensor, angle: Tensor) -> tuple[Tensor, Tensor]:
+    s, c = sin_cos(angle)
+    return s * Lz_in + c * Lx_in, c * Lz_in - s * Lx_in
+
+  def rotate_z(Lx_in: Tensor, Ly_in: Tensor, angle: Tensor) -> tuple[Tensor, Tensor]:
+    s, c = sin_cos(angle)
+    return c * Lx_in - s * Ly_in, s * Lx_in + c * Ly_in
 
   # Strang splitting: half-step forward, half-step reverse
-  for axis in range(3):
-    L = rotate_axis(L, axis, 0.5 * dt * L[..., axis] * I_inv[axis])
-  for axis in [2, 1, 0]:
-    L = rotate_axis(L, axis, 0.5 * dt * L[..., axis] * I_inv[axis])
-  return L
+  angle = 0.5 * dt * Lx * I_inv[0]
+  Ly, Lz = rotate_x(Ly, Lz, angle)
+  angle = 0.5 * dt * Ly * I_inv[1]
+  Lx, Lz = rotate_y(Lx, Lz, angle)
+  angle = 0.5 * dt * Lz * I_inv[2]
+  Lx, Ly = rotate_z(Lx, Ly, angle)
+
+  angle = 0.5 * dt * Lz * I_inv[2]
+  Lx, Ly = rotate_z(Lx, Ly, angle)
+  angle = 0.5 * dt * Ly * I_inv[1]
+  Lx, Lz = rotate_y(Lx, Lz, angle)
+  angle = 0.5 * dt * Lx * I_inv[0]
+  Ly, Lz = rotate_x(Ly, Lz, angle)
+  return Tensor.stack(Lx, Ly, Lz, dim=-1)
 
 
 class LiePoissonSystem:
@@ -5851,9 +5941,11 @@ class LiePoissonSystem:
     dt_scale, _ = policy.adjust_dt(steps, z.shape, z.device, (z,), make_step, energy_fn, "TINYGRAD_PHYSICS_DRIFT_LIE")
     if dt_scale != 1.0:
       dt *= dt_scale
+    tile = policy.choose_batch_tile(z.shape, z.device, 3)
+    z_use, z_tile_shape = _reshape_for_batch_tile(z, tile, 3)
     if vector_width is None:
-      vector_width = policy.choose_vector_width(z.shape, z.device, 3)
-    z_use, z_shape = _reshape_for_vec(z, vector_width, 3)
+      vector_width = policy.choose_vector_width(z_use.shape, z_use.device, 3)
+    z_use, z_shape = _reshape_for_vec(z_use, vector_width, 3)
     if unroll is None and use_scan:
       unroll = policy.choose_unroll(steps, z_use.shape, z_use.device, op_cost=op_cost)
     if unroll is not None:
@@ -5864,7 +5956,9 @@ class LiePoissonSystem:
       z_out, hist = out
       if z_shape is not None:
         hist = [(z_t.reshape(z_shape), e, c) for (z_t, e, c) in hist]
-      return _reshape_from_vec(z_out, z_shape), hist
+      if z_tile_shape is not None:
+        hist = [(_reshape_from_batch_tile(z_t, z_tile_shape), e, c) for (z_t, e, c) in hist]
+      return _reshape_from_batch_tile(_reshape_from_vec(z_out, z_shape), z_tile_shape), hist
     z_history: list[Tensor] = []
     for i in range(steps):
       if i % record_every == 0:
@@ -5873,10 +5967,10 @@ class LiePoissonSystem:
     z_history.append(z_use.detach())
     history = []
     for z_t in z_history:
-      z_emit = _reshape_from_vec(z_t, z_shape)
+      z_emit = _reshape_from_batch_tile(_reshape_from_vec(z_t, z_shape), z_tile_shape)
       history.append((z_emit.numpy().copy(), self.energy(z_emit), self.casimir(z_emit)))
     policy.maybe_print_report(steps, z.shape, z.device)
-    return _reshape_from_vec(z_use, z_shape), history
+    return _reshape_from_batch_tile(_reshape_from_vec(z_use, z_shape), z_tile_shape), history
 
   def compile_unrolled_step(self, dt: float, unroll: int):
     """Compile an unrolled step for Lie-Poisson systems."""
@@ -5925,19 +6019,34 @@ def quaternion_multiply(q1: Tensor, q2: Tensor) -> Tensor:
 
 def quaternion_normalize(q: Tensor) -> Tensor:
   """Normalize quaternion to unit length."""
-  norm = (q * q).sum(axis=-1).sqrt()
-  return q / norm.unsqueeze(-1)
+  norm2 = (q * q).sum(axis=-1)
+  if getenv("TINYGRAD_PHYSICS_FAST_NORM", 0):
+    inv = norm2.rsqrt()
+    return q * inv.unsqueeze(-1)
+  return q / norm2.sqrt().unsqueeze(-1)
+
+def integrate_orientation_fast(quat: Tensor, omega: Tensor, dt: float, project: bool = True) -> Tensor:
+  """Integrate orientation quaternion with inline multiply by [0, ω]."""
+  w, x, y, z = quat[..., 0], quat[..., 1], quat[..., 2], quat[..., 3]
+  ox, oy, oz = omega[..., 0], omega[..., 1], omega[..., 2]
+  dq_w = -(x * ox + y * oy + z * oz)
+  dq_x = w * ox + y * oz - z * oy
+  dq_y = w * oy - x * oz + z * ox
+  dq_z = w * oz + x * oy - y * ox
+  out = Tensor.stack([
+    w + dt * 0.5 * dq_w,
+    x + dt * 0.5 * dq_x,
+    y + dt * 0.5 * dq_y,
+    z + dt * 0.5 * dq_z,
+  ], dim=-1)
+  if project:
+    out = quaternion_normalize(out)
+  return out
 
 
 def integrate_orientation(quat: Tensor, omega: Tensor, dt: float, project: bool = True) -> Tensor:
   """Integrate orientation quaternion: dq/dt = 0.5 * q ⊗ [0, ω]"""
-  zero = omega[..., 0] * 0
-  omega_quat = Tensor.stack([zero, omega[..., 0], omega[..., 1], omega[..., 2]], dim=-1)
-  dq = quaternion_multiply(quat, omega_quat) * 0.5
-  out = quat + dt * dq
-  if project:
-    out = quaternion_normalize(out)
-  return out
+  return integrate_orientation_fast(quat, omega, dt, project=project)
 
 
 class RigidBodySystem:
@@ -5997,12 +6106,19 @@ class RigidBodySystem:
     dt_scale, _ = policy.adjust_dt(steps, L.shape, L.device, (L, q), make_step, energy_fn, "TINYGRAD_PHYSICS_DRIFT_RIGID")
     if dt_scale != 1.0:
       dt *= dt_scale
-    vec = policy.choose_vector_width(L.shape, L.device, 3)
-    L_use, L_shape = _reshape_for_vec(L, vec, 3)
-    q_use, q_shape = _reshape_for_vec(q, vec, 4)
+    tile = policy.choose_batch_tile(L.shape, L.device, 3)
+    L_use, L_tile_shape = _reshape_for_batch_tile(L, tile, 3)
+    q_use, q_tile_shape = _reshape_for_batch_tile(q, tile, 4)
+    if L_tile_shape is None or q_tile_shape is None:
+      L_use, L_tile_shape = L, None
+      q_use, q_tile_shape = q, None
+    vec = policy.choose_vector_width(L_use.shape, L_use.device, 3)
+    L_use, L_shape = _reshape_for_vec(L_use, vec, 3)
+    q_use, q_shape = _reshape_for_vec(q_use, vec, 4)
     if q_shape is None:
       L_use, L_shape = L, None
       q_use, q_shape = q, None
+      L_tile_shape, q_tile_shape = None, None
     if unroll is None and use_scan:
       unroll = policy.choose_unroll(steps, L_use.shape, L_use.device, op_cost=op_cost)
     def constraint_fn(state: tuple[Tensor, Tensor]):
@@ -6021,20 +6137,27 @@ class RigidBodySystem:
       L_out, q_out, history = out
       if L_shape is not None:
         history = [(L_t.reshape(L_shape), q_t.reshape(q_shape), e, c) for (L_t, q_t, e, c) in history]
-      return _reshape_from_vec(L_out, L_shape), _reshape_from_vec(q_out, q_shape), history
+      if L_tile_shape is not None:
+        history = [(_reshape_from_batch_tile(L_t, L_tile_shape), _reshape_from_batch_tile(q_t, q_tile_shape), e, c)
+                   for (L_t, q_t, e, c) in history]
+      return (_reshape_from_batch_tile(_reshape_from_vec(L_out, L_shape), L_tile_shape),
+              _reshape_from_batch_tile(_reshape_from_vec(q_out, q_shape), q_tile_shape),
+              history)
     history = []
     for i in range(steps):
       project = (i + 1) % project_every == 0
       if i % record_every == 0:
-        L_emit = _reshape_from_vec(L_use, L_shape)
-        q_emit = _reshape_from_vec(q_use, q_shape)
+        L_emit = _reshape_from_batch_tile(_reshape_from_vec(L_use, L_shape), L_tile_shape)
+        q_emit = _reshape_from_batch_tile(_reshape_from_vec(q_use, q_shape), q_tile_shape)
         history.append((L_emit.numpy().copy(), q_emit.numpy().copy(), self.energy(L_emit), self.casimir(L_emit)))
       L_use, q_use = self.step_fused(L_use, q_use, dt, project=project)
-    L_emit = _reshape_from_vec(L_use, L_shape)
-    q_emit = _reshape_from_vec(q_use, q_shape)
+    L_emit = _reshape_from_batch_tile(_reshape_from_vec(L_use, L_shape), L_tile_shape)
+    q_emit = _reshape_from_batch_tile(_reshape_from_vec(q_use, q_shape), q_tile_shape)
     history.append((L_emit.numpy().copy(), q_emit.numpy().copy(), self.energy(L_emit), self.casimir(L_emit)))
     policy.maybe_print_report(steps, L.shape, L.device)
-    return _reshape_from_vec(L_use, L_shape), _reshape_from_vec(q_use, q_shape), history
+    return (_reshape_from_batch_tile(_reshape_from_vec(L_use, L_shape), L_tile_shape),
+            _reshape_from_batch_tile(_reshape_from_vec(q_use, q_shape), q_tile_shape),
+            history)
 
   def compile_unrolled_step(self, dt: float, unroll: int, project_every: int = 1):
     """Compile an unrolled rigid-body step."""
@@ -6181,12 +6304,19 @@ class SatelliteControlIntegrator:
              unroll: int | None = None) -> tuple[Tensor, Tensor, list]:
     policy = policy or self.policy
     use_scan = policy.should_scan(steps, L.shape, L.device) if scan is None else scan
-    vec = policy.choose_vector_width(L.shape, L.device, 3)
-    L_use, L_shape = _reshape_for_vec(L, vec, 3)
-    q_use, q_shape = _reshape_for_vec(quat, vec, 4)
+    tile = policy.choose_batch_tile(L.shape, L.device, 3)
+    L_use, L_tile_shape = _reshape_for_batch_tile(L, tile, 3)
+    q_use, q_tile_shape = _reshape_for_batch_tile(quat, tile, 4)
+    if L_tile_shape is None or q_tile_shape is None:
+      L_use, L_tile_shape = L, None
+      q_use, q_tile_shape = quat, None
+    vec = policy.choose_vector_width(L_use.shape, L_use.device, 3)
+    L_use, L_shape = _reshape_for_vec(L_use, vec, 3)
+    q_use, q_shape = _reshape_for_vec(q_use, vec, 4)
     if q_shape is None:
       L_use, L_shape = L, None
       q_use, q_shape = quat, None
+      L_tile_shape, q_tile_shape = None, None
     op_cost = None
     if getenv("TINYGRAD_PHYSICS_UNROLL_COST", 1):
       try:
@@ -6211,20 +6341,27 @@ class SatelliteControlIntegrator:
       L_out, q_out, history = out
       if L_shape is not None:
         history = [(_reshape_from_vec(L_t, L_shape), _reshape_from_vec(q_t, q_shape)) for (L_t, q_t) in history]
-      return _reshape_from_vec(L_out, L_shape), _reshape_from_vec(q_out, q_shape), history
+      if L_tile_shape is not None:
+        history = [(_reshape_from_batch_tile(L_t, L_tile_shape), _reshape_from_batch_tile(q_t, q_tile_shape))
+                   for (L_t, q_t) in history]
+      return (_reshape_from_batch_tile(_reshape_from_vec(L_out, L_shape), L_tile_shape),
+              _reshape_from_batch_tile(_reshape_from_vec(q_out, q_shape), q_tile_shape),
+              history)
     history = []
     for i in range(steps):
       project = (i + 1) % project_every == 0
       if i % record_every == 0:
-        L_emit = _reshape_from_vec(L_use, L_shape)
-        q_emit = _reshape_from_vec(q_use, q_shape)
+        L_emit = _reshape_from_batch_tile(_reshape_from_vec(L_use, L_shape), L_tile_shape)
+        q_emit = _reshape_from_batch_tile(_reshape_from_vec(q_use, q_shape), q_tile_shape)
         history.append((L_emit.detach(), q_emit.detach()))
       L_use, q_use = self.step(L_use, q_use, project=project)
-    L_emit = _reshape_from_vec(L_use, L_shape)
-    q_emit = _reshape_from_vec(q_use, q_shape)
+    L_emit = _reshape_from_batch_tile(_reshape_from_vec(L_use, L_shape), L_tile_shape)
+    q_emit = _reshape_from_batch_tile(_reshape_from_vec(q_use, q_shape), q_tile_shape)
     history.append((L_emit.detach(), q_emit.detach()))
     policy.maybe_print_report(steps, L.shape, L.device)
-    return _reshape_from_vec(L_use, L_shape), _reshape_from_vec(q_use, q_shape), history
+    return (_reshape_from_batch_tile(_reshape_from_vec(L_use, L_shape), L_tile_shape),
+            _reshape_from_batch_tile(_reshape_from_vec(q_use, q_shape), q_tile_shape),
+            history)
 
 
 class LiePoissonBracketE3:
@@ -6232,8 +6369,11 @@ class LiePoissonBracketE3:
   Lie-Poisson structure for e(3)* (heavy top).
   """
   def flow(self, state: ProductManifold, grad_L: Tensor, grad_gamma: Tensor) -> tuple[Tensor, Tensor]:
-    dL_dt = cross(state.L, grad_L) + cross(state.gamma, grad_gamma)
-    dgamma_dt = cross(state.gamma, grad_L)
+    cL = _cross_components(state.L, grad_L)
+    cgg = _cross_components(state.gamma, grad_gamma)
+    cgl = _cross_components(state.gamma, grad_L)
+    dL_dt = Tensor.stack(cL[0] + cgg[0], cL[1] + cgg[1], cL[2] + cgg[2], dim=-1)
+    dgamma_dt = Tensor.stack(cgl[0], cgl[1], cgl[2], dim=-1)
     return dL_dt, dgamma_dt
 
 
@@ -6289,8 +6429,11 @@ class HeavyTopIntegrator:
 
   def _derivatives(self, L: Tensor, gamma: Tensor) -> tuple[Tensor, Tensor]:
     omega = self.H.I_inv * L
-    dL = cross(L, omega) + cross(gamma, self._e3) * self.H.mgl
-    dgamma = cross(gamma, omega)
+    cL = _cross_components(L, omega)
+    cge3 = _cross_components(gamma, self._e3)
+    cgo = _cross_components(gamma, omega)
+    dL = Tensor.stack(cL[0] + cge3[0] * self.H.mgl, cL[1] + cge3[1] * self.H.mgl, cL[2] + cge3[2] * self.H.mgl, dim=-1)
+    dgamma = Tensor.stack(cgo[0], cgo[1], cgo[2], dim=-1)
     return dL, dgamma
 
   def step_rk4(self, state: ProductManifold) -> ProductManifold:
@@ -6456,12 +6599,19 @@ class HeavyTopIntegrator:
         op_cost = _count_uops_limit(self.H(ProductManifold(L, gamma)).uop, 512)
       except Exception:
         op_cost = None
-    vec = policy.choose_vector_width(L.shape, L.device, 3)
-    L_use, L_shape = _reshape_for_vec(L, vec, 3)
-    g_use, g_shape = _reshape_for_vec(gamma, vec, 3)
+    tile = policy.choose_batch_tile(L.shape, L.device, 3)
+    L_use, L_tile_shape = _reshape_for_batch_tile(L, tile, 3)
+    g_use, g_tile_shape = _reshape_for_batch_tile(gamma, tile, 3)
+    if L_tile_shape is None or g_tile_shape is None:
+      L_use, L_tile_shape = L, None
+      g_use, g_tile_shape = gamma, None
+    vec = policy.choose_vector_width(L_use.shape, L_use.device, 3)
+    L_use, L_shape = _reshape_for_vec(L_use, vec, 3)
+    g_use, g_shape = _reshape_for_vec(g_use, vec, 3)
     if g_shape is None:
       L_use, L_shape = L, None
       g_use, g_shape = gamma, None
+      L_tile_shape, g_tile_shape = None, None
     def make_step(scale: float):
       def step_fn(L_in: Tensor, g_in: Tensor):
         self.dt = base_dt * scale
@@ -6494,20 +6644,27 @@ class HeavyTopIntegrator:
       L_out, g_out, history = out
       if L_shape is not None:
         history = [(_reshape_from_vec(L_t, L_shape), _reshape_from_vec(g_t, g_shape)) for (L_t, g_t) in history]
-      return _reshape_from_vec(L_out, L_shape), _reshape_from_vec(g_out, g_shape), history
+      if L_tile_shape is not None:
+        history = [(_reshape_from_batch_tile(L_t, L_tile_shape), _reshape_from_batch_tile(g_t, g_tile_shape))
+                   for (L_t, g_t) in history]
+      return (_reshape_from_batch_tile(_reshape_from_vec(L_out, L_shape), L_tile_shape),
+              _reshape_from_batch_tile(_reshape_from_vec(g_out, g_shape), g_tile_shape),
+              history)
     history = []
     for i in range(steps):
       project = (i + 1) % project_every == 0
       if i % record_every == 0:
-        L_emit = _reshape_from_vec(L_use, L_shape)
-        g_emit = _reshape_from_vec(g_use, g_shape)
+        L_emit = _reshape_from_batch_tile(_reshape_from_vec(L_use, L_shape), L_tile_shape)
+        g_emit = _reshape_from_batch_tile(_reshape_from_vec(g_use, g_shape), g_tile_shape)
         history.append((L_emit.detach(), g_emit.detach()))
       if method == "splitting":
         L_use, g_use = self.step_tensors(L_use, g_use, project=project)
       else:
         L_use, g_use = self.step_explicit_tensors(L_use, g_use, project=project)
-    L_emit = _reshape_from_vec(L_use, L_shape)
-    g_emit = _reshape_from_vec(g_use, g_shape)
+    L_emit = _reshape_from_batch_tile(_reshape_from_vec(L_use, L_shape), L_tile_shape)
+    g_emit = _reshape_from_batch_tile(_reshape_from_vec(g_use, g_shape), g_tile_shape)
     history.append((L_emit.detach(), g_emit.detach()))
     policy.maybe_print_report(steps, L.shape, L.device)
-    return _reshape_from_vec(L_use, L_shape), _reshape_from_vec(g_use, g_shape), history
+    return (_reshape_from_batch_tile(_reshape_from_vec(L_use, L_shape), L_tile_shape),
+            _reshape_from_batch_tile(_reshape_from_vec(g_use, g_shape), g_tile_shape),
+            history)

@@ -46,7 +46,9 @@ def run_simulation(steps: int = 1500, dt: float = 0.01, unroll_steps: int = 10,
     print(f"Start Satellite Control Simulation")
     print(f"Target: Untumble and Lock to Identity Quaternion")
     
-    history_q = []
+    history_q = [] if not benchmark else None
+    if benchmark and profile == "balanced":
+        profile = "fast"
     policy = get_profile(profile).policy
     control = ControlInput(lambda q_err, omega: -Kp * q_err[..., 1:] - Kd * omega)
     integrator = compile_system("satellite_control", I_inv=I_inv, control=control, dt=dt, policy=policy)
@@ -55,15 +57,18 @@ def run_simulation(steps: int = 1500, dt: float = 0.01, unroll_steps: int = 10,
     if unroll is not None and steps % unroll != 0:
         raise ValueError("steps must be divisible by unroll")
     start_time = time.perf_counter() if benchmark else None
+    if benchmark:
+        scan = True
     if scan:
-        record_every = 10
+        record_every = steps if benchmark else 10
         L, quat, hist = integrator.evolve(L, quat, steps, record_every=record_every, scan=True, unroll=unroll)
-        for L_t, q_t in hist:
-            if q_t.ndim > 1:
-                show = min(batch_size, viewer_batch)
-                history_q.append(q_t[:show].numpy().tolist())
-            else:
-                history_q.append(q_t.numpy().tolist())
+        if history_q is not None:
+            for L_t, q_t in hist:
+                if q_t.ndim > 1:
+                    show = min(batch_size, viewer_batch)
+                    history_q.append(q_t[:show].numpy().tolist())
+                else:
+                    history_q.append(q_t.numpy().tolist())
         L_sample = L[0] if L.ndim > 1 else L
         q_sample = quat[0] if quat.ndim > 1 else quat
         omega_curr = (L_sample * I_inv).numpy()
@@ -74,14 +79,15 @@ def run_simulation(steps: int = 1500, dt: float = 0.01, unroll_steps: int = 10,
         print(f"Final Omega: {ohm_mag:.6f}")
         print(f"Alignment Error: {err_align:.6f}")
     else:
-        record_every = 10
+        record_every = steps if benchmark else 10
         L, quat, hist = integrator.evolve(L, quat, steps, record_every=record_every, scan=False, unroll=unroll)
-        for L_t, q_t in hist:
-            if q_t.ndim > 1:
-                show = min(batch_size, viewer_batch)
-                history_q.append(q_t[:show].numpy().tolist())
-            else:
-                history_q.append(q_t.numpy().tolist())
+        if history_q is not None:
+            for L_t, q_t in hist:
+                if q_t.ndim > 1:
+                    show = min(batch_size, viewer_batch)
+                    history_q.append(q_t[:show].numpy().tolist())
+                else:
+                    history_q.append(q_t.numpy().tolist())
         L_sample = L[0] if L.ndim > 1 else L
         q_sample = quat[0] if quat.ndim > 1 else quat
         omega_curr = (L_sample * I_inv).numpy()
@@ -111,7 +117,8 @@ def run_simulation(steps: int = 1500, dt: float = 0.01, unroll_steps: int = 10,
         }
         print(f"Control report: {report}")
 
-    generate_viewer(history_q)
+    if not benchmark:
+        generate_viewer(history_q)
 
 def generate_viewer(history):
     html_content = f"""

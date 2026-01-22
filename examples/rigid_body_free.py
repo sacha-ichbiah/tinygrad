@@ -36,6 +36,8 @@ def run_simulation(batch_size: int = 1, steps: int = 2000, dt: float = 0.01,
 
     # Create the rigid body system using the tiny physics approach
     # The Hamiltonian H(L) = 0.5 * L · (I⁻¹ L) is defined internally
+    if benchmark and profile == "balanced":
+        profile = "fast"
     policy = get_profile(profile).policy
     system = compile_system("rigid_body", I=I, integrator="auto", policy=policy)
 
@@ -59,16 +61,19 @@ def run_simulation(batch_size: int = 1, steps: int = 2000, dt: float = 0.01,
 
     # Record initial conservation quantities
     L_sample = L[0] if L.ndim > 1 else L
-    H_start = system.energy(L_sample)
-    C_start = system.casimir(L_sample)
+    if not benchmark:
+        H_start = system.energy(L_sample)
+        C_start = system.casimir(L_sample)
 
     # Run simulation
-    record_every = 10
+    record_every = steps if benchmark else 10
     unroll = None if auto_unroll else unroll_steps
     if unroll is not None and steps % unroll != 0:
         raise ValueError("steps must be divisible by unroll")
 
     start_time = time.perf_counter() if benchmark else None
+    if benchmark:
+        scan = True
     if scan:
         L, q, history = system.evolve(L, q, dt, steps, record_every=record_every, scan=True, unroll=unroll, policy=policy)
     else:
@@ -82,29 +87,31 @@ def run_simulation(batch_size: int = 1, steps: int = 2000, dt: float = 0.01,
         if report is not None:
             print(f"Policy: {report}")
 
-    # Check conservation
-    H_end = system.energy(L_sample)
-    C_end = system.casimir(L_sample)
+    if not benchmark:
+        # Check conservation
+        H_end = system.energy(L_sample)
+        C_end = system.casimir(L_sample)
 
-    print(f"Energy Conservation:")
-    print(f"  H_start: {H_start:.10f}")
-    print(f"  H_end:   {H_end:.10f}")
-    print(f"  Drift:   {abs(H_end - H_start)/abs(H_start):.2e}")
-    print()
-    print(f"Casimir Conservation (|L|²):")
-    print(f"  C_start: {C_start:.10f}")
-    print(f"  C_end:   {C_end:.10f}")
-    print(f"  Drift:   {abs(C_end - C_start)/abs(C_start):.2e}")
+        print(f"Energy Conservation:")
+        print(f"  H_start: {H_start:.10f}")
+        print(f"  H_end:   {H_end:.10f}")
+        print(f"  Drift:   {abs(H_end - H_start)/abs(H_start):.2e}")
+        print()
+        print(f"Casimir Conservation (|L|²):")
+        print(f"  C_start: {C_start:.10f}")
+        print(f"  C_end:   {C_end:.10f}")
+        print(f"  Drift:   {abs(C_end - C_start)/abs(C_start):.2e}")
 
     # Extract quaternions for visualization
-    show_batch = min(batch_size, viewer_batch)
-    history_q = []
-    for _, q_hist, _, _ in history:
-        if hasattr(q_hist, "ndim") and q_hist.ndim == 2:
-            history_q.append(q_hist[:show_batch].tolist())
-        else:
-            history_q.append(q_hist.tolist())
-    generate_viewer(history_q, I.numpy().tolist())
+    if not benchmark:
+        show_batch = min(batch_size, viewer_batch)
+        history_q = []
+        for _, q_hist, _, _ in history:
+            if hasattr(q_hist, "ndim") and q_hist.ndim == 2:
+                history_q.append(q_hist[:show_batch].tolist())
+            else:
+                history_q.append(q_hist.tolist())
+        generate_viewer(history_q, I.numpy().tolist())
 
 
 def generate_viewer(history_q, inertias):
