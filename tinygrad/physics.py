@@ -29,6 +29,8 @@ import time
 # ============================================================================
 
 _grad_H_jit_cache: dict[tuple, TinyJit] = {}
+_implicit_mid_buf_cache: dict[tuple[str, tuple[int, ...], object], tuple[Tensor, Tensor, Tensor, Tensor]] = {}
+_implicit_iters_cache: dict[tuple[float, int, int], int] = {}
 
 def _count_uops_limit(root: UOp, limit: int) -> int:
     seen: set[int] = set()
@@ -498,6 +500,10 @@ def implicit_midpoint(q: Tensor, p: Tensor, H_func, dt: float = 0.01,
 
 
 def _implicit_fixed_iters(dt: float, max_iter: int) -> int:
+    key = (round(dt, 12), max_iter, int(getenv("TINYGRAD_IMPLICIT_HEURISTIC", 1)))
+    cached = _implicit_iters_cache.get(key)
+    if cached is not None:
+        return cached
     fixed_iters = getenv("TINYGRAD_IMPLICIT_ITERS", 0)
     if fixed_iters <= 0:
         if CAPTURING and len(capturing):
@@ -513,6 +519,7 @@ def _implicit_fixed_iters(dt: float, max_iter: int) -> int:
                 fixed_iters = 6
             else:
                 fixed_iters = 8
+    _implicit_iters_cache[key] = fixed_iters
     return fixed_iters
 
 
@@ -539,14 +546,24 @@ def implicit_midpoint_inplace(q: Tensor, p: Tensor, H_func, dt: float = 0.01,
         p.assign(p_next)
         return q, p
 
+    buf_key = (q.device, q.shape, q.dtype)
+    buf = _implicit_mid_buf_cache.get(buf_key, (None, None, None, None))
+    q_mid_buf, p_mid_buf, q_mid_tmp, p_mid_tmp = buf
+    if q_mid_buf is None or p_mid_buf is None or q_mid_buf.shape != q.shape or p_mid_buf.shape != p.shape:
+        q_mid_buf = Tensor.empty(*q.shape, device=q.device, dtype=q.dtype)
+        p_mid_buf = Tensor.empty(*p.shape, device=p.device, dtype=p.dtype)
+        q_mid_tmp = Tensor.empty(*q.shape, device=q.device, dtype=q.dtype)
+        p_mid_tmp = Tensor.empty(*p.shape, device=p.device, dtype=p.dtype)
+        _implicit_mid_buf_cache[buf_key] = (q_mid_buf, p_mid_buf, q_mid_tmp, p_mid_tmp)
+
     dHdq, dHdp = _grad_H(q, p, H_func)
     half_dt = 0.5 * dt
-    q_mid = q + half_dt * dHdp
-    p_mid = p - half_dt * dHdq
+    q_mid_buf.assign(q + half_dt * dHdp)
+    p_mid_buf.assign(p - half_dt * dHdq)
     for _ in range(fixed_iters):
-        dHdq_mid, dHdp_mid = _grad_H(q_mid, p_mid, H_func)
-        q_mid = q + half_dt * dHdp_mid
-        p_mid = p - half_dt * dHdq_mid
+        dHdq_mid, dHdp_mid = _grad_H(q_mid_buf, p_mid_buf, H_func)
+        q_mid_buf.assign(q + half_dt * dHdp_mid)
+        p_mid_buf.assign(p - half_dt * dHdq_mid)
     q.assign(q + dt * dHdp_mid)
     p.assign(p - dt * dHdq_mid)
     return q, p
@@ -561,14 +578,24 @@ def implicit_midpoint_into(q: Tensor, p: Tensor, q_out: Tensor, p_out: Tensor, H
         p_out = _assign_or_replace(p_out, p_next)
         return q_out, p_out
 
+    buf_key = (q.device, q.shape, q.dtype)
+    buf = _implicit_mid_buf_cache.get(buf_key, (None, None, None, None))
+    q_mid_buf, p_mid_buf, q_mid_tmp, p_mid_tmp = buf
+    if q_mid_buf is None or p_mid_buf is None or q_mid_buf.shape != q.shape or p_mid_buf.shape != p.shape:
+        q_mid_buf = Tensor.empty(*q.shape, device=q.device, dtype=q.dtype)
+        p_mid_buf = Tensor.empty(*p.shape, device=p.device, dtype=p.dtype)
+        q_mid_tmp = Tensor.empty(*q.shape, device=q.device, dtype=q.dtype)
+        p_mid_tmp = Tensor.empty(*p.shape, device=p.device, dtype=p.dtype)
+        _implicit_mid_buf_cache[buf_key] = (q_mid_buf, p_mid_buf, q_mid_tmp, p_mid_tmp)
+
     dHdq, dHdp = _grad_H(q, p, H_func)
     half_dt = 0.5 * dt
-    q_mid = q + half_dt * dHdp
-    p_mid = p - half_dt * dHdq
+    q_mid_buf.assign(q + half_dt * dHdp)
+    p_mid_buf.assign(p - half_dt * dHdq)
     for _ in range(fixed_iters):
-        dHdq_mid, dHdp_mid = _grad_H(q_mid, p_mid, H_func)
-        q_mid = q + half_dt * dHdp_mid
-        p_mid = p - half_dt * dHdq_mid
+        dHdq_mid, dHdp_mid = _grad_H(q_mid_buf, p_mid_buf, H_func)
+        q_mid_buf.assign(q + half_dt * dHdp_mid)
+        p_mid_buf.assign(p - half_dt * dHdq_mid)
     q_out = _assign_or_replace(q_out, q + dt * dHdp_mid)
     p_out = _assign_or_replace(p_out, p - dt * dHdq_mid)
     return q_out, p_out
@@ -642,6 +669,11 @@ class HamiltonianSystem:
         self._grad_kernel_coupled_vec_ok: dict[tuple[str, tuple[int, ...], object, int], bool] = {}
         self._two_phase_vec_perf_cache: dict[tuple[str, tuple[int, ...], object, int, float], bool] = {}
         self._coupled_sin_cache: dict[tuple[str, tuple[int, ...], object], bool] = {}
+        self._implicit_mid_init_cache: dict[tuple[float, str, tuple[int, ...], object], Callable] = {}
+        self._implicit_mid_iter_cache: dict[tuple[float, str, tuple[int, ...], object], Callable] = {}
+        self._implicit_mid_final_cache: dict[tuple[float, str, tuple[int, ...], object], Callable] = {}
+        self._implicit_mid_full_cache: dict[tuple[float, int, int, str, tuple[int, ...], object], Callable] = {}
+        self._implicit_mid_full_ok: dict[tuple[float, int, int, str, tuple[int, ...], object], bool] = {}
 
     def step(self, q: Tensor, p: Tensor, dt: float = 0.01) -> tuple[Tensor, Tensor]:
         return self._step(q, p, self.H, dt)
@@ -649,7 +681,7 @@ class HamiltonianSystem:
     def step_inplace(self, q: Tensor, p: Tensor, dt: float = 0.01) -> tuple[Tensor, Tensor]:
         """In-place step for scan loops; updates q and p buffers via assign."""
         if self.integrator_name == "implicit":
-            return implicit_midpoint_inplace(q, p, self.H, dt)
+            return self._implicit_midpoint_inplace_fast(q, p, dt)
         q_new, p_new = self.step(q, p, dt)
         q.assign(q_new)
         p.assign(p_new)
@@ -657,6 +689,143 @@ class HamiltonianSystem:
 
     def energy(self, q: Tensor, p: Tensor) -> float:
         return float(self.H(q, p).numpy())
+
+    def _implicit_midpoint_inplace_fast(self, q: Tensor, p: Tensor, dt: float) -> tuple[Tensor, Tensor]:
+        fixed_iters = _implicit_fixed_iters(dt, 10)
+        if fixed_iters <= 0 or self._coupled_has_reduce(q.device, q.shape, q.dtype):
+            return implicit_midpoint_inplace(q, p, self.H, dt)
+        vec = getenv("TINYGRAD_IMPLICIT_VEC", 0)
+        if vec <= 0:
+            vec = 4 if q.shape and q.shape[-1] % 4 == 0 else 1
+        if vec > 1 and q.shape and q.shape[-1] % vec != 0:
+            vec = 1
+        key = (dt, fixed_iters, vec, q.device, q.shape, q.dtype)
+        kernel = self._implicit_mid_full_cache.get(key)
+        if kernel is None:
+            kernel = self._build_implicit_mid_full_kernel(dt, fixed_iters, q.device, q.shape, q.dtype, vec)
+            self._implicit_mid_full_cache[key] = kernel
+        ok = self._implicit_mid_full_ok.get(key)
+        if ok is None:
+            try:
+                q_probe = q.detach().clone().realize()
+                p_probe = p.detach().clone().realize()
+                out = Tensor.custom_kernel(q_probe, p_probe, q_probe, p_probe, fxn=kernel)
+                Tensor.realize(out[2], out[3])
+                ok = True
+            except Exception:
+                ok = False
+            self._implicit_mid_full_ok[key] = ok
+        if not ok:
+            return self._implicit_midpoint_inplace_kernels(q, p, dt, fixed_iters)
+        out = Tensor.custom_kernel(q, p, q, p, fxn=kernel)
+        Tensor.realize(out[2], out[3])
+        return q, p
+
+    def _implicit_midpoint_into_fast(self, q: Tensor, p: Tensor, q_out: Tensor, p_out: Tensor, dt: float) -> tuple[Tensor, Tensor]:
+        fixed_iters = _implicit_fixed_iters(dt, 10)
+        if fixed_iters <= 0 or self._coupled_has_reduce(q.device, q.shape, q.dtype):
+            return implicit_midpoint_into(q, p, q_out, p_out, self.H, dt)
+        vec = getenv("TINYGRAD_IMPLICIT_VEC", 0)
+        if vec <= 0:
+            vec = 4 if q.shape and q.shape[-1] % 4 == 0 else 1
+        if vec > 1 and q.shape and q.shape[-1] % vec != 0:
+            vec = 1
+        key = (dt, fixed_iters, vec, q.device, q.shape, q.dtype)
+        kernel = self._implicit_mid_full_cache.get(key)
+        if kernel is None:
+            kernel = self._build_implicit_mid_full_kernel(dt, fixed_iters, q.device, q.shape, q.dtype, vec)
+            self._implicit_mid_full_cache[key] = kernel
+        ok = self._implicit_mid_full_ok.get(key)
+        if ok is None:
+            try:
+                q_probe = q.detach().clone().realize()
+                p_probe = p.detach().clone().realize()
+                q_tmp = Tensor.empty(*q.shape, device=q.device, dtype=q.dtype)
+                p_tmp = Tensor.empty(*p.shape, device=p.device, dtype=p.dtype)
+                out = Tensor.custom_kernel(q_probe, p_probe, q_tmp, p_tmp, fxn=kernel)
+                Tensor.realize(out[2], out[3])
+                ok = True
+            except Exception:
+                ok = False
+            self._implicit_mid_full_ok[key] = ok
+        if not ok:
+            return self._implicit_midpoint_into_kernels(q, p, q_out, p_out, dt, fixed_iters)
+        out = Tensor.custom_kernel(q, p, q_out, p_out, fxn=kernel)
+        Tensor.realize(out[2], out[3])
+        return out[2], out[3]
+
+    def _implicit_midpoint_inplace_kernels(self, q: Tensor, p: Tensor, dt: float, iters: int) -> tuple[Tensor, Tensor]:
+        key = (dt, q.device, q.shape, q.dtype)
+        init_kernel = self._implicit_mid_init_cache.get(key)
+        if init_kernel is None:
+            init_kernel = self._build_implicit_mid_init_kernel(dt, q.device, q.shape, q.dtype)
+            self._implicit_mid_init_cache[key] = init_kernel
+        iter_kernel = self._implicit_mid_iter_cache.get(key)
+        if iter_kernel is None:
+            iter_kernel = self._build_implicit_mid_iter_kernel(dt, q.device, q.shape, q.dtype)
+            self._implicit_mid_iter_cache[key] = iter_kernel
+        final_kernel = self._implicit_mid_final_cache.get(key)
+        if final_kernel is None:
+            final_kernel = self._build_implicit_mid_final_kernel(dt, q.device, q.shape, q.dtype)
+            self._implicit_mid_final_cache[key] = final_kernel
+
+        buf_key = (q.device, q.shape, q.dtype)
+        buf = _implicit_mid_buf_cache.get(buf_key, (None, None, None, None))
+        q_mid_a, p_mid_a, q_mid_b, p_mid_b = buf
+        if q_mid_a is None or p_mid_a is None or q_mid_a.shape != q.shape or p_mid_a.shape != p.shape:
+            q_mid_a = Tensor.empty(*q.shape, device=q.device, dtype=q.dtype)
+            p_mid_a = Tensor.empty(*p.shape, device=p.device, dtype=p.dtype)
+            q_mid_b = Tensor.empty(*q.shape, device=q.device, dtype=q.dtype)
+            p_mid_b = Tensor.empty(*p.shape, device=p.device, dtype=p.dtype)
+            _implicit_mid_buf_cache[buf_key] = (q_mid_a, p_mid_a, q_mid_b, p_mid_b)
+
+        out = Tensor.custom_kernel(q, p, q_mid_a, p_mid_a, fxn=init_kernel)
+        Tensor.realize(out[2], out[3])
+        q_mid, p_mid = out[2], out[3]
+        for _ in range(max(iters - 1, 0)):
+            out = Tensor.custom_kernel(q, p, q_mid, p_mid, q_mid_b, p_mid_b, fxn=iter_kernel)
+            Tensor.realize(out[4], out[5])
+            q_mid, p_mid = out[4], out[5]
+        out = Tensor.custom_kernel(q, p, q_mid, p_mid, q, p, fxn=final_kernel)
+        Tensor.realize(out[4], out[5])
+        return q, p
+
+    def _implicit_midpoint_into_kernels(self, q: Tensor, p: Tensor, q_out: Tensor, p_out: Tensor,
+                                        dt: float, iters: int) -> tuple[Tensor, Tensor]:
+        key = (dt, q.device, q.shape, q.dtype)
+        init_kernel = self._implicit_mid_init_cache.get(key)
+        if init_kernel is None:
+            init_kernel = self._build_implicit_mid_init_kernel(dt, q.device, q.shape, q.dtype)
+            self._implicit_mid_init_cache[key] = init_kernel
+        iter_kernel = self._implicit_mid_iter_cache.get(key)
+        if iter_kernel is None:
+            iter_kernel = self._build_implicit_mid_iter_kernel(dt, q.device, q.shape, q.dtype)
+            self._implicit_mid_iter_cache[key] = iter_kernel
+        final_kernel = self._implicit_mid_final_cache.get(key)
+        if final_kernel is None:
+            final_kernel = self._build_implicit_mid_final_kernel(dt, q.device, q.shape, q.dtype)
+            self._implicit_mid_final_cache[key] = final_kernel
+
+        buf_key = (q.device, q.shape, q.dtype)
+        buf = _implicit_mid_buf_cache.get(buf_key, (None, None, None, None))
+        q_mid_a, p_mid_a, q_mid_b, p_mid_b = buf
+        if q_mid_a is None or p_mid_a is None or q_mid_a.shape != q.shape or p_mid_a.shape != p.shape:
+            q_mid_a = Tensor.empty(*q.shape, device=q.device, dtype=q.dtype)
+            p_mid_a = Tensor.empty(*p.shape, device=p.device, dtype=p.dtype)
+            q_mid_b = Tensor.empty(*q.shape, device=q.device, dtype=q.dtype)
+            p_mid_b = Tensor.empty(*p.shape, device=p.device, dtype=p.dtype)
+            _implicit_mid_buf_cache[buf_key] = (q_mid_a, p_mid_a, q_mid_b, p_mid_b)
+
+        out = Tensor.custom_kernel(q, p, q_mid_a, p_mid_a, fxn=init_kernel)
+        Tensor.realize(out[2], out[3])
+        q_mid, p_mid = out[2], out[3]
+        for _ in range(max(iters - 1, 0)):
+            out = Tensor.custom_kernel(q, p, q_mid, p_mid, q_mid_b, p_mid_b, fxn=iter_kernel)
+            Tensor.realize(out[4], out[5])
+            q_mid, p_mid = out[4], out[5]
+        out = Tensor.custom_kernel(q, p, q_mid, p_mid, q_out, p_out, fxn=final_kernel)
+        Tensor.realize(out[4], out[5])
+        return out[4], out[5]
 
     def evolve(self, q: Tensor, p: Tensor, dt: float, steps: int,
                record_every: int = 1) -> tuple[Tensor, Tensor, list]:
@@ -681,6 +850,564 @@ class HamiltonianSystem:
             history.append((q_np, p_np, e))
 
         return q, p, history
+
+
+# ============================================================================
+# LIE-POISSON MECHANICS (Phase 2: Rigid Body Dynamics)
+# ============================================================================
+#
+# For systems on Lie algebras (like rigid body rotation), the Poisson structure
+# is state-dependent: J = J(z). The equation of motion is:
+#
+#     dz/dt = J(z) · ∇H(z)
+#
+# For so(3) (angular momentum): J(L) acts via cross product
+#     dL/dt = L × ∇H(L)
+#
+# This is Euler's equation when H = 0.5 * L · (I⁻¹ L)
+
+def cross(a: Tensor, b: Tensor) -> Tensor:
+  """Cross product a × b for 3-vectors (supports leading batch dims)."""
+  ax, ay, az = a[..., 0], a[..., 1], a[..., 2]
+  bx, by, bz = b[..., 0], b[..., 1], b[..., 2]
+  return Tensor.stack(
+    ay * bz - az * by,
+    az * bx - ax * bz,
+    ax * by - ay * bx,
+    dim=-1,
+  )
+
+
+def _grad_LP(z: Tensor, H_func) -> Tensor:
+  """Compute gradient of Hamiltonian for Lie-Poisson systems."""
+  z_grad = z.detach().requires_grad_(True)
+  H = H_func(z_grad)
+  H.backward()
+  return z_grad.grad.detach() if z_grad.grad is not None else z * 0
+
+
+def lie_poisson_euler_so3(L: Tensor, H_func, dt: float = 0.01) -> Tensor:
+  """1st-order Lie-Poisson Euler for so(3): dL/dt = L × ∇H(L)"""
+  dHdL = _grad_LP(L, H_func)
+  return (L + dt * cross(L, dHdL)).realize()
+
+
+def lie_poisson_midpoint_so3(L: Tensor, H_func, dt: float = 0.01,
+                             tol: float = 1e-10, max_iter: int = 10) -> Tensor:
+  """Implicit Midpoint for so(3). Preserves Casimirs (|L|²) to machine precision."""
+  dHdL = _grad_LP(L, H_func)
+  L_next = L + dt * cross(L, dHdL)
+
+  for _ in range(max_iter):
+    L_mid = 0.5 * (L + L_next)
+    dHdL_mid = _grad_LP(L_mid, H_func)
+    L_new = L + dt * cross(L_mid, dHdL_mid)
+    if (L_new - L_next).abs().max().numpy() < tol:
+      break
+    L_next = L_new
+
+  return L_next.realize()
+
+
+def lie_poisson_rk4_so3(L: Tensor, H_func, dt: float = 0.01) -> Tensor:
+  """4th-order RK4 for so(3). Good accuracy, does NOT preserve Casimirs exactly."""
+  def f(L_val):
+    return cross(L_val, _grad_LP(L_val, H_func))
+
+  k1 = f(L)
+  k2 = f(L + 0.5 * dt * k1)
+  k3 = f(L + 0.5 * dt * k2)
+  k4 = f(L + dt * k3)
+  return (L + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)).realize()
+
+
+def lie_poisson_splitting_so3(L: Tensor, I_inv: Tensor, dt: float = 0.01) -> Tensor:
+  """
+  Explicit splitting method for free rigid body.
+  Preserves |L|² exactly (Casimir). 2nd order via Strang splitting.
+  """
+  def rotate_axis(L_val: Tensor, axis: int, angle: Tensor) -> Tensor:
+    j, k = (axis + 1) % 3, (axis + 2) % 3
+    c, s = angle.cos(), angle.sin()
+    L_j_new = c * L_val[..., j] - s * L_val[..., k]
+    L_k_new = s * L_val[..., j] + c * L_val[..., k]
+    if axis == 0: return Tensor.stack([L_val[..., 0], L_j_new, L_k_new], dim=-1)
+    if axis == 1: return Tensor.stack([L_k_new, L_val[..., 1], L_j_new], dim=-1)
+    return Tensor.stack([L_j_new, L_k_new, L_val[..., 2]], dim=-1)
+
+  # Strang splitting: half-step forward, half-step reverse
+  for axis in range(3):
+    L = rotate_axis(L, axis, 0.5 * dt * L[..., axis] * I_inv[axis])
+  for axis in [2, 1, 0]:
+    L = rotate_axis(L, axis, 0.5 * dt * L[..., axis] * I_inv[axis])
+  return L.realize()
+
+
+class LiePoissonSystem:
+  """
+  Physics on a Lie algebra, defined by its Hamiltonian.
+
+  For the free rigid body: H(L) = 0.5 * sum(L² / I)
+  """
+  INTEGRATORS = {
+    "euler": lie_poisson_euler_so3,
+    "midpoint": lie_poisson_midpoint_so3,
+    "rk4": lie_poisson_rk4_so3,
+  }
+
+  def __init__(self, H_func, algebra: str = "so3", integrator: str = "midpoint"):
+    if algebra != "so3":
+      raise ValueError(f"Only so3 supported, got: {algebra}")
+    self.H = H_func
+    self.algebra = algebra
+    if integrator not in self.INTEGRATORS:
+      raise ValueError(f"Unknown integrator: {integrator}")
+    self._step = self.INTEGRATORS[integrator]
+    self.integrator_name = integrator
+
+  def step(self, z: Tensor, dt: float = 0.01) -> Tensor:
+    return self._step(z, self.H, dt)
+
+  def energy(self, z: Tensor) -> float:
+    return float(self.H(z).numpy())
+
+  def casimir(self, z: Tensor) -> float:
+    return float((z * z).sum().numpy())
+
+  def evolve(self, z: Tensor, dt: float, steps: int,
+             record_every: int = 1) -> tuple[Tensor, list]:
+    z_history: list[Tensor] = []
+    for i in range(steps):
+      if i % record_every == 0:
+        z_history.append(z.detach())
+      z = self.step(z, dt)
+    z_history.append(z.detach())
+    history = [(z_t.numpy().copy(), self.energy(z_t), self.casimir(z_t)) for z_t in z_history]
+    return z, history
+
+  def compile_unrolled_step(self, dt: float, unroll: int):
+    """Compile an unrolled step for Lie-Poisson systems."""
+    if unroll < 1:
+      raise ValueError("unroll must be >= 1")
+
+    def unrolled_step(z: Tensor):
+      for _ in range(unroll):
+        z = self.step(z, dt)
+      return z
+
+    return TinyJit(unrolled_step)
+
+  def evolve_unrolled(self, z: Tensor, dt: float, steps: int, unroll: int,
+                      record_every: int = 1) -> tuple[Tensor, list]:
+    """Evolve using an unrolled compiled step to reduce Python overhead."""
+    if unroll < 1:
+      raise ValueError("unroll must be >= 1")
+    if steps % unroll != 0:
+      raise ValueError("steps must be divisible by unroll")
+    if record_every % unroll != 0:
+      raise ValueError("record_every must be divisible by unroll")
+
+    step = self.compile_unrolled_step(dt, unroll)
+    z_history: list[Tensor] = []
+    for i in range(0, steps, unroll):
+      if i % record_every == 0:
+        z_history.append(z.detach())
+      z = step(z)
+    z_history.append(z.detach())
+    history = [(z_t.numpy().copy(), self.energy(z_t), self.casimir(z_t)) for z_t in z_history]
+    return z, history
+
+
+def quaternion_multiply(q1: Tensor, q2: Tensor) -> Tensor:
+  """Quaternion multiplication q1 * q2. Format: [w, x, y, z]."""
+  w1, x1, y1, z1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
+  w2, x2, y2, z2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
+  return Tensor.stack([
+    w1*w2 - x1*x2 - y1*y2 - z1*z2,
+    w1*x2 + x1*w2 + y1*z2 - z1*y2,
+    w1*y2 - x1*z2 + y1*w2 + z1*x2,
+    w1*z2 + x1*y2 - y1*x2 + z1*w2,
+  ], dim=-1)
+
+
+def quaternion_normalize(q: Tensor) -> Tensor:
+  """Normalize quaternion to unit length."""
+  norm = (q * q).sum(axis=-1).sqrt()
+  return q / norm.unsqueeze(-1)
+
+
+def integrate_orientation(quat: Tensor, omega: Tensor, dt: float) -> Tensor:
+  """Integrate orientation quaternion: dq/dt = 0.5 * q ⊗ [0, ω]"""
+  zero = omega[..., 0] * 0
+  omega_quat = Tensor.stack([zero, omega[..., 0], omega[..., 1], omega[..., 2]], dim=-1)
+  dq = quaternion_multiply(quat, omega_quat) * 0.5
+  return quaternion_normalize(quat + dt * dq).realize()
+
+
+class RigidBodySystem:
+  """
+  Complete rigid body simulation: Lie-Poisson dynamics (L) + quaternion kinematics (q).
+  """
+  def __init__(self, I: Tensor, integrator: str = "midpoint"):
+    self.I = I
+    self.I_inv = 1.0 / I
+    self.H = lambda L: 0.5 * (L * L * self.I_inv).sum()
+    self.integrator_name = integrator
+    if integrator == "splitting":
+      self._step_L = lambda L, dt: lie_poisson_splitting_so3(L, self.I_inv, dt)
+    elif integrator in LiePoissonSystem.INTEGRATORS:
+      self._lp = LiePoissonSystem(self.H, algebra="so3", integrator=integrator)
+      self._step_L = lambda L, dt: self._lp.step(L, dt)
+    else:
+      raise ValueError(f"Unknown integrator: {integrator}")
+
+  def step(self, L: Tensor, q: Tensor, dt: float = 0.01) -> tuple[Tensor, Tensor]:
+    L_new = self._step_L(L, dt)
+    return L_new, integrate_orientation(q, L_new * self.I_inv, dt)
+
+  def energy(self, L: Tensor) -> float:
+    return float(self.H(L).numpy())
+
+  def casimir(self, L: Tensor) -> float:
+    return float((L * L).sum().numpy())
+
+  def evolve(self, L: Tensor, q: Tensor, dt: float, steps: int,
+             record_every: int = 1) -> tuple[Tensor, Tensor, list]:
+    history = []
+    for i in range(steps):
+      if i % record_every == 0:
+        history.append((L.numpy().copy(), q.numpy().copy(), self.energy(L), self.casimir(L)))
+      L, q = self.step(L, q, dt)
+    history.append((L.numpy().copy(), q.numpy().copy(), self.energy(L), self.casimir(L)))
+    return L, q, history
+
+  def compile_unrolled_step(self, dt: float, unroll: int):
+    """Compile an unrolled rigid-body step."""
+    if unroll < 1:
+      raise ValueError("unroll must be >= 1")
+
+    def unrolled_step(L: Tensor, q: Tensor):
+      for _ in range(unroll):
+        L, q = self.step(L, q, dt)
+      return L, q
+
+    return TinyJit(unrolled_step)
+
+  def evolve_unrolled(self, L: Tensor, q: Tensor, dt: float, steps: int, unroll: int,
+                      record_every: int = 1) -> tuple[Tensor, Tensor, list]:
+    """Evolve using an unrolled compiled step to reduce Python overhead."""
+    if unroll < 1:
+      raise ValueError("unroll must be >= 1")
+    if steps % unroll != 0:
+      raise ValueError("steps must be divisible by unroll")
+    if record_every % unroll != 0:
+      raise ValueError("record_every must be divisible by unroll")
+
+    step = self.compile_unrolled_step(dt, unroll)
+    history = []
+    for i in range(0, steps, unroll):
+      if i % record_every == 0:
+        history.append((L.numpy().copy(), q.numpy().copy(), self.energy(L), self.casimir(L)))
+      L, q = step(L, q)
+    history.append((L.numpy().copy(), q.numpy().copy(), self.energy(L), self.casimir(L)))
+    return L, q, history
+
+
+class ProductManifold:
+  """
+  Product Manifold SO(3)* × S².
+  State = (L, γ) where L is angular momentum and γ is the body-frame gravity direction.
+  """
+  def __init__(self, L: Tensor, gamma: Tensor):
+    self.L = L
+    self.gamma = gamma
+
+  def normalize_gamma(self) -> 'ProductManifold':
+    norm = (self.gamma * self.gamma).sum(axis=-1).sqrt()
+    return ProductManifold(self.L, self.gamma / norm.unsqueeze(-1))
+
+  def realize(self) -> 'ProductManifold':
+    self.L.realize()
+    self.gamma.realize()
+    return self
+
+  @staticmethod
+  def from_euler_angles(L: Tensor, theta: float, phi: float, dtype=dtypes.float64) -> 'ProductManifold':
+    base = Tensor([
+      math.sin(theta) * math.cos(phi),
+      math.sin(theta) * math.sin(phi),
+      math.cos(theta),
+    ], dtype=dtype)
+    if L.ndim > 1:
+      base = base.reshape((1,) * (L.ndim - 1) + (3,)).expand(*L.shape[:-1], 3).contiguous()
+    gamma = base
+    return ProductManifold(L, gamma)
+
+  def casimirs(self) -> tuple[Tensor, Tensor]:
+    C1 = (self.gamma * self.gamma).sum(axis=-1)
+    C2 = (self.L * self.gamma).sum(axis=-1)
+    return C1, C2
+
+
+class ControlInput:
+  """
+  External control input for non-Hamiltonian forcing terms.
+  """
+  def __init__(self, fn: Callable):
+    self.fn = fn
+
+  def __call__(self, *args, **kwargs):
+    return self.fn(*args, **kwargs)
+
+
+class SatelliteControlIntegrator:
+  """
+  Symplectic split control integrator for rigid-body attitude control.
+  """
+  def __init__(self, I_inv: Tensor, control: ControlInput, dt: float):
+    self.I_inv = I_inv
+    self.control = control
+    self.dt = dt
+
+  def step(self, L: Tensor, quat: Tensor) -> tuple[Tensor, Tensor]:
+    omega = L * self.I_inv
+    q_err = (quat[..., 0:1] < 0).where(-quat, quat)
+    u = self.control(q_err, omega)
+    L_half = L + 0.5 * self.dt * u
+    L_free = lie_poisson_splitting_so3(L_half, self.I_inv, self.dt)
+    omega_free = L_free * self.I_inv
+    quat_free = integrate_orientation(quat, omega_free, self.dt)
+    q_err2 = (quat_free[..., 0:1] < 0).where(-quat_free, quat_free)
+    u2 = self.control(q_err2, omega_free)
+    L_next = L_free + 0.5 * self.dt * u2
+    return L_next, quat_free
+
+  def compile_unrolled_step(self, unroll: int):
+    if unroll < 1:
+      raise ValueError("unroll must be >= 1")
+
+    def unrolled_step(L: Tensor, quat: Tensor):
+      for _ in range(unroll):
+        L, quat = self.step(L, quat)
+      return L, quat
+
+    return TinyJit(unrolled_step)
+
+  def evolve_unrolled(self, L: Tensor, quat: Tensor, steps: int, unroll: int,
+                      record_every: int = 1) -> tuple[Tensor, Tensor, list]:
+    if unroll < 1:
+      raise ValueError("unroll must be >= 1")
+    if steps % unroll != 0:
+      raise ValueError("steps must be divisible by unroll")
+    if record_every % unroll != 0:
+      raise ValueError("record_every must be divisible by unroll")
+
+    step = self.compile_unrolled_step(unroll)
+    history = []
+    for i in range(0, steps, unroll):
+      if i % record_every == 0:
+        history.append((L.detach(), quat.detach()))
+      L, quat = step(L, quat)
+    history.append((L.detach(), quat.detach()))
+    return L, quat, history
+
+
+class LiePoissonBracketE3:
+  """
+  Lie-Poisson structure for e(3)* (heavy top).
+  """
+  def flow(self, state: ProductManifold, grad_L: Tensor, grad_gamma: Tensor) -> tuple[Tensor, Tensor]:
+    dL_dt = cross(state.L, grad_L) + cross(state.gamma, grad_gamma)
+    dgamma_dt = cross(state.gamma, grad_L)
+    return dL_dt, dgamma_dt
+
+
+class HeavyTopHamiltonian:
+  """
+  Hamiltonian for the heavy top.
+  H(L, γ) = ½ L · (I⁻¹ · L) + mgl γ₃
+  """
+  def __init__(self, I1: float, I2: float, I3: float, mgl: float, dtype=dtypes.float64):
+    self.I_inv = Tensor([1.0/I1, 1.0/I2, 1.0/I3], dtype=dtype)
+    self.mgl = mgl
+    self.dtype = dtype
+
+  def __call__(self, state: ProductManifold) -> Tensor:
+    omega = self.I_inv * state.L
+    T = 0.5 * (state.L * omega).sum()
+    V = self.mgl * state.gamma[2]
+    return T + V
+
+  def angular_velocity(self, L: Tensor) -> Tensor:
+    return self.I_inv * L
+
+
+class HeavyTopIntegrator:
+  """
+  Symplectic integrator for the heavy top.
+  """
+  def __init__(self, hamiltonian: HeavyTopHamiltonian, dt: float = 0.001):
+    self.H = hamiltonian
+    self.dt = dt
+    self.bracket = LiePoissonBracketE3()
+
+  def _rotate_vector(self, v: Tensor, axis: Tensor, angle: Tensor) -> Tensor:
+    axis_norm = (axis * axis).sum().sqrt()
+    eps = Tensor([1e-10], dtype=self.H.dtype)
+    k = axis / (axis_norm + eps)
+    c = angle.cos()
+    s = angle.sin()
+    if c.ndim < v.ndim:
+      c = c.unsqueeze(-1)
+      s = s.unsqueeze(-1)
+    k_cross_v = cross(k, v)
+    k_dot_v = (k * v).sum(axis=-1)
+    if k_dot_v.ndim < v.ndim:
+      k_dot_v = k_dot_v.unsqueeze(-1)
+    return v * c + k_cross_v * s + k * k_dot_v * (1 - c)
+
+  def _derivatives(self, L: Tensor, gamma: Tensor) -> tuple[Tensor, Tensor]:
+    omega = self.H.I_inv * L
+    e3 = Tensor([0.0, 0.0, 1.0], dtype=self.H.dtype)
+    dL = cross(L, omega) + cross(gamma, e3) * self.H.mgl
+    dgamma = cross(gamma, omega)
+    return dL, dgamma
+
+  def step_rk4(self, state: ProductManifold) -> ProductManifold:
+    L, gamma = state.L, state.gamma
+    dt = self.dt
+    dL1, dg1 = self._derivatives(L, gamma)
+    L2 = L + dL1 * (dt/2)
+    g2 = gamma + dg1 * (dt/2)
+    dL2, dg2 = self._derivatives(L2, g2)
+    L3 = L + dL2 * (dt/2)
+    g3 = gamma + dg2 * (dt/2)
+    dL3, dg3 = self._derivatives(L3, g3)
+    L4 = L + dL3 * dt
+    g4 = gamma + dg3 * dt
+    dL4, dg4 = self._derivatives(L4, g4)
+    L_new = L + (dL1 + dL2 * 2 + dL3 * 2 + dL4) * (dt/6)
+    gamma_new = gamma + (dg1 + dg2 * 2 + dg3 * 2 + dg4) * (dt/6)
+    return ProductManifold(L_new, gamma_new).normalize_gamma().realize()
+
+  def step_rk4_tensors(self, L: Tensor, gamma: Tensor) -> tuple[Tensor, Tensor]:
+    dt = self.dt
+    dL1, dg1 = self._derivatives(L, gamma)
+    L2 = L + dL1 * (dt/2)
+    g2 = gamma + dg1 * (dt/2)
+    dL2, dg2 = self._derivatives(L2, g2)
+    L3 = L + dL2 * (dt/2)
+    g3 = gamma + dg2 * (dt/2)
+    dL3, dg3 = self._derivatives(L3, g3)
+    L4 = L + dL3 * dt
+    g4 = gamma + dg3 * dt
+    dL4, dg4 = self._derivatives(L4, g4)
+    L_new = L + (dL1 + dL2 * 2 + dL3 * 2 + dL4) * (dt/6)
+    gamma_new = gamma + (dg1 + dg2 * 2 + dg3 * 2 + dg4) * (dt/6)
+    state = ProductManifold(L_new, gamma_new).normalize_gamma()
+    return state.L, state.gamma
+
+  def step_symmetric(self, state: ProductManifold) -> ProductManifold:
+    L, gamma = state.L, state.gamma
+    dt = self.dt
+    omega3 = self.H.I_inv[2] * L[..., 2]
+    angle = omega3 * (dt/2)
+    e3 = Tensor([0.0, 0.0, 1.0], dtype=self.H.dtype)
+    L = self._rotate_vector(L, e3, angle)
+    gamma = self._rotate_vector(gamma, e3, angle)
+    dL, dgamma = self._derivatives(L, gamma)
+    L_mid = L + dL * (dt/2)
+    gamma_mid = gamma + dgamma * (dt/2)
+    dL_mid, dgamma_mid = self._derivatives(L_mid, gamma_mid)
+    L = L + dL_mid * dt
+    gamma = gamma + dgamma_mid * dt
+    omega3 = self.H.I_inv[2] * L[..., 2]
+    angle = omega3 * (dt/2)
+    L = self._rotate_vector(L, e3, angle)
+    gamma = self._rotate_vector(gamma, e3, angle)
+    return ProductManifold(L, gamma).normalize_gamma().realize()
+
+  def step_symmetric_tensors(self, L: Tensor, gamma: Tensor) -> tuple[Tensor, Tensor]:
+    dt = self.dt
+    omega3 = self.H.I_inv[2] * L[..., 2]
+    angle = omega3 * (dt/2)
+    e3 = Tensor([0.0, 0.0, 1.0], dtype=self.H.dtype)
+    L = self._rotate_vector(L, e3, angle)
+    gamma = self._rotate_vector(gamma, e3, angle)
+    dL, dgamma = self._derivatives(L, gamma)
+    L_mid = L + dL * (dt/2)
+    gamma_mid = gamma + dgamma * (dt/2)
+    dL_mid, dgamma_mid = self._derivatives(L_mid, gamma_mid)
+    L = L + dL_mid * dt
+    gamma = gamma + dgamma_mid * dt
+    omega3 = self.H.I_inv[2] * L[..., 2]
+    angle = omega3 * (dt/2)
+    L = self._rotate_vector(L, e3, angle)
+    gamma = self._rotate_vector(gamma, e3, angle)
+    state = ProductManifold(L, gamma).normalize_gamma()
+    return state.L, state.gamma
+
+  def step(self, state: ProductManifold) -> ProductManifold:
+    return self.step_symmetric(state)
+
+  def step_tensors(self, L: Tensor, gamma: Tensor) -> tuple[Tensor, Tensor]:
+    return self.step_symmetric_tensors(L, gamma)
+
+  def step_explicit(self, state: ProductManifold) -> ProductManifold:
+    omega = self.H.angular_velocity(state.L)
+    e3 = Tensor([0.0, 0.0, 1.0], dtype=self.H.dtype)
+    grad_gamma = e3 * self.H.mgl
+    dL_dt, dgamma_dt = self.bracket.flow(state, omega, grad_gamma)
+    L_new = state.L + dL_dt * self.dt
+    gamma_new = state.gamma + dgamma_dt * self.dt
+    return ProductManifold(L_new, gamma_new).normalize_gamma().realize()
+
+  def step_explicit_tensors(self, L: Tensor, gamma: Tensor) -> tuple[Tensor, Tensor]:
+    omega = self.H.angular_velocity(L)
+    e3 = Tensor([0.0, 0.0, 1.0], dtype=self.H.dtype)
+    grad_gamma = e3 * self.H.mgl
+    dL_dt, dgamma_dt = self.bracket.flow(ProductManifold(L, gamma), omega, grad_gamma)
+    L_new = L + dL_dt * self.dt
+    gamma_new = gamma + dgamma_dt * self.dt
+    state = ProductManifold(L_new, gamma_new).normalize_gamma()
+    return state.L, state.gamma
+
+  def compile_unrolled_step(self, unroll: int, method: str = "splitting"):
+    """Compile an unrolled heavy-top step."""
+    if unroll < 1:
+      raise ValueError("unroll must be >= 1")
+    if method == "rk4":
+      raise ValueError("rk4 is not symplectic; use method='splitting'")
+    if method == "splitting":
+      step_fn = self.step_symmetric_tensors
+    else:
+      step_fn = self.step_explicit_tensors
+
+    def unrolled_step(L: Tensor, gamma: Tensor):
+      for _ in range(unroll):
+        L, gamma = step_fn(L, gamma)
+      return L, gamma
+
+    return TinyJit(unrolled_step)
+
+  def evolve_unrolled(self, L: Tensor, gamma: Tensor, steps: int, unroll: int,
+                      method: str = "splitting", record_every: int = 1) -> tuple[Tensor, Tensor, list]:
+    """Evolve heavy-top dynamics using unrolled compiled steps."""
+    if unroll < 1:
+      raise ValueError("unroll must be >= 1")
+    if steps % unroll != 0:
+      raise ValueError("steps must be divisible by unroll")
+    if record_every % unroll != 0:
+      raise ValueError("record_every must be divisible by unroll")
+
+    step = self.compile_unrolled_step(unroll, method=method)
+    history = []
+    for i in range(0, steps, unroll):
+      if i % record_every == 0:
+        history.append((L.detach(), gamma.detach()))
+      L, gamma = step(L, gamma)
+    history.append((L.detach(), gamma.detach()))
+    return L, gamma, history
 
     def evolve_scan(self, q: Tensor, p: Tensor, dt: float, steps: int, scan: int = 8,
                     record_every: int = 1) -> tuple[Tensor, Tensor, list]:
@@ -3309,6 +4036,13 @@ class HamiltonianSystem:
         if vector_width > 1 and q.shape and q.shape[-1] % vector_width == 0:
             reduce_vector_width = vector_width
         reduce_unroll = 1
+        if (dHdq_reduce_nodes or dHdp_reduce_nodes) and q.shape and not getenv("TINYGRAD_COUPLED_REDUCE_TUNE", 0) and \
+           not getenv("TINYGRAD_COUPLED_REDUCE_TUNE_BOTH", 0) and not getenv("TINYGRAD_COUPLED_REDUCE_UNROLL_TUNE", 0):
+            last_extent = q.shape[-1] // reduce_vector_width if reduce_vector_width > 0 else q.shape[-1]
+            if last_extent >= 16384:
+                reduce_unroll = 8
+            elif last_extent >= 4096:
+                reduce_unroll = 4
         if getenv("TINYGRAD_COUPLED_REDUCE_TUNE_BOTH", 0) and (dHdq_reduce_nodes or dHdp_reduce_nodes):
             tune_key = (q.device, q.shape, q.dtype)
             cached = self._reduce_kernel_coupled_tune_both_cache.get(tune_key)
@@ -3732,6 +4466,154 @@ class HamiltonianSystem:
             p_out_ptr = p_out.index(*ranges[:-1], base, ptr=True)
             store_p = p_out_ptr.cast(vec_dtype.ptr(size=p_out_ptr.dtype.size, addrspace=p_out_ptr.dtype.addrspace)).store(p_new)
             return store_p.end(*ranges).sink(arg=KernelInfo(name="coupled_update_p_fused", opts_to_apply=()))
+
+        return kernel
+
+    def _build_implicit_mid_init_kernel(self, dt: float, device: str, shape: tuple[int, ...], dtype) -> Callable:
+        q_sym_uop, p_sym_uop, dHdq_uop, dHdp_uop = self._get_coupled_grad_uops(device, shape, dtype)
+        strip_device_consts = PatternMatcher([
+            (UPat((Ops.CONST, Ops.VCONST), name="c"), _strip_device_const),
+        ])
+
+        def kernel(q: UOp, p: UOp, q_mid_out: UOp, p_mid_out: UOp) -> UOp:
+            ranges = [UOp.range(s, i+1) for i, s in enumerate(shape)]
+            q_val = q.vindex(*ranges)
+            p_val = p.vindex(*ranges)
+            dHdq = dHdq_uop.substitute({q_sym_uop: q_val, p_sym_uop: p_val})
+            dHdp = dHdp_uop.substitute({q_sym_uop: q_val, p_sym_uop: p_val})
+            dHdq = graph_rewrite(dHdq, strip_device_consts, name="strip_device_consts")
+            dHdp = graph_rewrite(dHdp, strip_device_consts, name="strip_device_consts")
+            half_dt = UOp.const(dHdq.dtype, 0.5 * dt, shape=tuple(r.vmax + 1 for r in ranges))
+            q_mid = q_val + half_dt * dHdp
+            p_mid = p_val - half_dt * dHdq
+            store_q = q_mid_out.index(*ranges, ptr=True).store(q_mid)
+            store_p = p_mid_out.index(*ranges, ptr=True).store(p_mid)
+            return UOp.group(store_q, store_p).end(*ranges).sink(arg=KernelInfo(name="implicit_mid_init", opts_to_apply=()))
+
+        return kernel
+
+    def _build_implicit_mid_iter_kernel(self, dt: float, device: str, shape: tuple[int, ...], dtype) -> Callable:
+        q_sym_uop, p_sym_uop, dHdq_uop, dHdp_uop = self._get_coupled_grad_uops(device, shape, dtype)
+        strip_device_consts = PatternMatcher([
+            (UPat((Ops.CONST, Ops.VCONST), name="c"), _strip_device_const),
+        ])
+
+        def kernel(q: UOp, p: UOp, q_mid: UOp, p_mid: UOp, q_mid_out: UOp, p_mid_out: UOp) -> UOp:
+            ranges = [UOp.range(s, i+1) for i, s in enumerate(shape)]
+            q_val = q.vindex(*ranges)
+            p_val = p.vindex(*ranges)
+            q_mid_val = q_mid.vindex(*ranges)
+            p_mid_val = p_mid.vindex(*ranges)
+            dHdq_mid = dHdq_uop.substitute({q_sym_uop: q_mid_val, p_sym_uop: p_mid_val})
+            dHdp_mid = dHdp_uop.substitute({q_sym_uop: q_mid_val, p_sym_uop: p_mid_val})
+            dHdq_mid = graph_rewrite(dHdq_mid, strip_device_consts, name="strip_device_consts")
+            dHdp_mid = graph_rewrite(dHdp_mid, strip_device_consts, name="strip_device_consts")
+            half_dt = UOp.const(dHdq_mid.dtype, 0.5 * dt, shape=tuple(r.vmax + 1 for r in ranges))
+            q_next = q_val + half_dt * dHdp_mid
+            p_next = p_val - half_dt * dHdq_mid
+            store_q = q_mid_out.index(*ranges, ptr=True).store(q_next)
+            store_p = p_mid_out.index(*ranges, ptr=True).store(p_next)
+            return UOp.group(store_q, store_p).end(*ranges).sink(arg=KernelInfo(name="implicit_mid_iter", opts_to_apply=()))
+
+        return kernel
+
+    def _build_implicit_mid_final_kernel(self, dt: float, device: str, shape: tuple[int, ...], dtype) -> Callable:
+        q_sym_uop, p_sym_uop, dHdq_uop, dHdp_uop = self._get_coupled_grad_uops(device, shape, dtype)
+        strip_device_consts = PatternMatcher([
+            (UPat((Ops.CONST, Ops.VCONST), name="c"), _strip_device_const),
+        ])
+
+        def kernel(q: UOp, p: UOp, q_mid: UOp, p_mid: UOp, q_out: UOp, p_out: UOp) -> UOp:
+            ranges = [UOp.range(s, i+1) for i, s in enumerate(shape)]
+            q_val = q.vindex(*ranges)
+            p_val = p.vindex(*ranges)
+            q_mid_val = q_mid.vindex(*ranges)
+            p_mid_val = p_mid.vindex(*ranges)
+            dHdq_mid = dHdq_uop.substitute({q_sym_uop: q_mid_val, p_sym_uop: p_mid_val})
+            dHdp_mid = dHdp_uop.substitute({q_sym_uop: q_mid_val, p_sym_uop: p_mid_val})
+            dHdq_mid = graph_rewrite(dHdq_mid, strip_device_consts, name="strip_device_consts")
+            dHdp_mid = graph_rewrite(dHdp_mid, strip_device_consts, name="strip_device_consts")
+            dt_uop = UOp.const(dHdq_mid.dtype, dt, shape=tuple(r.vmax + 1 for r in ranges))
+            q_next = q_val + dt_uop * dHdp_mid
+            p_next = p_val - dt_uop * dHdq_mid
+            store_q = q_out.index(*ranges, ptr=True).store(q_next)
+            store_p = p_out.index(*ranges, ptr=True).store(p_next)
+            return UOp.group(store_q, store_p).end(*ranges).sink(arg=KernelInfo(name="implicit_mid_final", opts_to_apply=()))
+
+        return kernel
+
+    def _build_implicit_mid_full_kernel(self, dt: float, iters: int, device: str, shape: tuple[int, ...], dtype,
+                                        vector_width: int) -> Callable:
+        if iters < 1:
+            raise ValueError("iters must be >= 1")
+        if vector_width < 1:
+            raise ValueError("vector_width must be >= 1")
+        if vector_width > 1 and shape and shape[-1] % vector_width != 0:
+            raise ValueError("vector_width must divide the last dimension")
+        q_sym_uop, p_sym_uop, dHdq_uop, dHdp_uop = self._get_coupled_grad_uops(device, shape, dtype)
+        const_vec = PatternMatcher([
+            (UPat((Ops.CONST, Ops.VCONST), name="x"), _const_to_vec),
+        ])
+        drop_vector_expand = PatternMatcher([
+            (UPat((Ops.RESHAPE, Ops.EXPAND), name="x"), _drop_vector_expand),
+        ])
+        strip_device_consts = PatternMatcher([
+            (UPat((Ops.CONST, Ops.VCONST), name="c"), _strip_device_const),
+        ])
+
+        def kernel(q: UOp, p: UOp, q_out: UOp, p_out: UOp) -> UOp:
+            use_vec = vector_width > 1
+            if use_vec:
+                ranges = [UOp.range(s, i+1) for i, s in enumerate(shape[:-1])]
+                ranges.append(UOp.range(shape[-1] // vector_width, len(shape)))
+                base = ranges[-1] * UOp.const(dtypes.index, vector_width)
+                vec_dtype = q.dtype.base.vec(vector_width)
+                q_ptr = q.index(*ranges[:-1], base, ptr=True)
+                p_ptr = p.index(*ranges[:-1], base, ptr=True)
+                q_val = q_ptr.cast(vec_dtype.ptr(size=q_ptr.dtype.size, addrspace=q_ptr.dtype.addrspace)).load()
+                p_val = p_ptr.cast(vec_dtype.ptr(size=p_ptr.dtype.size, addrspace=p_ptr.dtype.addrspace)).load()
+            else:
+                ranges = [UOp.range(s, i+1) for i, s in enumerate(shape)]
+                q_val = q.vindex(*ranges)
+                p_val = p.vindex(*ranges)
+
+            def grad_uop(q_uop: UOp, p_uop: UOp) -> tuple[UOp, UOp]:
+                dHdq = dHdq_uop.substitute({q_sym_uop: q_uop, p_sym_uop: p_uop})
+                dHdp = dHdp_uop.substitute({q_sym_uop: q_uop, p_sym_uop: p_uop})
+                if use_vec:
+                    dHdq = graph_rewrite(dHdq, const_vec, ctx={"vector_width": vector_width}, name="const_vec")
+                    dHdp = graph_rewrite(dHdp, const_vec, ctx={"vector_width": vector_width}, name="const_vec")
+                    dHdq = graph_rewrite(dHdq, drop_vector_expand, ctx={"vector_width": vector_width}, name="drop_vector_expand")
+                    dHdp = graph_rewrite(dHdp, drop_vector_expand, ctx={"vector_width": vector_width}, name="drop_vector_expand")
+                dHdq = graph_rewrite(dHdq, strip_device_consts, name="strip_device_consts")
+                dHdp = graph_rewrite(dHdp, strip_device_consts, name="strip_device_consts")
+                if use_vec:
+                    if dHdq.dtype.count == 1: dHdq = dHdq.broadcast(vector_width)
+                    if dHdp.dtype.count == 1: dHdp = dHdp.broadcast(vector_width)
+                return dHdq, dHdp
+
+            shape_vals = tuple(r.vmax + 1 for r in ranges)
+            dHdq_mid, dHdp_mid = grad_uop(q_val, p_val)
+            half_dt = UOp.const(dHdq_mid.dtype, 0.5 * dt, shape=None if use_vec else shape_vals)
+            q_mid = q_val + half_dt * dHdp_mid
+            p_mid = p_val - half_dt * dHdq_mid
+            for _ in range(iters - 1):
+                dHdq_mid, dHdp_mid = grad_uop(q_mid, p_mid)
+                q_mid = q_val + half_dt * dHdp_mid
+                p_mid = p_val - half_dt * dHdq_mid
+            dHdq_mid, dHdp_mid = grad_uop(q_mid, p_mid)
+            dt_uop = UOp.const(dHdq_mid.dtype, dt, shape=None if use_vec else shape_vals)
+            q_next = q_val + dt_uop * dHdp_mid
+            p_next = p_val - dt_uop * dHdq_mid
+            if use_vec:
+                q_out_ptr = q_out.index(*ranges[:-1], base, ptr=True)
+                p_out_ptr = p_out.index(*ranges[:-1], base, ptr=True)
+                store_q = q_out_ptr.cast(vec_dtype.ptr(size=q_out_ptr.dtype.size, addrspace=q_out_ptr.dtype.addrspace)).store(q_next)
+                store_p = p_out_ptr.cast(vec_dtype.ptr(size=p_out_ptr.dtype.size, addrspace=p_out_ptr.dtype.addrspace)).store(p_next)
+            else:
+                store_q = q_out.index(*ranges, ptr=True).store(q_next)
+                store_p = p_out.index(*ranges, ptr=True).store(p_next)
+            return UOp.group(store_q, store_p).end(*ranges).sink(arg=KernelInfo(name="implicit_mid_full", opts_to_apply=()))
 
         return kernel
 
@@ -4682,7 +5564,7 @@ class HamiltonianSystem:
             q_b, p_b = q_buf, p_buf
             for _ in range(unroll):
                 if self.integrator_name == "implicit":
-                    q_b, p_b = implicit_midpoint_into(q_a, p_a, q_b, p_b, self.H, dt)
+                    q_b, p_b = self._implicit_midpoint_into_fast(q_a, p_a, q_b, p_b, dt)
                 else:
                     q_b, p_b = self.step(q_a, p_a, dt)
                 q_a, p_a, q_b, p_b = q_b, p_b, q_a, p_a

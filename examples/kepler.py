@@ -59,8 +59,8 @@ def kepler_hamiltonian(GM: float = 1.0, m: float = 1.0, softening: float = 0.0):
 # SIMULATION
 # ============================================================================
 
-def run_simulation(integrator="yoshida4", dt=0.01, steps=5000, eccentricity=0.6,
-                   use_scan=False, use_unroll=False, unroll_steps=1,
+def run_simulation(integrator="leapfrog", dt=0.01, steps=5000, eccentricity=0.6,
+                   use_scan=True, use_unroll=False, unroll_steps=4,
                    vector_width=1, scan_tune=False, render=True):
     """
     Simulate the Kepler problem using the TinyPhysics compiler approach.
@@ -78,11 +78,8 @@ def run_simulation(integrator="yoshida4", dt=0.01, steps=5000, eccentricity=0.6,
     v_aphelion = np.sqrt(GM * (1 - e) / (a * (1 + e)))
 
     # Initial state
-    q = Tensor([r_aphelion, 0.0], requires_grad=True)
-    p = Tensor([0.0, m * v_aphelion], requires_grad=True)
-    if use_scan:
-        q = q.detach()
-        p = p.detach()
+    q = Tensor([r_aphelion, 0.0], requires_grad=False)
+    p = Tensor([0.0, m * v_aphelion], requires_grad=False)
 
     # Expected orbital period
     T_orbital = 2 * np.pi * np.sqrt(a**3 / GM)
@@ -670,4 +667,4 @@ if __name__ == "__main__":
             render=False,
         )
     else:
-        run_simulation("yoshida4")
+        run_simulation()

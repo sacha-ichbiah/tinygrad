@@ -17,317 +17,38 @@ This is the key insight: the Product Manifold has a NON-TRIVIAL coupling
 between the two factors through the Poisson bracket.
 """
 
-from tinygrad import Tensor, dtypes
+from tinygrad import TinyJit, Tensor, dtypes
+from tinygrad.physics import HeavyTopHamiltonian, HeavyTopIntegrator, ProductManifold
+import argparse
+import time
 import numpy as np
-
-# ============================================================================
-# PRIMITIVE 1: Cross Product (from 2.1)
-# ============================================================================
-
-def cross(a: Tensor, b: Tensor) -> Tensor:
-  """
-  Cross product a × b for 3-vectors.
-  This is the fundamental operation for SO(3) dynamics.
-
-  The Lie bracket structure: [a, b] = a × b
-  """
-  ax, ay, az = a[0], a[1], a[2]
-  bx, by, bz = b[0], b[1], b[2]
-  return Tensor.stack([
-    ay * bz - az * by,
-    az * bx - ax * bz,
-    ax * by - ay * bx
-  ])
-
-# ============================================================================
-# PRIMITIVE 2: Product Manifold State
-# ============================================================================
-
-class ProductManifold:
-  """
-  The Product Manifold SO(3)* × S² for the Heavy Top.
-
-  State = (L, γ) where:
-    L ∈ so(3)* ≃ R³ : Angular momentum in body frame
-    γ ∈ S² ⊂ R³    : Gravity direction in body frame (unit vector)
-
-  The key property: γ must stay on the unit sphere (|γ| = 1).
-  This is a Casimir invariant of the Poisson structure.
-  """
-
-  def __init__(self, L: Tensor, gamma: Tensor):
-    self.L = L          # Angular momentum (3-vector)
-    self.gamma = gamma  # Gravity direction (unit 3-vector)
-
-  def normalize_gamma(self) -> 'ProductManifold':
-    """Project γ back to S² (numerical stability)."""
-    norm = (self.gamma * self.gamma).sum().sqrt()
-    return ProductManifold(self.L, self.gamma / norm)
-
-  def realize(self) -> 'ProductManifold':
-    """Force evaluation to prevent graph explosion."""
-    self.L.realize()
-    self.gamma.realize()
-    return self
-
-  @staticmethod
-  def from_euler_angles(L: Tensor, theta: float, phi: float) -> 'ProductManifold':
-    """
-    Create state from angular momentum and spherical angles.
-    θ: angle from vertical (0 = upright, π = hanging)
-    φ: azimuthal angle
-    """
-    gamma = Tensor([
-      np.sin(theta) * np.cos(phi),
-      np.sin(theta) * np.sin(phi),
-      np.cos(theta)
-    ], dtype=dtypes.float64)
-    return ProductManifold(L, gamma)
-
-  def casimirs(self) -> tuple[Tensor, Tensor]:
-    """
-    The Casimir invariants (conserved by any Hamiltonian flow):
-    C₁ = |γ|² = 1 (geometric constraint)
-    C₂ = L · γ   (projection of L onto gravity direction)
-    """
-    C1 = (self.gamma * self.gamma).sum()
-    C2 = (self.L * self.gamma).sum()
-    return C1, C2
-
-# ============================================================================
-# THE HAMILTONIAN: Energy of the Heavy Top
-# ============================================================================
-
-class HeavyTopHamiltonian:
-  """
-  The Heavy Top Hamiltonian:
-
-    H(L, γ) = ½ L · (I⁻¹ · L) + mgl (γ · e₃)
-            = ½(L₁²/I₁ + L₂²/I₂ + L₃²/I₃) + mgl γ₃
-
-  Where:
-    I = diag(I₁, I₂, I₃) : Principal moments of inertia
-    mgl : Gravitational torque parameter (mass × gravity × distance to pivot)
-    e₃ = (0, 0, 1) : Symmetry axis of the top
-
-  For a symmetric top: I₁ = I₂ (≠ I₃)
-  """
-
-  def __init__(self, I1: float, I2: float, I3: float, mgl: float):
-    self.I_inv = Tensor([1.0/I1, 1.0/I2, 1.0/I3], dtype=dtypes.float64)
-    self.mgl = mgl  # Gravitational torque parameter
-
-  def __call__(self, state: ProductManifold) -> Tensor:
-    """Compute total energy H = T + V."""
-    # Kinetic energy: T = ½ L · (I⁻¹ · L)
-    omega = self.I_inv * state.L  # Angular velocity ω = I⁻¹ L
-    T = 0.5 * (state.L * omega).sum()
-
-    # Potential energy: V = mgl γ₃ (height of center of mass)
-    V = self.mgl * state.gamma[2]
-
-    return T + V
-
-  def angular_velocity(self, L: Tensor) -> Tensor:
-    """ω = I⁻¹ · L"""
-    return self.I_inv * L
-
-# ============================================================================
-# THE POISSON STRUCTURE: Lie-Poisson Bracket
-# ============================================================================
-
-class LiePoissonBracket:
-  """
-  The Lie-Poisson structure for e(3)* (Euclidean group coadjoint orbit).
-
-  The flow equations are:
-    dL/dt = {L, H} = L × ∂H/∂L + γ × ∂H/∂γ
-    dγ/dt = {γ, H} = γ × ∂H/∂L
-
-  This is the PRODUCT MANIFOLD structure:
-  - The L equation has contributions from BOTH L and γ gradients
-  - The γ equation only sees the L gradient
-
-  This asymmetry is the hallmark of a semi-direct product Lie algebra.
-  """
-
-  def flow(self, state: ProductManifold, grad_L: Tensor, grad_gamma: Tensor) -> tuple[Tensor, Tensor]:
-    """
-    Apply the Poisson tensor J to the gradients.
-
-    Returns (dL/dt, dγ/dt) = J · ∇H
-
-    The structure matrix J encodes:
-      J = [ [L×]  [γ×] ]
-          [ [γ×]   0   ]
-
-    Where [a×] is the skew-symmetric matrix for cross product.
-    """
-    # dL/dt = L × (∂H/∂L) + γ × (∂H/∂γ)
-    dL_dt = cross(state.L, grad_L) + cross(state.gamma, grad_gamma)
-
-    # dγ/dt = γ × (∂H/∂L)
-    dgamma_dt = cross(state.gamma, grad_L)
-
-    return dL_dt, dgamma_dt
-
-# ============================================================================
-# THE INTEGRATOR: Symplectic-Lie Splitting
-# ============================================================================
-
-class HeavyTopIntegrator:
-  """
-  Symplectic integrator for the Heavy Top.
-
-  For a SYMMETRIC TOP (I1 = I2), we use an exact splitting:
-
-  The Hamiltonian splits as: H = H₁(L₃) + H₂(L, γ)
-  where H₁ = L₃²/(2I₃) and H₂ = (L₁² + L₂²)/(2I₁) + mgl·γ₃
-
-  H₁-flow: exact rotation around e₃ axis
-  H₂-flow: uses Runge-Kutta on the reduced system
-
-  For general (non-symmetric) tops, we use 4th order Runge-Kutta
-  which still gives excellent energy conservation.
-  """
-
-  def __init__(self, hamiltonian: HeavyTopHamiltonian, dt: float = 0.001):
-    self.H = hamiltonian
-    self.dt = dt
-    self.bracket = LiePoissonBracket()
-
-  def _rotate_vector(self, v: Tensor, axis: Tensor, angle: Tensor) -> Tensor:
-    """
-    Rodrigues' rotation formula: rotate v around axis by angle.
-
-    v' = v cos(θ) + (k × v) sin(θ) + k (k · v)(1 - cos(θ))
-    """
-    axis_norm = (axis * axis).sum().sqrt()
-    eps = Tensor([1e-10], dtype=dtypes.float64)
-    k = axis / (axis_norm + eps)
-
-    c = angle.cos()
-    s = angle.sin()
-
-    k_cross_v = cross(k, v)
-    k_dot_v = (k * v).sum()
-
-    return v * c + k_cross_v * s + k * k_dot_v * (1 - c)
-
-  def _derivatives(self, L: Tensor, gamma: Tensor) -> tuple[Tensor, Tensor]:
-    """
-    Compute (dL/dt, dγ/dt) from the Lie-Poisson equations.
-
-    dL/dt = L × ω + γ × (mgl·e₃)
-    dγ/dt = γ × ω
-
-    where ω = I⁻¹·L
-    """
-    omega = self.H.I_inv * L
-    e3 = Tensor([0.0, 0.0, 1.0], dtype=dtypes.float64)
-
-    dL = cross(L, omega) + cross(gamma, e3) * self.H.mgl
-    dgamma = cross(gamma, omega)
-
-    return dL, dgamma
-
-  def step_rk4(self, state: ProductManifold) -> ProductManifold:
-    """
-    4th order Runge-Kutta integrator.
-    Not strictly symplectic but excellent energy conservation.
-    """
-    L, gamma = state.L, state.gamma
-    dt = self.dt
-
-    # k1
-    dL1, dg1 = self._derivatives(L, gamma)
-
-    # k2
-    L2 = L + dL1 * (dt/2)
-    g2 = gamma + dg1 * (dt/2)
-    dL2, dg2 = self._derivatives(L2, g2)
-
-    # k3
-    L3 = L + dL2 * (dt/2)
-    g3 = gamma + dg2 * (dt/2)
-    dL3, dg3 = self._derivatives(L3, g3)
-
-    # k4
-    L4 = L + dL3 * dt
-    g4 = gamma + dg3 * dt
-    dL4, dg4 = self._derivatives(L4, g4)
-
-    # Combine
-    L_new = L + (dL1 + dL2 * 2 + dL3 * 2 + dL4) * (dt/6)
-    gamma_new = gamma + (dg1 + dg2 * 2 + dg3 * 2 + dg4) * (dt/6)
-
-    return ProductManifold(L_new, gamma_new).normalize_gamma().realize()
-
-  def step_symmetric(self, state: ProductManifold) -> ProductManifold:
-    """
-    Symplectic splitting for SYMMETRIC top (I1 = I2).
-
-    Split: H = H₁ + H₂ where
-      H₁ = L₃²/(2I₃)  (rotation around symmetry axis)
-      H₂ = rest       (planar + potential)
-
-    H₁-flow is exact: e₃-rotation by angle ω₃·dt
-    H₂-flow uses midpoint rule (symplectic for quadratic H).
-    """
-    L, gamma = state.L, state.gamma
-    dt = self.dt
-
-    # === H₁ flow (half step): rotation around e₃ ===
-    omega3 = self.H.I_inv[2] * L[2]
-    angle = omega3 * (dt/2)
-    e3 = Tensor([0.0, 0.0, 1.0], dtype=dtypes.float64)
-
-    L = self._rotate_vector(L, e3, angle)
-    gamma = self._rotate_vector(gamma, e3, angle)
-
-    # === H₂ flow (full step): midpoint implicit ===
-    # Use explicit midpoint (2nd order symplectic)
-    dL, dgamma = self._derivatives(L, gamma)
-    L_mid = L + dL * (dt/2)
-    gamma_mid = gamma + dgamma * (dt/2)
-    dL_mid, dgamma_mid = self._derivatives(L_mid, gamma_mid)
-    L = L + dL_mid * dt
-    gamma = gamma + dgamma_mid * dt
-
-    # === H₁ flow (half step): rotation around e₃ ===
-    omega3 = self.H.I_inv[2] * L[2]
-    angle = omega3 * (dt/2)
-
-    L = self._rotate_vector(L, e3, angle)
-    gamma = self._rotate_vector(gamma, e3, angle)
-
-    return ProductManifold(L, gamma).normalize_gamma().realize()
-
-  def step(self, state: ProductManifold) -> ProductManifold:
-    """
-    Default step: use RK4 for best energy conservation.
-    """
-    return self.step_rk4(state)
-
-  def step_explicit(self, state: ProductManifold) -> ProductManifold:
-    """
-    Simple explicit Euler for comparison (NOT symplectic).
-    Shows the structure of the Poisson bracket directly.
-    """
-    omega = self.H.angular_velocity(state.L)
-    e3 = Tensor([0.0, 0.0, 1.0], dtype=dtypes.float64)
-    grad_gamma = e3 * self.H.mgl
-
-    dL_dt, dgamma_dt = self.bracket.flow(state, omega, grad_gamma)
-
-    L_new = state.L + dL_dt * self.dt
-    gamma_new = state.gamma + dgamma_dt * self.dt
-
-    return ProductManifold(L_new, gamma_new).normalize_gamma().realize()
+import json
+import os
 
 # ============================================================================
 # SIMULATION RUNNER
 # ============================================================================
+
+def _auto_unroll(candidates: list[int], steps: int, make_state, step_factory) -> int:
+  best = None
+  best_t = None
+  trial_steps = min(steps, 2000)
+  for unroll in candidates:
+    if steps % unroll != 0: continue
+    L, gamma = make_state()
+    step = step_factory(unroll)
+    for _ in range(3):
+      L, gamma = step(L, gamma)
+    t0 = time.perf_counter()
+    for _ in range(trial_steps // unroll):
+      L, gamma = step(L, gamma)
+    L.numpy(); gamma.numpy()
+    t1 = time.perf_counter()
+    if best_t is None or t1 - t0 < best_t:
+      best_t = t1 - t0
+      best = unroll
+  return best if best is not None else candidates[0]
+
 
 def simulate_heavy_top(
     L0: list[float],
@@ -339,7 +60,14 @@ def simulate_heavy_top(
     mgl: float = 1.0,
     dt: float = 0.001,
     steps: int = 10000,
-    method: str = "splitting"
+    method: str = "splitting",
+    batch_size: int = 1,
+    unroll_steps: int = 8,
+    scan: bool = False,
+    auto_unroll: bool = False,
+    viewer_batch: int = 4,
+    benchmark: bool = False,
+    render: bool = False,
 ) -> dict:
   """
   Simulate the Heavy Top and track conservation laws.
@@ -352,16 +80,20 @@ def simulate_heavy_top(
     mgl: Gravitational torque parameter
     dt: Time step
     steps: Number of steps
-    method: "rk4", "splitting" (symplectic), or "euler" (explicit)
+    method: "splitting" (symplectic) or "euler" (explicit)
 
   Returns:
     Dictionary with trajectories and conservation diagnostics
   """
   # Initialize
   L = Tensor(L0, dtype=dtypes.float64)
+  if batch_size > 1:
+    L = L.reshape(1, 3).expand(batch_size, 3).contiguous()
   state = ProductManifold.from_euler_angles(L, theta0, phi0)
-  H = HeavyTopHamiltonian(I1, I2, I3, mgl)
+  gamma = state.gamma
+  H = HeavyTopHamiltonian(I1, I2, I3, mgl, dtype=dtypes.float64)
   integrator = HeavyTopIntegrator(H, dt)
+  unroll_steps = unroll_steps
 
   # Storage
   history = {
@@ -370,37 +102,96 @@ def simulate_heavy_top(
   }
 
   # Initial values
-  E0 = H(state).numpy()
-  C1_0, C2_0 = state.casimirs()
-  C1_0, C2_0 = C1_0.numpy(), C2_0.numpy()
+  L_sample = L[0] if L.ndim > 1 else L
+  gamma_sample = gamma[0] if gamma.ndim > 1 else gamma
+  E0 = H(ProductManifold(L_sample, gamma_sample)).numpy()
+  C1_0 = (gamma_sample * gamma_sample).sum().numpy()
+  C2_0 = (L_sample * gamma_sample).sum().numpy()
 
   # Select integration method
   if method == "rk4":
-    step_fn = integrator.step_rk4
-  elif method == "splitting":
-    step_fn = integrator.step_symmetric
+    raise ValueError("rk4 is not symplectic; use method='splitting'")
+  if method == "splitting":
+    step_fn = integrator.step_symmetric_tensors
   else:
-    step_fn = integrator.step_explicit
+    step_fn = integrator.step_explicit_tensors
+  if auto_unroll:
+    candidates = [2, 4, 8, 16]
+    def make_state():
+      L0_tensor = Tensor(L0, dtype=dtypes.float64)
+      if batch_size > 1:
+        L0_tensor = L0_tensor.reshape(1, 3).expand(batch_size, 3).contiguous()
+      g0 = ProductManifold.from_euler_angles(L0_tensor, theta0, phi0).gamma
+      return L0_tensor, g0
+    def step_factory(unroll):
+      return integrator.compile_unrolled_step(unroll, method=method)
+    unroll_steps = _auto_unroll(candidates, steps, make_state, step_factory)
+  if steps % unroll_steps != 0:
+    raise ValueError("steps must be divisible by unroll_steps")
+  def step_unrolled(L_in: Tensor, gamma_in: Tensor):
+    for _ in range(unroll_steps):
+      L_in, gamma_in = step_fn(L_in, gamma_in)
+    return L_in, gamma_in
+  step = TinyJit(step_unrolled)
 
   # Run simulation
   sample_interval = max(1, steps // 100)  # Sample ~100 times
-  for i in range(steps):
-    if i % sample_interval == 0:
-      E = H(state).numpy()
-      C1, C2 = state.casimirs()
-
-      history['time'].append(i * dt)
-      history['L'].append(state.L.numpy().copy())
-      history['gamma'].append(state.gamma.numpy().copy())
+  start_time = time.perf_counter() if benchmark else None
+  if scan:
+    if sample_interval % unroll_steps != 0:
+      sample_interval = unroll_steps
+    L, gamma, hist_t = integrator.evolve_unrolled(L, gamma, steps, unroll_steps, method=method, record_every=sample_interval)
+    for idx, (L_t, g_t) in enumerate(hist_t):
+      L_sample = L_t[:viewer_batch] if L_t.ndim > 1 else L_t
+      g_sample = g_t[:viewer_batch] if g_t.ndim > 1 else g_t
+      if isinstance(L_sample, Tensor) and L_sample.ndim > 1:
+        E = H(ProductManifold(L_sample[0], g_sample[0])).numpy()
+        C1 = (g_sample[0] * g_sample[0]).sum()
+        C2 = (L_sample[0] * g_sample[0]).sum()
+      else:
+        E = H(ProductManifold(L_sample, g_sample)).numpy()
+        C1 = (g_sample * g_sample).sum()
+        C2 = (L_sample * g_sample).sum()
+      history['time'].append(idx * sample_interval * dt)
+      history['L'].append(L_sample.numpy().copy())
+      history['gamma'].append(g_sample.numpy().copy())
       history['energy'].append(E)
       history['C1'].append(C1.numpy())
       history['C2'].append(C2.numpy())
+  else:
+    for i in range(0, steps, unroll_steps):
+      if i % sample_interval == 0:
+        L_sample = L[:viewer_batch] if L.ndim > 1 else L
+        gamma_sample = gamma[:viewer_batch] if gamma.ndim > 1 else gamma
+        if isinstance(L_sample, Tensor) and L_sample.ndim > 1:
+          E = H(ProductManifold(L_sample[0], gamma_sample[0])).numpy()
+          C1 = (gamma_sample[0] * gamma_sample[0]).sum()
+          C2 = (L_sample[0] * gamma_sample[0]).sum()
+        else:
+          E = H(ProductManifold(L_sample, gamma_sample)).numpy()
+          C1 = (gamma_sample * gamma_sample).sum()
+          C2 = (L_sample * gamma_sample).sum()
 
-    state = step_fn(state)
+        history['time'].append(i * dt)
+        history['L'].append(L_sample.numpy().copy())
+        history['gamma'].append(gamma_sample.numpy().copy())
+        history['energy'].append(E)
+        history['C1'].append(C1.numpy())
+        history['C2'].append(C2.numpy())
+
+      L, gamma = step(L, gamma)
+
+  if benchmark and start_time is not None:
+    elapsed = time.perf_counter() - start_time
+    steps_s = steps / elapsed if elapsed > 0 else float("inf")
+    print(f"Performance: {steps_s:,.1f} steps/s")
 
   # Final conservation check
-  E_final = H(state).numpy()
-  C1_final, C2_final = state.casimirs()
+  L_sample = L[0] if L.ndim > 1 else L
+  gamma_sample = gamma[0] if gamma.ndim > 1 else gamma
+  E_final = H(ProductManifold(L_sample, gamma_sample)).numpy()
+  C1_final = (gamma_sample * gamma_sample).sum()
+  C2_final = (L_sample * gamma_sample).sum()
 
   history['diagnostics'] = {
     'E0': E0,
@@ -412,13 +203,85 @@ def simulate_heavy_top(
     'C2_final': C2_final.numpy(),
   }
 
+  if render:
+    generate_viewer(history['gamma'])
   return history
+
+
+def generate_viewer(history_gamma):
+  history_list = [g.tolist() if hasattr(g, "tolist") else g for g in history_gamma]
+  html_content = f"""
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Heavy Top Precession</title>
+  <style>
+    body {{ font-family: sans-serif; background: #000; color: #fff; display: flex; flex-direction: column; align-items: center; }}
+    canvas {{ border: 1px solid #444; }}
+  </style>
+</head>
+<body>
+  <h1>Heavy Top Precession</h1>
+  <p>Trace of γ projected on ground (x,y).</p>
+  <canvas id="simCanvas" width="600" height="600"></canvas>
+  <script>
+    const history = {json.dumps(history_list)};
+    const canvas = document.getElementById('simCanvas');
+    const ctx = canvas.getContext('2d');
+    const cx = canvas.width / 2;
+    const cy = canvas.height / 2;
+    const scale = 200;
+    let frame = 0;
+
+    function draw() {{
+      ctx.fillStyle = 'rgba(0,0,0,0.2)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      const g = history[frame];
+      const show = Array.isArray(g[0]) ? g : [g];
+      const grid = Math.ceil(Math.sqrt(show.length));
+      show.forEach((v, idx) => {{
+        const gx = idx % grid;
+        const gy = Math.floor(idx / grid);
+        const ox = cx + (gx - (grid - 1)/2) * 220;
+        const oy = cy + (gy - (grid - 1)/2) * 220;
+        const x = ox + v[0] * scale;
+        const y = oy - v[1] * scale;
+        ctx.fillStyle = '#0f0';
+        ctx.beginPath();
+        ctx.arc(x, y, 3, 0, 2 * Math.PI);
+        ctx.fill();
+      }});
+      frame = (frame + 1) % history.length;
+      requestAnimationFrame(draw);
+    }}
+    draw();
+  </script>
+</body>
+</html>
+  """
+  viewer_path = 'examples/heavy_top_viewer.html'
+  with open(viewer_path, 'w') as f:
+    f.write(html_content)
+  print(f"Viewer generated: {os.path.abspath(viewer_path)}")
 
 # ============================================================================
 # DEMO
 # ============================================================================
 
 if __name__ == "__main__":
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--batch", type=int, default=int(os.getenv("TINYGRAD_BATCH", "1")))
+  parser.add_argument("--steps", type=int, default=800)
+  parser.add_argument("--dt", type=float, default=0.002)
+  parser.add_argument("--method", type=str, default="splitting")
+  parser.add_argument("--unroll", type=int, default=8)
+  parser.add_argument("--scan", action="store_true")
+  parser.add_argument("--auto-unroll", action="store_true")
+  parser.add_argument("--viewer-batch", type=int, default=4)
+  parser.add_argument("--benchmark", action="store_true")
+  parser.add_argument("--render", action="store_true")
+  args = parser.parse_args()
+
   print("=" * 60)
   print("TinyPhysics 2.2: The Heavy Top")
   print("=" * 60)
@@ -439,9 +302,16 @@ if __name__ == "__main__":
     theta0=np.pi/6,       # 30 degrees tilt
     I1=1.0, I2=1.0, I3=0.5,
     mgl=1.0,
-    dt=0.01,
-    steps=100,
-    method="rk4"
+    dt=args.dt,
+    steps=args.steps,
+    method=args.method,
+    batch_size=args.batch,
+    unroll_steps=args.unroll,
+    scan=args.scan,
+    auto_unroll=args.auto_unroll,
+    viewer_batch=args.viewer_batch,
+    benchmark=args.benchmark,
+    render=args.render,
   )
 
   diag = results['diagnostics']

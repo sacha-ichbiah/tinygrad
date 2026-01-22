@@ -293,7 +293,8 @@ def do_linearize(prg:UOp, sink:UOp) -> UOp:
   if SPEC:
     has_vec0 = any(u.op is Ops.VECTORIZE and u.dtype == dtypes.index.vec(0) for u in lst)
     has_sin = any(u.op is Ops.SIN for u in sink.toposort())
-    if not has_sin and not has_vec0:
+    has_shrink = any(u.op is Ops.SHRINK for u in sink.toposort())
+    if not has_sin and not has_vec0 and not has_shrink:
       type_verify(lst, program_spec)
   return prg.replace(src=prg.src + (UOp(Ops.LINEAR, src=tuple(lst)),))
 

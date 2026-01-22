@@ -210,6 +210,7 @@ if __name__ == "__main__":
   dt = _parse_float_flag(args, "dt", 0.01)
   unroll = _parse_int_flag(args, "unroll", 1)
   implicit_iters = _parse_int_flag(args, "implicit-iters", 0)
+  implicit_vec = _parse_int_flag(args, "implicit-vec", 0)
   jit = "--jit" in args
   report_energy = _parse_bool_flag(args, "energy-drift")
   if fast:
@@ -217,6 +218,10 @@ if __name__ == "__main__":
     if unroll == 1:
       unroll = 4
     report_energy = True
+  if integrator == "implicit" and not (buffered or functional or mixed):
+    buffered = True
+    if unroll == 1:
+      unroll = 4
   if integrator == "implicit":
     if sweep_iters:
       it_min, it_max = (2, 10)
@@ -236,6 +241,9 @@ if __name__ == "__main__":
     if implicit_iters > 0:
       import os
       os.environ["TINYGRAD_IMPLICIT_ITERS"] = str(implicit_iters)
+    if implicit_vec > 0:
+      import os
+      os.environ["TINYGRAD_IMPLICIT_VEC"] = str(implicit_vec)
   benchmark(integrator=integrator, steps=steps, repeats=repeats, dt=dt, jit=jit,
             unroll=unroll, implicit_iters=implicit_iters, report_energy=report_energy,
             buffered=buffered, functional=functional, mixed=mixed)

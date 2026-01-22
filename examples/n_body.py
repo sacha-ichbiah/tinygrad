@@ -12,10 +12,12 @@ This demonstrates the "compiler" + "broadcast" primitives from the roadmap.
 """
 
 import numpy as np
+from tinygrad import TinyJit
 from tinygrad.tensor import Tensor
 from tinygrad.physics import HamiltonianSystem
 import json
 import os
+import time
 
 
 # ============================================================================
@@ -38,13 +40,16 @@ def nbody_hamiltonian(masses: np.ndarray, G: float = 1.0, softening: float = 0.0
     Autograd then derives all N² forces automatically!
     """
     N = len(masses)
-    m = Tensor(masses.reshape(N, 1))  # (N, 1) for broadcasting
+    m = Tensor(masses)  # (N,)
+    m_i = m.reshape(N, 1)
+    m_j = m.reshape(1, N)
+    mass_prod = m_i * m_j
     eps_sq = softening ** 2
 
     def H(q, p):
         # Kinetic energy: T = Sum_i |p_i|²/(2*m_i)
         # p shape: (N, D), m shape: (N, 1)
-        T = ((p * p).sum(axis=1) / (2 * m.squeeze())).sum()
+        T = ((p * p).sum(axis=1) / (2 * m)).sum()
 
         # Potential energy using BROADCASTING
         # q shape: (N, D)
@@ -61,10 +66,6 @@ def nbody_hamiltonian(masses: np.ndarray, G: float = 1.0, softening: float = 0.0
         inv_dist = dist_sq.rsqrt()
 
         # Mass product matrix: m_i * m_j, shape (N, N)
-        m_i = Tensor(masses.reshape(N, 1))  # (N, 1)
-        m_j = Tensor(masses.reshape(1, N))  # (1, N)
-        mass_prod = m_i * m_j
-
         # Potential: V = -0.5 * G * Sum_{i,j} m_i * m_j / |r_ij|
         # Factor 0.5 because we sum over all pairs twice (i,j) and (j,i)
         # Note: diagonal (i=i) gives -G*m_i²/eps which is constant, doesn't affect dynamics
@@ -79,7 +80,9 @@ def nbody_hamiltonian(masses: np.ndarray, G: float = 1.0, softening: float = 0.0
 # SIMULATION
 # ============================================================================
 
-def run_simulation(N=5, integrator="leapfrog", dt=0.001, steps=2000, config="random"):
+def run_simulation(N=5, integrator="leapfrog", dt=0.001, steps=10000, config="random",
+                   use_scan=True, unroll_steps=4, scan_tune=False, record_every=10,
+                   render=False, diagnostics=False, fast_force=True):
     """
     Simulate N-body gravitational dynamics.
 
@@ -114,8 +117,8 @@ def run_simulation(N=5, integrator="leapfrog", dt=0.001, steps=2000, config="ran
             [0.0, -np.sqrt(G * masses[0] / 2.0) * masses[3]],
         ], dtype=np.float32)
 
-    q = Tensor(q_init)
-    p = Tensor(p_init)
+    q = Tensor(q_init, requires_grad=False)
+    p = Tensor(p_init, requires_grad=False)
 
     print("=" * 60)
     print(f"N-BODY GRAVITY - TinyPhysics Compiler Approach (N={N})")
@@ -123,7 +126,10 @@ def run_simulation(N=5, integrator="leapfrog", dt=0.001, steps=2000, config="ran
     print(f"\nPhysics defined by Hamiltonian ONLY:")
     print(f"  H = Sum_i |p_i|²/2m_i - Sum_{{i<j}} G*m_i*m_j/|r_ij|")
     print(f"\nBROADCAST computes all {N}² pairwise interactions.")
-    print(f"AUTOGRAD derives all {N}² forces automatically!")
+    if fast_force and integrator == "leapfrog":
+        print(f"FAST FORCE path: direct gravity forces (no autograd).")
+    else:
+        print(f"AUTOGRAD derives all {N}² forces automatically!")
     print(f"\nIntegrator: {integrator}")
     print(f"Config: {config}, dt={dt}, steps={steps}")
 
@@ -132,29 +138,83 @@ def run_simulation(N=5, integrator="leapfrog", dt=0.001, steps=2000, config="ran
     system = HamiltonianSystem(H, integrator=integrator)
 
     # Initial energy and momentum
-    E_start = system.energy(q, p)
-    P_start = p.numpy().sum(axis=0)
-
-    print(f"\nInitial Energy: {E_start:.6f}")
-    print(f"Initial Momentum: [{P_start[0]:.6f}, {P_start[1]:.6f}]")
+    if diagnostics:
+        E_start = system.energy(q, p)
+        P_start = p.numpy().sum(axis=0)
+        print(f"\nInitial Energy: {E_start:.6f}")
+        print(f"Initial Momentum: [{P_start[0]:.6f}, {P_start[1]:.6f}]")
 
     # EVOLVE
-    q, p, history = system.evolve(q, p, dt=dt, steps=steps, record_every=2)
+    start_time = time.perf_counter()
+    history = None
+    if fast_force and integrator == "leapfrog":
+        m = Tensor(masses)
+        m_i = m.reshape(N, 1, 1)
+        m_j = m.reshape(1, N, 1)
+        eps_sq = 0.01 * 0.01
+        def forces(q_in: Tensor) -> Tensor:
+            diff = q_in.unsqueeze(1) - q_in.unsqueeze(0)
+            dist_sq = (diff * diff).sum(axis=2) + eps_sq
+            inv_dist3 = dist_sq.rsqrt() / dist_sq
+            return (-G * m_i * (m_j * diff * inv_dist3.unsqueeze(2)).sum(axis=1))
+        def step(q_in: Tensor, p_in: Tensor):
+            f = forces(q_in)
+            p_half = p_in + (0.5 * dt) * f
+            q_new = q_in + dt * (p_half / m.reshape(N, 1))
+            f_new = forces(q_new)
+            p_new = p_half + (0.5 * dt) * f_new
+            return q_new, p_new
+        step_jit = TinyJit(step)
+        if steps % unroll_steps != 0:
+            raise ValueError("steps must be divisible by unroll_steps")
+        if render:
+            history = []
+        step_count = 0
+        for _ in range(steps // unroll_steps):
+            for _ in range(unroll_steps):
+                q, p = step_jit(q, p)
+                if render and (step_count % record_every == 0):
+                    history.append((q.numpy().copy(), p.numpy().copy(), step_count * dt))
+                step_count += 1
+        if render and not history:
+            history = [(q.numpy().copy(), p.numpy().copy(), steps * dt)]
+        else:
+            q.numpy()
+            p.numpy()
+    elif use_scan and integrator == "leapfrog":
+        if steps % unroll_steps != 0:
+            raise ValueError("steps must be divisible by unroll_steps for scan")
+        try:
+            q, p, history = system.evolve_scan_kernel(
+                q, p, dt=dt, steps=steps, coupled=True, coupled_fused=True,
+                unroll_steps=unroll_steps, scan_tune=scan_tune,
+            )
+        except Exception as e:
+            print(f"Scan kernel failed ({e}); falling back to evolve.")
+            history = None
+    if history is None:
+        q, p, history = system.evolve(q, p, dt=dt, steps=steps, record_every=record_every)
+    elapsed = time.perf_counter() - start_time
+    steps_s = steps / elapsed if elapsed > 0 else float("inf")
+    print(f"Performance: {steps_s:,.1f} steps/s")
 
     # Final state
-    E_end = system.energy(q, p)
-    P_end = p.numpy().sum(axis=0)
-    E_drift = abs(E_end - E_start) / abs(E_start)
-
-    print(f"\nFinal Energy:   {E_end:.6f}")
-    print(f"Final Momentum: [{P_end[0]:.6f}, {P_end[1]:.6f}]")
-    print(f"Energy Drift:   {E_drift:.2e}")
+    if diagnostics:
+        E_end = system.energy(q, p)
+        P_end = p.numpy().sum(axis=0)
+        E_drift = abs(E_end - E_start) / abs(E_start)
+        print(f"\nFinal Energy:   {E_end:.6f}")
+        print(f"Final Momentum: [{P_end[0]:.6f}, {P_end[1]:.6f}]")
+        print(f"Energy Drift:   {E_drift:.2e}")
 
     # Generate viewer
-    history_q = [h[0].tolist() for h in history]
-    generate_viewer(history_q, N, masses)
+    if render:
+        history_q = [h[0].tolist() for h in history]
+        generate_viewer(history_q, N, masses)
 
-    return E_start, E_end, E_drift
+    if diagnostics:
+        return E_start, E_end, E_drift
+    return None, None, None
 
 
 def generate_viewer(history_q, N, masses):
@@ -186,6 +246,13 @@ def generate_viewer(history_q, N, masses):
             max-width: 500px;
         }}
         code {{ color: #4f4; }}
+        .controls {{
+            display: flex;
+            gap: 16px;
+            align-items: center;
+            margin: 10px;
+        }}
+        input[type="range"] {{ width: 220px; }}
     </style>
 </head>
 <body>
@@ -195,6 +262,10 @@ def generate_viewer(history_q, N, masses):
         <code>H = T - G*Sum m_i*m_j/|r_ij|</code>
         <p>Broadcasting handles O(N²) interactions.</p>
         <p>Autograd derives all forces!</p>
+    </div>
+    <div class="controls">
+        <label>Speed: <span id="speedLabel">1.0×</span></label>
+        <input id="speedSlider" type="range" min="0.25" max="8" step="0.25" value="1">
     </div>
     <canvas id="simCanvas" width="800" height="600"></canvas>
     <script>
@@ -210,12 +281,19 @@ def generate_viewer(history_q, N, masses):
         const colors = ['#ffcc00', '#00ccff', '#ff6666', '#66ff66', '#ff66ff', '#66ffff'];
 
         let frame = 0;
+        let speed = 1.0;
+        const speedSlider = document.getElementById('speedSlider');
+        const speedLabel = document.getElementById('speedLabel');
+        speedSlider.addEventListener('input', (e) => {{
+            speed = parseFloat(e.target.value);
+            speedLabel.textContent = `${{speed.toFixed(2)}}×`;
+        }});
 
         function draw() {{
             ctx.fillStyle = 'rgba(0, 0, 0, 0.1)';
             ctx.fillRect(0, 0, width, height);
 
-            const positions = history[frame];
+            const positions = history[Math.floor(frame)];
 
             for (let i = 0; i < N; i++) {{
                 const x = positions[i][0] * scale + width/2;
@@ -227,7 +305,8 @@ def generate_viewer(history_q, N, masses):
                 ctx.fill();
             }}
 
-            frame = (frame + 1) % history.length;
+            frame += speed;
+            if (frame >= history.length) frame = frame % history.length;
             requestAnimationFrame(draw);
         }}
 
@@ -261,4 +340,4 @@ if __name__ == "__main__":
     elif len(sys.argv) > 1 and sys.argv[1] == "--compare":
         compare_configs()
     else:
-        run_simulation(N=5, config="random", dt=0.001, steps=2000)
+        run_simulation(N=5, config="random", dt=0.001, steps=10000)
