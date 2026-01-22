@@ -48,10 +48,12 @@ def main():
   parser.add_argument("--rigid-unroll", type=int, default=8)
   parser.add_argument("--heavy-unroll", type=int, default=8)
   parser.add_argument("--sat-unroll", type=int, default=10)
-  parser.add_argument("--scan", action="store_true")
+  parser.add_argument("--scan", action="store_true", default=True)
+  parser.add_argument("--no-scan", action="store_false", dest="scan")
+  parser.add_argument("--profile", type=str, default=os.getenv("TINYGRAD_PHYSICS_PROFILE", "balanced"))
   args = parser.parse_args()
 
-  run_rigid(batch_size=args.batch, steps=args.rigid_steps, unroll_steps=args.rigid_unroll, scan=args.scan, viewer_batch=args.viewer_batch)
+  run_rigid(batch_size=args.batch, steps=args.rigid_steps, unroll_steps=args.rigid_unroll, scan=args.scan, viewer_batch=args.viewer_batch, profile=args.profile)
   simulate_heavy_top(
     L0=[0.1, 0.0, 5.0],
     theta0=3.141592653589793/6,
@@ -63,8 +65,9 @@ def main():
     scan=args.scan,
     viewer_batch=args.viewer_batch,
     render=True,
+    profile=args.profile,
   )
-  run_sat(steps=args.sat_steps, unroll_steps=args.sat_unroll, batch_size=args.batch, scan=args.scan, viewer_batch=args.viewer_batch)
+  run_sat(steps=args.sat_steps, unroll_steps=args.sat_unroll, batch_size=args.batch, scan=args.scan, viewer_batch=args.viewer_batch, profile=args.profile)
   write_combined_viewer()
 
 

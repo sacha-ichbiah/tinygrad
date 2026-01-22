@@ -40,13 +40,12 @@ def nbody_hamiltonian(masses: np.ndarray, G: float = 1.0, softening: float = 0.0
     Autograd then derives all N² forces automatically!
     """
     N = len(masses)
-    m = Tensor(masses)  # (N,)
-    m_i = m.reshape(N, 1)
-    m_j = m.reshape(1, N)
-    mass_prod = m_i * m_j
-    eps_sq = softening ** 2
-
     def H(q, p):
+        m = Tensor(masses, device=q.device)  # (N,)
+        m_i = m.reshape(N, 1)
+        m_j = m.reshape(1, N)
+        mass_prod = m_i * m_j
+        eps_sq = softening ** 2
         # Kinetic energy: T = Sum_i |p_i|²/(2*m_i)
         # p shape: (N, D), m shape: (N, 1)
         T = ((p * p).sum(axis=1) / (2 * m)).sum()
@@ -82,7 +81,7 @@ def nbody_hamiltonian(masses: np.ndarray, G: float = 1.0, softening: float = 0.0
 
 def run_simulation(N=5, integrator="leapfrog", dt=0.001, steps=10000, config="random",
                    use_scan=True, unroll_steps=4, scan_tune=False, record_every=10,
-                   render=False, diagnostics=False, fast_force=True):
+                   render=False, diagnostics=False):
     """
     Simulate N-body gravitational dynamics.
 
@@ -126,10 +125,7 @@ def run_simulation(N=5, integrator="leapfrog", dt=0.001, steps=10000, config="ra
     print(f"\nPhysics defined by Hamiltonian ONLY:")
     print(f"  H = Sum_i |p_i|²/2m_i - Sum_{{i<j}} G*m_i*m_j/|r_ij|")
     print(f"\nBROADCAST computes all {N}² pairwise interactions.")
-    if fast_force and integrator == "leapfrog":
-        print(f"FAST FORCE path: direct gravity forces (no autograd).")
-    else:
-        print(f"AUTOGRAD derives all {N}² forces automatically!")
+    print(f"AUTOGRAD derives all {N}² forces automatically!")
     print(f"\nIntegrator: {integrator}")
     print(f"Config: {config}, dt={dt}, steps={steps}")
 
@@ -147,53 +143,26 @@ def run_simulation(N=5, integrator="leapfrog", dt=0.001, steps=10000, config="ra
     # EVOLVE
     start_time = time.perf_counter()
     history = None
-    if fast_force and integrator == "leapfrog":
-        m = Tensor(masses)
-        m_i = m.reshape(N, 1, 1)
-        m_j = m.reshape(1, N, 1)
-        eps_sq = 0.01 * 0.01
-        def forces(q_in: Tensor) -> Tensor:
-            diff = q_in.unsqueeze(1) - q_in.unsqueeze(0)
-            dist_sq = (diff * diff).sum(axis=2) + eps_sq
-            inv_dist3 = dist_sq.rsqrt() / dist_sq
-            return (-G * m_i * (m_j * diff * inv_dist3.unsqueeze(2)).sum(axis=1))
-        def step(q_in: Tensor, p_in: Tensor):
-            f = forces(q_in)
-            p_half = p_in + (0.5 * dt) * f
-            q_new = q_in + dt * (p_half / m.reshape(N, 1))
-            f_new = forces(q_new)
-            p_new = p_half + (0.5 * dt) * f_new
-            return q_new, p_new
-        step_jit = TinyJit(step)
-        if steps % unroll_steps != 0:
-            raise ValueError("steps must be divisible by unroll_steps")
-        if render:
-            history = []
-        step_count = 0
-        for _ in range(steps // unroll_steps):
-            for _ in range(unroll_steps):
-                q, p = step_jit(q, p)
-                if render and (step_count % record_every == 0):
-                    history.append((q.numpy().copy(), p.numpy().copy(), step_count * dt))
-                step_count += 1
-        if render and not history:
-            history = [(q.numpy().copy(), p.numpy().copy(), steps * dt)]
-        else:
-            q.numpy()
-            p.numpy()
-    elif use_scan and integrator == "leapfrog":
-        if steps % unroll_steps != 0:
-            raise ValueError("steps must be divisible by unroll_steps for scan")
-        try:
-            q, p, history = system.evolve_scan_kernel(
-                q, p, dt=dt, steps=steps, coupled=True, coupled_fused=True,
-                unroll_steps=unroll_steps, scan_tune=scan_tune,
-            )
-        except Exception as e:
-            print(f"Scan kernel failed ({e}); falling back to evolve.")
-            history = None
-    if history is None:
-        q, p, history = system.evolve(q, p, dt=dt, steps=steps, record_every=record_every)
+    try:
+        if use_scan and integrator == "leapfrog":
+            if steps % unroll_steps != 0:
+                raise ValueError("steps must be divisible by unroll_steps for scan")
+            try:
+                q, p, history = system.evolve_scan_kernel(
+                    q, p, dt=dt, steps=steps, coupled=True, coupled_fused=True,
+                    unroll_steps=unroll_steps, scan_tune=scan_tune,
+                )
+            except Exception as e:
+                print(f"Scan kernel failed ({e}); falling back to evolve.")
+                history = None
+        if history is None:
+            q, p, history = system.evolve(q, p, dt=dt, steps=steps, record_every=record_every)
+    except Exception as e:
+        print(f"Compiler failed ({e}); retrying on PYTHON backend.")
+        q = Tensor(q_init, requires_grad=False, device="PYTHON")
+        p = Tensor(p_init, requires_grad=False, device="PYTHON")
+        system = HamiltonianSystem(H, integrator=integrator)
+        q, p, history = system.evolve(q, p, dt=dt, steps=steps, record_every=record_every, scan=False, unroll=None)
     elapsed = time.perf_counter() - start_time
     steps_s = steps / elapsed if elapsed > 0 else float("inf")
     print(f"Performance: {steps_s:,.1f} steps/s")

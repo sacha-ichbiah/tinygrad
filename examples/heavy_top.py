@@ -21,6 +21,7 @@ from tinygrad import TinyJit, Tensor, dtypes
 from tinygrad.physics import HeavyTopHamiltonian, HeavyTopIntegrator, ProductManifold
 import argparse
 import time
+from tinygrad.physics_profile import get_profile
 import numpy as np
 import json
 import os
@@ -28,27 +29,6 @@ import os
 # ============================================================================
 # SIMULATION RUNNER
 # ============================================================================
-
-def _auto_unroll(candidates: list[int], steps: int, make_state, step_factory) -> int:
-  best = None
-  best_t = None
-  trial_steps = min(steps, 2000)
-  for unroll in candidates:
-    if steps % unroll != 0: continue
-    L, gamma = make_state()
-    step = step_factory(unroll)
-    for _ in range(3):
-      L, gamma = step(L, gamma)
-    t0 = time.perf_counter()
-    for _ in range(trial_steps // unroll):
-      L, gamma = step(L, gamma)
-    L.numpy(); gamma.numpy()
-    t1 = time.perf_counter()
-    if best_t is None or t1 - t0 < best_t:
-      best_t = t1 - t0
-      best = unroll
-  return best if best is not None else candidates[0]
-
 
 def simulate_heavy_top(
     L0: list[float],
@@ -63,11 +43,13 @@ def simulate_heavy_top(
     method: str = "splitting",
     batch_size: int = 1,
     unroll_steps: int = 8,
-    scan: bool = False,
-    auto_unroll: bool = False,
+    scan: bool = True,
+    auto_unroll: bool = True,
     viewer_batch: int = 4,
     benchmark: bool = False,
     render: bool = False,
+    profile: str = "balanced",
+    report_policy: bool = False,
 ) -> dict:
   """
   Simulate the Heavy Top and track conservation laws.
@@ -91,8 +73,9 @@ def simulate_heavy_top(
     L = L.reshape(1, 3).expand(batch_size, 3).contiguous()
   state = ProductManifold.from_euler_angles(L, theta0, phi0)
   gamma = state.gamma
+  policy = get_profile(profile).policy
   H = HeavyTopHamiltonian(I1, I2, I3, mgl, dtype=dtypes.float64)
-  integrator = HeavyTopIntegrator(H, dt)
+  integrator = HeavyTopIntegrator(H, dt, policy=policy)
   unroll_steps = unroll_steps
 
   # Storage
@@ -117,15 +100,14 @@ def simulate_heavy_top(
     step_fn = integrator.step_explicit_tensors
   if auto_unroll:
     candidates = [2, 4, 8, 16]
-    def make_state():
-      L0_tensor = Tensor(L0, dtype=dtypes.float64)
-      if batch_size > 1:
-        L0_tensor = L0_tensor.reshape(1, 3).expand(batch_size, 3).contiguous()
-      g0 = ProductManifold.from_euler_angles(L0_tensor, theta0, phi0).gamma
-      return L0_tensor, g0
     def step_factory(unroll):
-      return integrator.compile_unrolled_step(unroll, method=method)
-    unroll_steps = _auto_unroll(candidates, steps, make_state, step_factory)
+      step = integrator.compile_unrolled_step(unroll, method=method)
+      def run_steps():
+        nonlocal L, gamma
+        for _ in range(3):
+          L, gamma = step(L, gamma)
+      return run_steps
+    unroll_steps = policy.choose_unroll(steps, L.shape, L.device, candidates=candidates, step_factory=step_factory)
   if steps % unroll_steps != 0:
     raise ValueError("steps must be divisible by unroll_steps")
   def step_unrolled(L_in: Tensor, gamma_in: Tensor):
@@ -140,7 +122,7 @@ def simulate_heavy_top(
   if scan:
     if sample_interval % unroll_steps != 0:
       sample_interval = unroll_steps
-    L, gamma, hist_t = integrator.evolve_unrolled(L, gamma, steps, unroll_steps, method=method, record_every=sample_interval)
+    L, gamma, hist_t = integrator.evolve(L, gamma, steps, method=method, record_every=sample_interval, scan=True, unroll=unroll_steps, policy=policy)
     for idx, (L_t, g_t) in enumerate(hist_t):
       L_sample = L_t[:viewer_batch] if L_t.ndim > 1 else L_t
       g_sample = g_t[:viewer_batch] if g_t.ndim > 1 else g_t
@@ -185,6 +167,10 @@ def simulate_heavy_top(
     elapsed = time.perf_counter() - start_time
     steps_s = steps / elapsed if elapsed > 0 else float("inf")
     print(f"Performance: {steps_s:,.1f} steps/s")
+  if report_policy:
+    report = policy.report(steps, L.shape, L.device)
+    if report is not None:
+      print(f"Policy: {report}")
 
   # Final conservation check
   L_sample = L[0] if L.ndim > 1 else L
@@ -275,11 +261,15 @@ if __name__ == "__main__":
   parser.add_argument("--dt", type=float, default=0.002)
   parser.add_argument("--method", type=str, default="splitting")
   parser.add_argument("--unroll", type=int, default=8)
-  parser.add_argument("--scan", action="store_true")
-  parser.add_argument("--auto-unroll", action="store_true")
+  parser.add_argument("--scan", action="store_true", default=True)
+  parser.add_argument("--no-scan", action="store_false", dest="scan")
+  parser.add_argument("--auto-unroll", action="store_true", default=True)
+  parser.add_argument("--no-auto-unroll", action="store_false", dest="auto_unroll")
   parser.add_argument("--viewer-batch", type=int, default=4)
+  parser.add_argument("--profile", type=str, default=os.getenv("TINYGRAD_PHYSICS_PROFILE", "balanced"))
   parser.add_argument("--benchmark", action="store_true")
   parser.add_argument("--render", action="store_true")
+  parser.add_argument("--policy-report", action="store_true")
   args = parser.parse_args()
 
   print("=" * 60)
@@ -312,6 +302,8 @@ if __name__ == "__main__":
     viewer_batch=args.viewer_batch,
     benchmark=args.benchmark,
     render=args.render,
+    profile=args.profile,
+    report_policy=args.policy_report,
   )
 
   diag = results['diagnostics']

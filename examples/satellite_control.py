@@ -1,35 +1,18 @@
 import argparse
+import time
+from tinygrad.physics_profile import get_profile
 import numpy as np
 from tinygrad import TinyJit
 from tinygrad.tensor import Tensor
 from tinygrad.physics import ControlInput, SatelliteControlIntegrator
+from tinygrad.helpers import getenv
 import json
 import os
 
-def _auto_unroll(candidates: list[int], steps: int, make_state, step_factory) -> int:
-    best = None
-    best_t = None
-    trial_steps = min(steps, 2000)
-    for unroll in candidates:
-        if steps % unroll != 0: continue
-        L, q = make_state()
-        step = step_factory(unroll)
-        for _ in range(3):
-            L, q = step(L, q)
-        t0 = time.perf_counter()
-        for _ in range(trial_steps // unroll):
-            L, q = step(L, q)
-        L.numpy(); q.numpy()
-        t1 = time.perf_counter()
-        if best_t is None or t1 - t0 < best_t:
-            best_t = t1 - t0
-            best = unroll
-    return best if best is not None else candidates[0]
-
-
 def run_simulation(steps: int = 1500, dt: float = 0.01, unroll_steps: int = 10,
-                   batch_size: int = 1, auto_unroll: bool = False, scan: bool = False,
-                   viewer_batch: int = 4, benchmark: bool = False):
+                   batch_size: int = 1, auto_unroll: bool = True, scan: bool = True,
+                   viewer_batch: int = 4, benchmark: bool = False, profile: str = "balanced",
+                   report_policy: bool = False):
     # Satellite Parameters
     # Asymmetric Body
     I = Tensor([1.0, 2.0, 3.0])
@@ -65,24 +48,23 @@ def run_simulation(steps: int = 1500, dt: float = 0.01, unroll_steps: int = 10,
     print(f"Target: Untumble and Lock to Identity Quaternion")
     
     history_q = []
+    policy = get_profile(profile).policy
     control = ControlInput(lambda q_err, omega: -Kp * q_err[..., 1:] - Kd * omega)
-    integrator = SatelliteControlIntegrator(I_inv, control, dt)
+    integrator = SatelliteControlIntegrator(I_inv, control, dt, policy=policy)
 
     def step(L_val: Tensor, quat_val: Tensor):
         return integrator.step(L_val, quat_val)
 
     if auto_unroll:
         candidates = [5, 10, 20]
-        def make_state():
-            L0 = Tensor(L_init, requires_grad=False)
-            q0 = Tensor(quat_init, requires_grad=False)
-            if batch_size > 1:
-                L0 = L0.reshape(1, 3).expand(batch_size, 3).contiguous()
-                q0 = q0.reshape(1, 4).expand(batch_size, 4).contiguous()
-            return L0, q0
         def step_factory(unroll):
-            return integrator.compile_unrolled_step(unroll)
-        unroll_steps = _auto_unroll(candidates, steps, make_state, step_factory)
+            step = integrator.compile_unrolled_step(unroll)
+            def run_steps():
+                nonlocal L, quat
+                for _ in range(3):
+                    L, quat = step(L, quat)
+            return run_steps
+        unroll_steps = policy.choose_unroll(steps, L.shape, L.device, candidates=candidates, step_factory=step_factory)
     if steps % unroll_steps != 0:
         raise ValueError("steps must be divisible by unroll_steps")
     start_time = time.perf_counter() if benchmark else None
@@ -135,6 +117,19 @@ def run_simulation(steps: int = 1500, dt: float = 0.01, unroll_steps: int = 10,
         elapsed = time.perf_counter() - start_time
         steps_s = steps / elapsed if elapsed > 0 else float("inf")
         print(f"Performance: {steps_s:,.1f} steps/s")
+    if report_policy:
+        report = policy.report(steps, L.shape, L.device)
+        if report is not None:
+            print(f"Policy: {report}")
+
+    if getenv("TINYGRAD_PHYSICS_REPORT", 0) and "ohm_mag" in locals():
+        report = {
+            "final_omega": float(ohm_mag),
+            "alignment_error": float(err_align),
+            "steps": steps,
+            "dt": dt,
+        }
+        print(f"Control report: {report}")
 
     generate_viewer(history_q)
 
@@ -274,10 +269,14 @@ if __name__ == "__main__":
     parser.add_argument("--steps", type=int, default=1500)
     parser.add_argument("--dt", type=float, default=0.01)
     parser.add_argument("--unroll", type=int, default=10)
-    parser.add_argument("--auto-unroll", action="store_true")
-    parser.add_argument("--scan", action="store_true")
+    parser.add_argument("--auto-unroll", action="store_true", default=True)
+    parser.add_argument("--no-auto-unroll", action="store_false", dest="auto_unroll")
+    parser.add_argument("--scan", action="store_true", default=True)
+    parser.add_argument("--no-scan", action="store_false", dest="scan")
     parser.add_argument("--viewer-batch", type=int, default=4)
+    parser.add_argument("--profile", type=str, default=os.getenv("TINYGRAD_PHYSICS_PROFILE", "balanced"))
     parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("--policy-report", action="store_true")
     args = parser.parse_args()
     run_simulation(
         steps=args.steps,
@@ -288,4 +287,6 @@ if __name__ == "__main__":
         scan=args.scan,
         viewer_batch=args.viewer_batch,
         benchmark=args.benchmark,
+        profile=args.profile,
+        report_policy=args.policy_report,
     )

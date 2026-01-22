@@ -21,6 +21,8 @@ def linearize(sink:UOp) -> list[UOp]:
 
     # we place UOps with higher run_counts later
     run_count = prod([int(r.vmax)+1 for r in u.ranges])
+    if u.op is Ops.RANGE and u.arg[-1] == AxisType.REDUCE:
+      run_count = 1 << 60
 
     # simple priority override. this is all bottom up now, smaller numbers will be closer to the top
     extra = None
@@ -54,7 +56,24 @@ def linearize(sink:UOp) -> list[UOp]:
   if getenv("DEBUG_LINEARIZE"):
     for i,u in enumerate(newlst):
       print(f"{i:4d} {str(u.op):20s} {multirange_str(u.ranges, color=True, pad=10)} {priorities[u]}")
-  return newlst
+  return _delay_reduce_ranges(newlst)
+
+def _delay_reduce_ranges(uops:list[UOp]) -> list[UOp]:
+  # move reduce ranges as late as possible (right before first dependent op)
+  reduce_ranges = [u for u in uops if u.op is Ops.RANGE and u.arg[-1] == AxisType.REDUCE]
+  for r in reduce_ranges:
+    idx = {u:i for i,u in enumerate(uops)}
+    start = idx[r]
+    first = None
+    for i in range(start+1, len(uops)):
+      if r in uops[i].ranges:
+        first = i
+        break
+    if first is None or first == start+1: continue
+    uops.pop(start)
+    if first > start: first -= 1
+    uops.insert(first, r)
+  return uops
 
 class CFGContext:
   def __init__(self, sink:UOp):
@@ -83,10 +102,11 @@ class CFGContext:
       zipped = zip(order, order[1:]) if k.op is Ops.SINK else zip([k.src[1]] + order, order)
       for x,y in zipped:
         # TODO: this can happen! it causes infinite loop in shufflenet
-        if x.op is Ops.RANGE and x.arg[-1] == AxisType.REDUCE: continue
+        # preserve nesting order for reduce ranges too
         if len(y.src) < 2 or len(x.src) < 2: continue
         assert y.src[1] not in x.backward_slice_with_self
         self.edges[y.src[1]] = x
+
 
 pm_add_control_flow = PatternMatcher([
   (UPat(Ops.RANGE, name="x"), lambda ctx,x: x.replace(src=x.src+(y,)) if (y:=ctx.edges.get(x)) is not None else None),

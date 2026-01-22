@@ -19,6 +19,7 @@ Conservation laws:
 """
 import argparse
 import time
+from tinygrad.physics_profile import get_profile
 import numpy as np
 from tinygrad import TinyJit
 from tinygrad.tensor import Tensor
@@ -27,37 +28,18 @@ import json
 import os
 
 
-def _auto_unroll(candidates: list[int], steps: int, make_state, step_factory) -> int:
-    best = None
-    best_t = None
-    trial_steps = min(steps, 2000)
-    for unroll in candidates:
-        if steps % unroll != 0: continue
-        L, q = make_state()
-        step = step_factory(unroll)
-        for _ in range(3):
-            L, q = step(L, q)
-        t0 = time.perf_counter()
-        for _ in range(trial_steps // unroll):
-            L, q = step(L, q)
-        L.numpy(); q.numpy()
-        t1 = time.perf_counter()
-        if best_t is None or t1 - t0 < best_t:
-            best_t = t1 - t0
-            best = unroll
-    return best if best is not None else candidates[0]
-
-
 def run_simulation(batch_size: int = 1, steps: int = 2000, dt: float = 0.01,
-                   unroll_steps: int = 8, scan: bool = False, auto_unroll: bool = False,
-                   viewer_batch: int = 4, benchmark: bool = False):
+                   unroll_steps: int = 8, scan: bool = True, auto_unroll: bool = True,
+                   viewer_batch: int = 4, benchmark: bool = False, profile: str = "balanced",
+                   report_policy: bool = False):
     # Principal moments of inertia: I1 < I2 < I3
     # Intermediate axis (I2) is unstable - the Tennis Racket Theorem!
     I = Tensor([1.0, 2.0, 3.0])
 
     # Create the rigid body system using the tiny physics approach
     # The Hamiltonian H(L) = 0.5 * L · (I⁻¹ L) is defined internally
-    system = RigidBodySystem(I, integrator="midpoint")
+    policy = get_profile(profile).policy
+    system = RigidBodySystem(I, integrator="midpoint", policy=policy)
 
     dt = dt
     steps = steps
@@ -86,13 +68,14 @@ def run_simulation(batch_size: int = 1, steps: int = 2000, dt: float = 0.01,
     record_every = 10
     if auto_unroll:
         candidates = [2, 4, 8, 16]
-        def make_state():
-            L0 = Tensor([0.01, 2.0, 0.01]).reshape(1, 3).expand(batch_size, 3).contiguous() if batch_size > 1 else Tensor([0.01, 2.0, 0.01])
-            q0 = Tensor([1.0, 0.0, 0.0, 0.0]).reshape(1, 4).expand(batch_size, 4).contiguous() if batch_size > 1 else Tensor([1.0, 0.0, 0.0, 0.0])
-            return L0, q0
         def step_factory(unroll):
-            return system.compile_unrolled_step(dt, unroll)
-        unroll_steps = _auto_unroll(candidates, steps, make_state, step_factory)
+            step = system.compile_unrolled_step(dt, unroll)
+            def run_steps():
+                nonlocal L, q
+                for _ in range(3):
+                    L, q = step(L, q)
+            return run_steps
+        unroll_steps = policy.choose_unroll(steps, L.shape, L.device, candidates=candidates, step_factory=step_factory)
     if steps % unroll_steps != 0:
         raise ValueError("steps must be divisible by unroll_steps")
 
@@ -100,7 +83,7 @@ def run_simulation(batch_size: int = 1, steps: int = 2000, dt: float = 0.01,
     if scan:
         if record_every % unroll_steps != 0:
             record_every = unroll_steps
-        L, q, history = system.evolve_unrolled(L, q, dt, steps, unroll_steps, record_every=record_every)
+        L, q, history = system.evolve(L, q, dt, steps, record_every=record_every, scan=True, unroll=unroll_steps, policy=policy)
     else:
         def step_unrolled(L_in: Tensor, q_in: Tensor):
             for _ in range(unroll_steps):
@@ -121,6 +104,10 @@ def run_simulation(batch_size: int = 1, steps: int = 2000, dt: float = 0.01,
         elapsed = time.perf_counter() - start_time
         steps_s = steps / elapsed if elapsed > 0 else float("inf")
         print(f"Performance: {steps_s:,.1f} steps/s")
+    if report_policy:
+        report = policy.report(steps, L.shape, L.device)
+        if report is not None:
+            print(f"Policy: {report}")
 
     # Check conservation
     H_end = system.energy(L_sample)
@@ -261,10 +248,14 @@ if __name__ == "__main__":
     parser.add_argument("--steps", type=int, default=2000)
     parser.add_argument("--dt", type=float, default=0.01)
     parser.add_argument("--unroll", type=int, default=8)
-    parser.add_argument("--scan", action="store_true")
-    parser.add_argument("--auto-unroll", action="store_true")
+    parser.add_argument("--scan", action="store_true", default=True)
+    parser.add_argument("--no-scan", action="store_false", dest="scan")
+    parser.add_argument("--auto-unroll", action="store_true", default=True)
+    parser.add_argument("--no-auto-unroll", action="store_false", dest="auto_unroll")
     parser.add_argument("--viewer-batch", type=int, default=4)
+    parser.add_argument("--profile", type=str, default=os.getenv("TINYGRAD_PHYSICS_PROFILE", "balanced"))
     parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("--policy-report", action="store_true")
     args = parser.parse_args()
     run_simulation(
         batch_size=args.batch,
@@ -274,5 +265,7 @@ if __name__ == "__main__":
         scan=args.scan,
         auto_unroll=args.auto_unroll,
         viewer_batch=args.viewer_batch,
+        profile=args.profile,
         benchmark=args.benchmark,
+        report_policy=args.policy_report,
     )

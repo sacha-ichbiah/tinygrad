@@ -163,9 +163,42 @@ class CStyleLanguage(Renderer):
     self.r = r
 
     child_count = Counter(v for ru in uops for v in ru.src)
+    consumer_scopes: dict[UOp, set[tuple[UOp, ...]]] = {}
+    range_stack: list[UOp] = []
+    pending_ranges: list[UOp] = []
+    pending_ends: set[UOp] = set()
+    for u in uops:
+      if u.op in {Ops.NOOP, Ops.GROUP}: continue
+      if u.op is Ops.RANGE:
+        pending_ranges.append(u)
+        continue
+      if u.op is Ops.AFTER or u.op is Ops.SINK: continue
+      if u.op is not Ops.END and u.op is not Ops.ENDIF and pending_ranges:
+        for rng in tuple(pending_ranges):
+          if rng in u.ranges:
+            range_stack.append(rng)
+            pending_ranges.remove(rng)
+      scope_key = tuple(range_stack)
+      for s in u.src: consumer_scopes.setdefault(s, set()).add(scope_key)
+      if u.op is Ops.END and len(u.src) > 1 and u.src[1].op is Ops.RANGE:
+        r_end = u.src[1]
+        if r_end in pending_ranges:
+          pending_ranges.remove(r_end)
+          continue
+        if range_stack and range_stack[-1] is r_end:
+          range_stack.pop()
+          while range_stack and range_stack[-1] in pending_ends:
+            pending_ends.remove(range_stack[-1])
+            range_stack.pop()
+        else:
+          pending_ends.add(r_end)
+    multi_scope = {u for u, scopes in consumer_scopes.items() if len(scopes) > 1}
     bufs: dict[UOp, tuple[str, tuple[DType, bool]]] = {}
     kernel = []
     depth = 1
+    range_stack = []
+    pending_ranges = []
+    pending_ends = set()
     c: defaultdict[str, int] = defaultdict(int)
     name = "test"
     for u in uops:
@@ -196,21 +229,55 @@ class CStyleLanguage(Renderer):
                   Ops.INDEX: "bidx", Ops.DEFINE_REG: "acc", Ops.LOAD: "val"}.get(u.op, "alu")
         r[u] = f"{prefix}{c[prefix]}"
 
+      if u.op is Ops.RANGE:
+        pending_ranges.append(u)
+        continue
+
+      if u.op is not Ops.END and u.op is not Ops.ENDIF and pending_ranges:
+        for rng in tuple(pending_ranges):
+          if rng in u.ranges:
+            l_rng = cast(str, self.string_rewrite.rewrite(rng, ctx=self))
+            kernel.append("  "*depth + l_rng)
+            depth += 1
+            range_stack.append(rng)
+            pending_ranges.remove(rng)
+
       l = cast(str, self.string_rewrite.rewrite(u, ctx=self))
       assert l is not None, f"failed to render {u.op} {u.dtype} {[(x.op,x.dtype) for x in u.src]} {u.arg}"
 
-      if u.op in {Ops.ENDIF, Ops.END}: depth -= 1
-      if (u.op is not Ops.CAST or u.dtype.vcount == 1) and (u.op in {Ops.CONST, Ops.GEP, Ops.INDEX, Ops.CUSTOMI} or \
+      if u.op is Ops.END and len(u.src) > 1 and u.src[1].op is Ops.RANGE:
+        r_end = u.src[1]
+        if r_end in pending_ranges:
+          pending_ranges.remove(r_end)
+          continue
+        if range_stack and range_stack[-1] is r_end:
+          depth -= 1
+          kernel.append("  "*depth + "}")
+          range_stack.pop()
+          while range_stack and range_stack[-1] in pending_ends:
+            pending_ends.remove(range_stack[-1])
+            depth -= 1
+            kernel.append("  "*depth + "}")
+            range_stack.pop()
+        else:
+          pending_ends.add(r_end)
+        continue
+      if u.op is Ops.ENDIF: depth -= 1
+      force_inline = u in multi_scope and u.op not in {Ops.DEFINE_LOCAL, Ops.DEFINE_REG, Ops.STORE, Ops.RANGE, Ops.END,
+                                                       Ops.SPECIAL, Ops.DEFINE_GLOBAL, Ops.DEFINE_VAR, Ops.IF, Ops.ENDIF}
+      if (u.op is not Ops.CAST or u.dtype.vcount == 1) and (force_inline or u.op in {Ops.CONST, Ops.GEP, Ops.INDEX, Ops.CUSTOMI} or \
         (u.op is Ops.LOAD and u.src[0].ptrdtype.addrspace == AddrSpace.REG) or \
         (u.op is Ops.CAST and isinstance(u.dtype, PtrDType)) or \
-        (u.op in {Ops.VECTORIZE, *(GroupOp.ALU-{Ops.WHERE}), Ops.CAST, Ops.BITCAST} and child_count[u] == 1 and not getenv("EXPAND_SSA"))):
+        (u.op in {Ops.VECTORIZE, *(GroupOp.ALU-{Ops.WHERE}), Ops.CAST, Ops.BITCAST} and (force_inline or child_count[u] == 1) and
+          not getenv("EXPAND_SSA"))):
         r[u] = l
       else:
         if u.op not in {Ops.RANGE, Ops.DEFINE_LOCAL, Ops.STORE, Ops.DEFINE_REG} and u.dtype != dtypes.void:
           l = f"{self.render_dtype(u.dtype)} {r[u]} = {l}" + (";" if u.op is not Ops.SPECIAL else "")
         kernel.append("  "*depth + l)
         if prefix: c[prefix] += 1  # if it was used, increment
-      if u.op in {Ops.IF, Ops.RANGE}: depth += 1
+      if u.op is Ops.IF:
+        depth += 1
     del self.r
 
     # NOTE: this relies on bufs dict preserving order
