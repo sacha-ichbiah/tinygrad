@@ -13,7 +13,7 @@ This demonstrates the "compiler" approach - physics defined by energy alone.
 
 import numpy as np
 from tinygrad.tensor import Tensor
-from tinygrad.physics import HamiltonianSystem
+from tinygrad.physics import simulate_hamiltonian
 import json
 import os
 import time
@@ -59,9 +59,7 @@ def kepler_hamiltonian(GM: float = 1.0, m: float = 1.0, softening: float = 0.0):
 # SIMULATION
 # ============================================================================
 
-def run_simulation(integrator="leapfrog", dt=0.01, steps=5000, eccentricity=0.6,
-                   use_scan=True, use_unroll=False, unroll_steps=4,
-                   vector_width=1, scan_tune=False, render=True):
+def run_simulation(dt=0.01, steps=5000, eccentricity=0.6, render=True):
     """
     Simulate the Kepler problem using the TinyPhysics compiler approach.
 
@@ -92,17 +90,15 @@ def run_simulation(integrator="leapfrog", dt=0.01, steps=5000, eccentricity=0.6,
     print(f"\nEquations of motion derived automatically via autograd:")
     print(f"  dq/dt = +dH/dp = p/m")
     print(f"  dp/dt = -dH/dq = -GMm*r/|r|³")
-    print(f"\nIntegrator: {integrator}")
+    print(f"\nIntegrator: auto")
     print(f"Eccentricity: {e}, Semi-major axis: {a}")
     print(f"Orbital period: {T_orbital:.4f}")
     print(f"Simulation: {steps} steps, dt={dt} ({dt*steps/T_orbital:.1f} orbits)")
 
     # CREATE THE HAMILTONIAN SYSTEM - This is the "compilation" step
     H = kepler_hamiltonian(GM=GM, m=m)
-    system = HamiltonianSystem(H, integrator=integrator)
-
     # Initial energy
-    E_start = system.energy(q, p)
+    E_start = float(H(q, p).numpy())
     L_start = float((q.numpy()[0] * p.numpy()[1] - q.numpy()[1] * p.numpy()[0]))
 
     print(f"\nInitial Energy: {E_start:.6f}")
@@ -110,37 +106,13 @@ def run_simulation(integrator="leapfrog", dt=0.01, steps=5000, eccentricity=0.6,
 
     # EVOLVE THE SYSTEM
     start_time = time.perf_counter()
-    history = None
-    if use_scan and integrator == "leapfrog":
-        if steps % unroll_steps != 0:
-            raise ValueError("steps must be divisible by unroll_steps for scan")
-        try:
-            q, p, history = system.evolve_scan_kernel(
-                q, p, dt=dt, steps=steps, coupled=True, coupled_fused=True,
-                unroll_steps=unroll_steps, vector_width=vector_width, scan_tune=scan_tune,
-            )
-        except Exception as e:
-            print(f"Scan kernel failed ({e}); falling back to unrolled step.")
-            use_scan = False
-            use_unroll = True
-    if use_unroll and integrator == "leapfrog":
-        if steps % unroll_steps != 0:
-            raise ValueError("steps must be divisible by unroll_steps for unroll")
-        step = system.compile_unrolled_step(dt, unroll_steps)
-        for _ in range(steps // unroll_steps):
-            q, p = step(q, p)
-        q.numpy()
-        p.numpy()
-        history = []
-        history.append((q.numpy().copy(), p.numpy().copy(), system.energy(q, p)))
-    if history is None:
-        q, p, history = system.evolve(q, p, dt=dt, steps=steps, record_every=10)
+    q, p, history = simulate_hamiltonian(H, q, p, dt=dt, steps=steps, record_every=10)
 
     elapsed = time.perf_counter() - start_time
     steps_s = steps / elapsed if elapsed > 0 else float("inf")
 
     # Final state
-    E_end = system.energy(q, p)
+    E_end = float(H(q, p).numpy())
     q_np, p_np = q.numpy(), p.numpy()
     L_end = float(q_np[0] * p_np[1] - q_np[1] * p_np[0])
 
@@ -158,8 +130,6 @@ def run_simulation(integrator="leapfrog", dt=0.01, steps=5000, eccentricity=0.6,
         history_q = [h[0].tolist() for h in history]
         history_E = [h[2] for h in history]
         generate_viewer(history_q, a, e, history_E, E_start)
-    elif render and use_scan:
-        print("Viewer disabled for scan mode (history is too sparse).")
 
     return E_start, E_end, E_drift, L_drift
 
@@ -640,15 +610,15 @@ def compare_integrators():
     print("=" * 60)
 
     results = {}
-    for name in ["euler", "leapfrog", "yoshida4"]:
+    for name in ["auto"]:
         print(f"\n{'='*60}")
-        _, _, E_drift, L_drift = run_simulation(integrator=name, dt=0.01, steps=5000)
+        _, _, E_drift, L_drift = run_simulation(dt=0.01, steps=5000)
         results[name] = (E_drift, L_drift)
 
     print(f"\n{'='*60}")
     print("SUMMARY")
     print("="*60)
-    print(f"{'Integrator':<12} {'Energy Drift':<15} {'Ang.Mom. Drift':<15}")
+    print(f"{'Mode':<12} {'Energy Drift':<15} {'Ang.Mom. Drift':<15}")
     print("-"*42)
     for name, (e_drift, l_drift) in results.items():
         print(f"{name:<12} {e_drift:<15.2e} {l_drift:<15.2e}")
@@ -659,12 +629,5 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     if len(args) > 0 and args[0] == "--compare":
         compare_integrators()
-    elif "--fast" in args:
-        run_simulation(
-            integrator="leapfrog",
-            use_unroll=True,
-            unroll_steps=8,
-            render=False,
-        )
     else:
-        run_simulation()
+        run_simulation(render="--no-render" not in args)

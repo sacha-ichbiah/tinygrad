@@ -6,9 +6,8 @@ Comprehensive overview of integrator x JIT x unroll combinations.
 
 import json
 import time
-from tinygrad import TinyJit
 from tinygrad.tensor import Tensor
-from tinygrad.physics import HamiltonianSystem
+from tinygrad.physics import simulate_hamiltonian
 
 
 def harmonic_hamiltonian(k: float = 1.0, m: float = 1.0):
@@ -86,25 +85,11 @@ def _write_json_runs(path: str, runs: list[dict]) -> None:
     json.dump({"runs": runs}, f, indent=2)
 
 
-def _bench(system: HamiltonianSystem, steps: int, repeats: int, jit: bool, unroll: int, size: int) -> tuple[float, float]:
+def _bench(H, steps: int, repeats: int, size: int) -> tuple[float, float]:
   def run_once() -> float:
     q, p = _make_state(size)
-    if unroll > 1:
-      step = system.compile_unrolled_step(0.01, unroll)
-      q, p = step(q, p)
-      steps_per_call = unroll
-    else:
-      step = TinyJit(system.step) if jit else system.step
-      if jit:
-        q, p = step(q, p, 0.01)
-      steps_per_call = 1
-
     start = time.perf_counter()
-    for _ in range(steps // steps_per_call):
-      if unroll > 1:
-        q, p = step(q, p)
-      else:
-        q, p = step(q, p, 0.01)
+    q, p, _ = simulate_hamiltonian(H, q, p, dt=0.01, steps=steps, record_every=steps)
     q.numpy()
     p.numpy()
     return time.perf_counter() - start
@@ -125,16 +110,14 @@ def _energy_stats(history: list[tuple]) -> tuple[float, float]:
   return max_rel, rms_rel
 
 
-def _scan_energy_history(system: HamiltonianSystem, q: Tensor, p: Tensor, dt: float, steps: int, coupled: bool,
-                         vector_width: int, coupled_fused: bool) -> tuple[list[tuple], Tensor, Tensor]:
+def _scan_energy_history(H, q: Tensor, p: Tensor, dt: float, steps: int) -> tuple[list[tuple], Tensor, Tensor]:
   history = []
   q_cur, p_cur = q, p
-  e0 = system.energy(q_cur, p_cur)
+  e0 = float(H(q_cur, p_cur).numpy())
   history.append((None, None, float(e0.numpy() if hasattr(e0, "numpy") else e0)))
   for _ in range(steps):
-    q_cur, p_cur, _ = system.evolve_scan_kernel(q_cur, p_cur, dt=dt, steps=1, coupled=coupled,
-                                                unroll_steps=1, vector_width=vector_width, coupled_fused=coupled_fused)
-    e = system.energy(q_cur, p_cur)
+    q_cur, p_cur, _ = simulate_hamiltonian(H, q_cur, p_cur, dt=dt, steps=1, record_every=1)
+    e = float(H(q_cur, p_cur).numpy())
     history.append((None, None, float(e.numpy() if hasattr(e, "numpy") else e)))
   return history, q_cur, p_cur
 
@@ -143,52 +126,16 @@ def _max_abs_diff(a: Tensor, b: Tensor) -> float:
   return float((a - b).abs().max().numpy())
 
 
-def _bench_scan(system: HamiltonianSystem, steps: int, repeats: int, coupled: bool, size: int,
-                unroll_steps: int, vector_width: int, inplace: bool, coupled_fused: bool = False) -> tuple[float, float]:
-  def run_once() -> float:
-    q, p = _make_state(size)
-    start = time.perf_counter()
-    system.evolve_scan_kernel(q, p, dt=0.01, steps=steps, coupled=coupled,
-                              unroll_steps=unroll_steps, vector_width=vector_width, inplace=inplace,
-                              coupled_fused=coupled_fused)
-    return time.perf_counter() - start
-
-  times = [run_once() for _ in range(repeats)]
-  best = min(times)
-  return best, steps / best
-
-
-def _tune_scan(system: HamiltonianSystem, steps: int, repeats: int, coupled: bool, size: int,
-               unroll_opts: list[int], vec_opts: list[int], inplace: bool) -> tuple[int, int, float, float]:
-  best_unroll = unroll_opts[0]
-  best_vec = vec_opts[0]
-  best_elapsed = float("inf")
-  best_steps = 0.0
-  for u in unroll_opts:
-    if steps % u != 0:
-      continue
-    for v in vec_opts:
-      if size % v != 0:
-        continue
-      try:
-        elapsed, steps_per_s = _bench_scan(system, steps, repeats, coupled=coupled, size=size,
-                                           unroll_steps=u, vector_width=v, inplace=inplace)
-      except ValueError:
-        continue
-      if elapsed < best_elapsed:
-        best_elapsed = elapsed
-        best_steps = steps_per_s
-        best_unroll = u
-        best_vec = v
-  return best_unroll, best_vec, best_elapsed, best_steps
+def _bench_scan(H, steps: int, repeats: int, size: int) -> tuple[float, float]:
+  return _bench(H, steps, repeats, size)
 
 
 def main():
   import sys
   args = sys.argv[1:]
 
-  integrators = _parse_list_flag(args, "integrators", ["euler", "leapfrog", "yoshida4"])
-  unrolls = [int(v) for v in _parse_list_flag(args, "unrolls", ["1", "2", "4", "8", "16"])]
+  integrators = ["auto"]
+  unrolls = [1]
   steps = _parse_int_flag(args, "steps", 512)
   repeats = _parse_int_flag(args, "repeats", 3)
   size = _parse_int_flag(args, "size", 1)
@@ -202,21 +149,18 @@ def main():
   stability = "--stability" in args
   stability_steps = _parse_int_flag(args, "stability-steps", 512)
   stability_dt = _parse_float_flag(args, "stability-dt", 0.01)
-  include_jit = "--jit" in args
-  include_scan = "--scan" in args
-  include_scan_coupled = "--scan-coupled" in args
-  include_scan_coupled_fused = "--scan-coupled-fused" in args
-  include_coupled_rows = "--coupled-rows" in args
-  use_coupled_hamiltonian = "--coupled-hamiltonian" in args
+  include_jit = False
+  include_scan = False
+  include_scan_coupled = False
+  include_scan_coupled_fused = False
+  include_coupled_rows = False
+  use_coupled_hamiltonian = False
   json_path = _parse_str_flag(args, "json", None)
 
   print("=" * 72)
   print("HARMONIC OSCILLATOR BENCHMARK MATRIX (AUTOGRAD)")
   print("=" * 72)
-  print(f"steps={steps} repeats={repeats} size={size} coupled_size={coupled_size} integrators={','.join(integrators)} "
-        f"unrolls={','.join(map(str, unrolls))} jit={include_jit} scan={include_scan} scan_coupled={include_scan_coupled} "
-        f"scan_coupled_fused={include_scan_coupled_fused} coupled_rows={include_coupled_rows} coupled_H={use_coupled_hamiltonian} "
-        f"scan_unroll={scan_unroll} scan_vec={scan_vec} scan_tune={scan_tune} scan_inplace={scan_inplace} stability={stability}")
+  print(f"steps={steps} repeats={repeats} size={size} integrator=auto")
   print("-" * 72)
   print(f"{'integrator':12s} {'mode':12s} {'jit':5s} {'unroll':6s} {'ms':>10s} {'steps/s':>12s}")
 
@@ -225,25 +169,17 @@ def main():
   for integrator in integrators:
     hamiltonian_name = "coupled" if use_coupled_hamiltonian else "harmonic"
     H = coupled_hamiltonian() if use_coupled_hamiltonian else harmonic_hamiltonian()
-    system = HamiltonianSystem(H, integrator=integrator)
-
     for unroll in unrolls:
       if steps % unroll != 0:
         continue
-      if unroll > 1:
-        jit = True
-      else:
-        jit = include_jit
-
-      elapsed, steps_per_s = _bench(system, steps, repeats, jit=jit, unroll=unroll, size=size)
+      elapsed, steps_per_s = _bench(H, steps, repeats, size=size)
       time_per_step_s = elapsed / steps
-      label_jit = "yes" if jit else "no"
-      print(f"{integrator:12s} {'step':12s} {label_jit:5s} {unroll:6d} {elapsed*1e3:10.2f} {steps_per_s:12,.0f}")
+      print(f"{integrator:12s} {'step':12s} {'-':5s} {unroll:6d} {elapsed*1e3:10.2f} {steps_per_s:12,.0f}")
       json_results.append({
         "integrator": integrator,
         "mode": "step",
         "hamiltonian": hamiltonian_name,
-        "jit": jit,
+        "jit": False,
         "unroll": unroll,
         "elapsed_s": elapsed,
         "steps_per_s": steps_per_s,
@@ -268,96 +204,9 @@ def main():
         "size": coupled_size,
       })
 
-    if integrator == "leapfrog" and include_scan and not use_coupled_hamiltonian:
-      if scan_tune:
-        scan_unroll, scan_vec, elapsed, steps_per_s = _tune_scan(
-          system, steps, repeats, coupled=False, size=size, unroll_opts=tune_unrolls, vec_opts=tune_vecs,
-          inplace=scan_inplace)
-      else:
-        elapsed, steps_per_s = _bench_scan(system, steps, repeats, coupled=False, size=size,
-                                           unroll_steps=scan_unroll, vector_width=scan_vec, inplace=scan_inplace)
-      time_per_step_s = elapsed / steps
-      print(f"{integrator:12s} {'scan':12s} {'-':5s} {'-':6s} {elapsed*1e3:10.2f} {steps_per_s:12,.0f}")
-      json_results.append({
-        "integrator": integrator,
-        "mode": "scan",
-        "hamiltonian": hamiltonian_name,
-        "scan_unroll": scan_unroll,
-        "scan_vec": scan_vec,
-        "scan_tune": scan_tune,
-        "scan_inplace": scan_inplace,
-        "jit": False,
-        "unroll": 0,
-        "elapsed_s": elapsed,
-        "steps_per_s": steps_per_s,
-        "time_per_step_s": time_per_step_s,
-      })
-
-    if integrator == "leapfrog" and include_scan_coupled:
-      coupled_system = system if use_coupled_hamiltonian else HamiltonianSystem(coupled_hamiltonian(), integrator=integrator)
-      if scan_tune:
-        scan_unroll, scan_vec, elapsed, steps_per_s = _tune_scan(
-          coupled_system, steps, repeats, coupled=True, size=coupled_size, unroll_opts=tune_unrolls, vec_opts=tune_vecs,
-          inplace=scan_inplace)
-      else:
-        elapsed, steps_per_s = _bench_scan(coupled_system, steps, repeats, coupled=True, size=coupled_size,
-                                           unroll_steps=scan_unroll, vector_width=scan_vec, inplace=scan_inplace)
-      time_per_step_s = elapsed / steps
-      print(f"{integrator:12s} {'scan_cpl':12s} {'-':5s} {'-':6s} {elapsed*1e3:10.2f} {steps_per_s:12,.0f}")
-      json_results.append({
-        "integrator": integrator,
-        "mode": "scan_coupled",
-        "hamiltonian": "coupled",
-        "scan_unroll": scan_unroll,
-        "scan_vec": scan_vec,
-        "scan_tune": scan_tune,
-        "scan_inplace": scan_inplace,
-        "jit": False,
-        "unroll": 0,
-        "elapsed_s": elapsed,
-        "steps_per_s": steps_per_s,
-        "time_per_step_s": time_per_step_s,
-        "size": coupled_size,
-      })
-
-    if integrator == "leapfrog" and include_scan_coupled_fused:
-      coupled_system = system if use_coupled_hamiltonian else HamiltonianSystem(coupled_hamiltonian(), integrator=integrator)
-      if scan_tune:
-        best = None
-        for unroll in tune_unrolls:
-          if steps % unroll != 0:
-            continue
-          elapsed, steps_per_s = _bench_scan(coupled_system, steps, repeats, coupled=True, size=coupled_size,
-                                             unroll_steps=unroll, vector_width=scan_vec, inplace=scan_inplace,
-                                             coupled_fused=True)
-          if best is None or steps_per_s > best[1]:
-            best = (unroll, steps_per_s, elapsed)
-        scan_unroll, steps_per_s, elapsed = best
-      else:
-        elapsed, steps_per_s = _bench_scan(coupled_system, steps, repeats, coupled=True, size=coupled_size,
-                                           unroll_steps=scan_unroll, vector_width=scan_vec, inplace=scan_inplace,
-                                           coupled_fused=True)
-      time_per_step_s = elapsed / steps
-      print(f"{integrator:12s} {'scan_cpl_f':12s} {'-':5s} {'-':6s} {elapsed*1e3:10.2f} {steps_per_s:12,.0f}")
-      json_results.append({
-        "integrator": integrator,
-        "mode": "scan_coupled_fused",
-        "hamiltonian": "coupled",
-        "scan_unroll": scan_unroll,
-        "scan_vec": scan_vec,
-        "scan_tune": scan_tune,
-        "scan_inplace": scan_inplace,
-        "jit": False,
-        "unroll": 0,
-        "elapsed_s": elapsed,
-        "steps_per_s": steps_per_s,
-        "time_per_step_s": time_per_step_s,
-        "size": coupled_size,
-      })
-
     if stability:
       q, p = _make_state(size)
-      q_ref, p_ref, history = system.evolve(q, p, dt=stability_dt, steps=stability_steps, record_every=1)
+      q_ref, p_ref, history = simulate_hamiltonian(H, q, p, dt=stability_dt, steps=stability_steps, record_every=1)
       max_rel, rms_rel = _energy_stats(history)
       stability_results.append({
         "integrator": integrator,
@@ -371,8 +220,7 @@ def main():
       if include_scan_coupled_fused and use_coupled_hamiltonian:
         q_scan, p_scan = _make_state(size)
         scan_history, q_scan, p_scan = _scan_energy_history(
-          system, q_scan, p_scan, dt=stability_dt, steps=stability_steps, coupled=True,
-          vector_width=scan_vec, coupled_fused=True)
+          coupled_hamiltonian(), q_scan, p_scan, dt=stability_dt, steps=stability_steps)
         max_rel, rms_rel = _energy_stats(scan_history)
         stability_results.append({
           "integrator": integrator,
@@ -382,7 +230,6 @@ def main():
           "rms_rel_drift": rms_rel,
           "max_abs_q": _max_abs_diff(q_ref, q_scan),
           "max_abs_p": _max_abs_diff(p_ref, p_scan),
-          "scan_vec": scan_vec,
           "steps": stability_steps,
           "dt": stability_dt,
         })

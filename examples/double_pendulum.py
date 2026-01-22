@@ -15,7 +15,7 @@ where T = 0.5 * p^T * M(q)^{-1} * p (position-dependent mass matrix)
 
 import numpy as np
 from tinygrad.tensor import Tensor
-from tinygrad.physics import HamiltonianSystem
+from tinygrad.physics import simulate_hamiltonian
 import json
 import os
 
@@ -73,12 +73,12 @@ def double_pendulum_hamiltonian(m1=1.0, m2=1.0, l1=1.0, l2=1.0, g=9.81):
 # SIMULATION
 # ============================================================================
 
-def run_simulation(integrator="implicit", dt=0.01, steps=1000):
+def run_simulation(dt=0.01, steps=1000):
     """
     Simulate a double pendulum using the TinyPhysics compiler approach.
 
-    For non-separable Hamiltonians, use "implicit" integrator for best
-    energy conservation.
+    For non-separable Hamiltonians, the compiler selects an implicit integrator
+    when needed for stability and energy conservation.
     """
     # Physics constants
     m1, m2 = 1.0, 1.0
@@ -101,22 +101,20 @@ def run_simulation(integrator="implicit", dt=0.01, steps=1000):
     print(f"  H(q, p) = 0.5 * p^T * M(q)^{{-1}} * p + V(q)")
     print(f"\nThis is a NON-SEPARABLE Hamiltonian (mass matrix depends on q).")
     print(f"Autograd handles the complex derivatives automatically!")
-    print(f"\nIntegrator: {integrator}")
+    print(f"\nIntegrator: auto")
     print(f"Initial: theta1={theta1_init:.2f}, theta2={theta2_init:.2f}")
 
     # CREATE THE HAMILTONIAN SYSTEM
     H = double_pendulum_hamiltonian(m1=m1, m2=m2, l1=l1, l2=l2, g=g)
-    system = HamiltonianSystem(H, integrator=integrator)
-
     # Initial energy
-    E_start = system.energy(q, p)
+    E_start = float(H(q, p).numpy())
     print(f"\nInitial Energy: {E_start:.6f}")
 
     # EVOLVE
-    q, p, history = system.evolve(q, p, dt=dt, steps=steps, record_every=10)
+    q, p, history = simulate_hamiltonian(H, q, p, dt=dt, steps=steps, record_every=10)
 
     # Final state
-    E_end = system.energy(q, p)
+    E_end = float(H(q, p).numpy())
     E_drift = abs(E_end - E_start) / abs(E_start)
 
     print(f"Final Energy:   {E_end:.6f}")
@@ -224,30 +222,5 @@ def generate_viewer(history_q, l1, l2):
     print(f"\nViewer: {os.path.abspath(filepath)}")
 
 
-def compare_integrators():
-    """Compare integrators for non-separable Hamiltonian."""
-    print("=" * 60)
-    print("COMPARING INTEGRATORS FOR NON-SEPARABLE HAMILTONIAN")
-    print("=" * 60)
-    print("\nNote: For non-separable H, 'implicit' is truly symplectic.")
-    print("Explicit methods (leapfrog, yoshida4) are only approximately symplectic.\n")
-
-    results = {}
-    for name in ["leapfrog", "implicit"]:
-        print(f"{'='*60}")
-        _, _, drift = run_simulation(integrator=name, dt=0.01, steps=1000)
-        results[name] = drift
-
-    print(f"\n{'='*60}")
-    print("SUMMARY: Energy Drift")
-    print("="*60)
-    for name, drift in results.items():
-        print(f"  {name:12s}: {drift:.2e}")
-
-
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "--compare":
-        compare_integrators()
-    else:
-        run_simulation("implicit")
+    run_simulation()

@@ -2,9 +2,8 @@ import argparse
 import time
 from tinygrad.physics_profile import get_profile
 import numpy as np
-from tinygrad import TinyJit
 from tinygrad.tensor import Tensor
-from tinygrad.physics import ControlInput, SatelliteControlIntegrator
+from tinygrad.physics import ControlInput, compile_system
 from tinygrad.helpers import getenv
 import json
 import os
@@ -50,29 +49,15 @@ def run_simulation(steps: int = 1500, dt: float = 0.01, unroll_steps: int = 10,
     history_q = []
     policy = get_profile(profile).policy
     control = ControlInput(lambda q_err, omega: -Kp * q_err[..., 1:] - Kd * omega)
-    integrator = SatelliteControlIntegrator(I_inv, control, dt, policy=policy)
+    integrator = compile_system("satellite_control", I_inv=I_inv, control=control, dt=dt, policy=policy)
 
-    def step(L_val: Tensor, quat_val: Tensor):
-        return integrator.step(L_val, quat_val)
-
-    if auto_unroll:
-        candidates = [5, 10, 20]
-        def step_factory(unroll):
-            step = integrator.compile_unrolled_step(unroll)
-            def run_steps():
-                nonlocal L, quat
-                for _ in range(3):
-                    L, quat = step(L, quat)
-            return run_steps
-        unroll_steps = policy.choose_unroll(steps, L.shape, L.device, candidates=candidates, step_factory=step_factory)
-    if steps % unroll_steps != 0:
-        raise ValueError("steps must be divisible by unroll_steps")
+    unroll = None if auto_unroll else unroll_steps
+    if unroll is not None and steps % unroll != 0:
+        raise ValueError("steps must be divisible by unroll")
     start_time = time.perf_counter() if benchmark else None
     if scan:
         record_every = 10
-        if record_every % unroll_steps != 0:
-            record_every = unroll_steps
-        L, quat, hist = integrator.evolve_unrolled(L, quat, steps, unroll_steps, record_every=record_every)
+        L, quat, hist = integrator.evolve(L, quat, steps, record_every=record_every, scan=True, unroll=unroll)
         for L_t, q_t in hist:
             if q_t.ndim > 1:
                 show = min(batch_size, viewer_batch)
@@ -89,29 +74,24 @@ def run_simulation(steps: int = 1500, dt: float = 0.01, unroll_steps: int = 10,
         print(f"Final Omega: {ohm_mag:.6f}")
         print(f"Alignment Error: {err_align:.6f}")
     else:
-        step_jit = integrator.compile_unrolled_step(unroll_steps)
-        for i in range(0, steps, unroll_steps):
-            L, quat = step_jit(L, quat)
+        record_every = 10
+        L, quat, hist = integrator.evolve(L, quat, steps, record_every=record_every, scan=False, unroll=unroll)
+        for L_t, q_t in hist:
+            if q_t.ndim > 1:
+                show = min(batch_size, viewer_batch)
+                history_q.append(q_t[:show].numpy().tolist())
+            else:
+                history_q.append(q_t.numpy().tolist())
+        L_sample = L[0] if L.ndim > 1 else L
+        q_sample = quat[0] if quat.ndim > 1 else quat
+        omega_curr = (L_sample * I_inv).numpy()
+        q_curr = q_sample.numpy()
+        ohm_mag = np.linalg.norm(omega_curr)
+        err_align = 1.0 - abs(np.dot(q_curr, target_q))
 
-            if i % 10 == 0:
-                if quat.ndim > 1:
-                    show = min(batch_size, viewer_batch)
-                    history_q.append(quat[:show].numpy().tolist())
-                else:
-                    history_q.append(quat.numpy().tolist())
-
-            # Check Convergence
-            if i + unroll_steps >= steps:
-                L_sample = L[0] if L.ndim > 1 else L
-                q_sample = quat[0] if quat.ndim > 1 else quat
-                omega_curr = (L_sample * I_inv).numpy()
-                q_curr = q_sample.numpy()
-                ohm_mag = np.linalg.norm(omega_curr)
-                err_align = 1.0 - abs(np.dot(q_curr, target_q))
-
-                print(f"End Sim.")
-                print(f"Final Omega: {ohm_mag:.6f}")
-                print(f"Alignment Error: {err_align:.6f}")
+        print(f"End Sim.")
+        print(f"Final Omega: {ohm_mag:.6f}")
+        print(f"Alignment Error: {err_align:.6f}")
 
     if benchmark and start_time is not None:
         elapsed = time.perf_counter() - start_time

@@ -20,10 +20,8 @@ Conservation laws:
 import argparse
 import time
 from tinygrad.physics_profile import get_profile
-import numpy as np
-from tinygrad import TinyJit
 from tinygrad.tensor import Tensor
-from tinygrad.physics import RigidBodySystem
+from tinygrad.physics import compile_system
 import json
 import os
 
@@ -39,7 +37,7 @@ def run_simulation(batch_size: int = 1, steps: int = 2000, dt: float = 0.01,
     # Create the rigid body system using the tiny physics approach
     # The Hamiltonian H(L) = 0.5 * L · (I⁻¹ L) is defined internally
     policy = get_profile(profile).policy
-    system = RigidBodySystem(I, integrator="midpoint", policy=policy)
+    system = compile_system("rigid_body", I=I, integrator="auto", policy=policy)
 
     dt = dt
     steps = steps
@@ -66,40 +64,15 @@ def run_simulation(batch_size: int = 1, steps: int = 2000, dt: float = 0.01,
 
     # Run simulation
     record_every = 10
-    if auto_unroll:
-        candidates = [2, 4, 8, 16]
-        def step_factory(unroll):
-            step = system.compile_unrolled_step(dt, unroll)
-            def run_steps():
-                nonlocal L, q
-                for _ in range(3):
-                    L, q = step(L, q)
-            return run_steps
-        unroll_steps = policy.choose_unroll(steps, L.shape, L.device, candidates=candidates, step_factory=step_factory)
-    if steps % unroll_steps != 0:
-        raise ValueError("steps must be divisible by unroll_steps")
+    unroll = None if auto_unroll else unroll_steps
+    if unroll is not None and steps % unroll != 0:
+        raise ValueError("steps must be divisible by unroll")
 
     start_time = time.perf_counter() if benchmark else None
     if scan:
-        if record_every % unroll_steps != 0:
-            record_every = unroll_steps
-        L, q, history = system.evolve(L, q, dt, steps, record_every=record_every, scan=True, unroll=unroll_steps, policy=policy)
+        L, q, history = system.evolve(L, q, dt, steps, record_every=record_every, scan=True, unroll=unroll, policy=policy)
     else:
-        def step_unrolled(L_in: Tensor, q_in: Tensor):
-            for _ in range(unroll_steps):
-                L_in, q_in = system.step(L_in, q_in, dt)
-            return L_in, q_in
-        step = TinyJit(step_unrolled)
-        history = []
-        for i in range(0, steps, unroll_steps):
-            if i % record_every == 0:
-                L_sample = L[0] if L.ndim > 1 else L
-                q_sample = q[0] if q.ndim > 1 else q
-                history.append((L_sample.numpy().copy(), q_sample.numpy().copy(), system.energy(L_sample), system.casimir(L_sample)))
-            L, q = step(L, q)
-        L_sample = L[0] if L.ndim > 1 else L
-        q_sample = q[0] if q.ndim > 1 else q
-        history.append((L_sample.numpy().copy(), q_sample.numpy().copy(), system.energy(L_sample), system.casimir(L_sample)))
+        L, q, history = system.evolve(L, q, dt, steps, record_every=record_every, scan=False, unroll=unroll, policy=policy)
     if benchmark and start_time is not None:
         elapsed = time.perf_counter() - start_time
         steps_s = steps / elapsed if elapsed > 0 else float("inf")

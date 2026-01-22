@@ -17,8 +17,8 @@ This is the key insight: the Product Manifold has a NON-TRIVIAL coupling
 between the two factors through the Poisson bracket.
 """
 
-from tinygrad import TinyJit, Tensor, dtypes
-from tinygrad.physics import HeavyTopHamiltonian, HeavyTopIntegrator, ProductManifold
+from tinygrad import Tensor, dtypes
+from tinygrad.physics import ProductManifold, compile_system
 import argparse
 import time
 from tinygrad.physics_profile import get_profile
@@ -74,8 +74,8 @@ def simulate_heavy_top(
   state = ProductManifold.from_euler_angles(L, theta0, phi0)
   gamma = state.gamma
   policy = get_profile(profile).policy
-  H = HeavyTopHamiltonian(I1, I2, I3, mgl, dtype=dtypes.float64)
-  integrator = HeavyTopIntegrator(H, dt, policy=policy)
+  integrator = compile_system("heavy_top", I1=I1, I2=I2, I3=I3, mgl=mgl, dt=dt, policy=policy, dtype=dtypes.float64)
+  H = integrator.H
   unroll_steps = unroll_steps
 
   # Storage
@@ -94,35 +94,15 @@ def simulate_heavy_top(
   # Select integration method
   if method == "rk4":
     raise ValueError("rk4 is not symplectic; use method='splitting'")
-  if method == "splitting":
-    step_fn = integrator.step_symmetric_tensors
-  else:
-    step_fn = integrator.step_explicit_tensors
-  if auto_unroll:
-    candidates = [2, 4, 8, 16]
-    def step_factory(unroll):
-      step = integrator.compile_unrolled_step(unroll, method=method)
-      def run_steps():
-        nonlocal L, gamma
-        for _ in range(3):
-          L, gamma = step(L, gamma)
-      return run_steps
-    unroll_steps = policy.choose_unroll(steps, L.shape, L.device, candidates=candidates, step_factory=step_factory)
-  if steps % unroll_steps != 0:
-    raise ValueError("steps must be divisible by unroll_steps")
-  def step_unrolled(L_in: Tensor, gamma_in: Tensor):
-    for _ in range(unroll_steps):
-      L_in, gamma_in = step_fn(L_in, gamma_in)
-    return L_in, gamma_in
-  step = TinyJit(step_unrolled)
+  unroll = None if auto_unroll else unroll_steps
+  if unroll is not None and steps % unroll != 0:
+    raise ValueError("steps must be divisible by unroll")
 
   # Run simulation
   sample_interval = max(1, steps // 100)  # Sample ~100 times
   start_time = time.perf_counter() if benchmark else None
   if scan:
-    if sample_interval % unroll_steps != 0:
-      sample_interval = unroll_steps
-    L, gamma, hist_t = integrator.evolve(L, gamma, steps, method=method, record_every=sample_interval, scan=True, unroll=unroll_steps, policy=policy)
+    L, gamma, hist_t = integrator.evolve(L, gamma, steps, method=method, record_every=sample_interval, scan=True, unroll=unroll, policy=policy)
     for idx, (L_t, g_t) in enumerate(hist_t):
       L_sample = L_t[:viewer_batch] if L_t.ndim > 1 else L_t
       g_sample = g_t[:viewer_batch] if g_t.ndim > 1 else g_t
@@ -141,27 +121,24 @@ def simulate_heavy_top(
       history['C1'].append(C1.numpy())
       history['C2'].append(C2.numpy())
   else:
-    for i in range(0, steps, unroll_steps):
-      if i % sample_interval == 0:
-        L_sample = L[:viewer_batch] if L.ndim > 1 else L
-        gamma_sample = gamma[:viewer_batch] if gamma.ndim > 1 else gamma
-        if isinstance(L_sample, Tensor) and L_sample.ndim > 1:
-          E = H(ProductManifold(L_sample[0], gamma_sample[0])).numpy()
-          C1 = (gamma_sample[0] * gamma_sample[0]).sum()
-          C2 = (L_sample[0] * gamma_sample[0]).sum()
-        else:
-          E = H(ProductManifold(L_sample, gamma_sample)).numpy()
-          C1 = (gamma_sample * gamma_sample).sum()
-          C2 = (L_sample * gamma_sample).sum()
-
-        history['time'].append(i * dt)
-        history['L'].append(L_sample.numpy().copy())
-        history['gamma'].append(gamma_sample.numpy().copy())
-        history['energy'].append(E)
-        history['C1'].append(C1.numpy())
-        history['C2'].append(C2.numpy())
-
-      L, gamma = step(L, gamma)
+    L, gamma, hist_t = integrator.evolve(L, gamma, steps, method=method, record_every=sample_interval, scan=False, unroll=unroll, policy=policy)
+    for idx, (L_t, g_t) in enumerate(hist_t):
+      L_sample = L_t[:viewer_batch] if L_t.ndim > 1 else L_t
+      g_sample = g_t[:viewer_batch] if g_t.ndim > 1 else g_t
+      if isinstance(L_sample, Tensor) and L_sample.ndim > 1:
+        E = H(ProductManifold(L_sample[0], g_sample[0])).numpy()
+        C1 = (g_sample[0] * g_sample[0]).sum()
+        C2 = (L_sample[0] * g_sample[0]).sum()
+      else:
+        E = H(ProductManifold(L_sample, g_sample)).numpy()
+        C1 = (g_sample * g_sample).sum()
+        C2 = (L_sample * g_sample).sum()
+      history['time'].append(idx * sample_interval * dt)
+      history['L'].append(L_sample.numpy().copy())
+      history['gamma'].append(g_sample.numpy().copy())
+      history['energy'].append(E)
+      history['C1'].append(C1.numpy())
+      history['C2'].append(C2.numpy())
 
   if benchmark and start_time is not None:
     elapsed = time.perf_counter() - start_time

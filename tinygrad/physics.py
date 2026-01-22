@@ -30,6 +30,7 @@ import time
 # ============================================================================
 
 _grad_H_jit_cache: dict[tuple, TinyJit] = {}
+_grad_LP_jit_cache: dict[tuple, TinyJit] = {}
 _implicit_mid_buf_cache: dict[tuple[str, tuple[int, ...], object], tuple[Tensor, Tensor, Tensor, Tensor]] = {}
 _implicit_iters_cache: dict[tuple[float, int, int], int] = {}
 
@@ -47,6 +48,8 @@ class SymplecticPolicy:
         self.budget_ms = budget_ms
         self._unroll_cache: dict[tuple, int] = {}
         self._last_report: dict[tuple, dict] = {}
+        self._vec_cache: dict[tuple, int] = {}
+        self._proj_cache: dict[tuple, int] = {}
 
     def _record(self, steps: int, shape: tuple[int, ...], device: str, extra: dict):
         key = (steps, shape, device, self.accuracy, self.scan, self.tune, self.max_unroll, self.min_unroll)
@@ -78,8 +81,9 @@ class SymplecticPolicy:
         return base
 
     def choose_unroll(self, steps: int, shape: tuple[int, ...], device: str,
-                      candidates: list[int] | None = None, step_factory: Callable | None = None) -> int:
-        key = (steps, shape, device, self.accuracy, self.scan, self.tune, self.max_unroll, self.min_unroll)
+                      candidates: list[int] | None = None, step_factory: Callable | None = None,
+                      op_cost: int | None = None) -> int:
+        key = (steps, shape, device, self.accuracy, self.scan, self.tune, self.max_unroll, self.min_unroll, op_cost)
         cached = self._unroll_cache.get(key)
         if cached is not None:
             return cached
@@ -104,8 +108,13 @@ class SymplecticPolicy:
                 self._last_report[key] = {"mode": "tune", "unroll": best, "trial_steps": trial_steps}
                 return best
         chosen = self._heuristic_unroll(steps, shape, device)
+        if op_cost is not None:
+            if op_cost > 512:
+                chosen = min(chosen, 2)
+            elif op_cost > 256:
+                chosen = min(chosen, 4)
         self._unroll_cache[key] = chosen
-        self._last_report[key] = {"mode": "heuristic", "unroll": chosen}
+        self._last_report[key] = {"mode": "heuristic", "unroll": chosen, "op_cost": op_cost}
         return chosen
 
     def should_scan(self, steps: int, shape: tuple[int, ...], device: str) -> bool:
@@ -114,6 +123,86 @@ class SymplecticPolicy:
         if steps < self.min_unroll:
             return False
         return True
+
+    def projection_stride(self, constraint: str) -> int:
+        strict_drift = self.drift_target is not None and self.drift_target <= 1e-6
+        if self.accuracy in ("precise", "ultra_precise") or strict_drift:
+            return 1
+        if self.accuracy == "fast":
+            return 4
+        return 2
+
+    def choose_vector_width(self, shape: tuple[int, ...], device: str, vec_dim: int) -> int:
+        key = (shape, device, vec_dim, self.accuracy, self.drift_target)
+        cached = self._vec_cache.get(key)
+        if cached is not None:
+            return cached
+        if not shape or shape[-1] != vec_dim:
+            self._vec_cache[key] = 1
+            return 1
+        if "CPU" not in device.upper():
+            self._vec_cache[key] = 1
+            return 1
+        total = 1
+        for s in shape:
+            try:
+                total *= int(s)
+            except Exception:
+                total *= 1
+        if total % (8 * vec_dim) == 0:
+            self._vec_cache[key] = 8
+            return 8
+        if total % (4 * vec_dim) == 0:
+            self._vec_cache[key] = 4
+            return 4
+        if total % (2 * vec_dim) == 0:
+            self._vec_cache[key] = 2
+            return 2
+        self._vec_cache[key] = 1
+        return 1
+
+    def choose_projection_stride(self, steps: int, shape: tuple[int, ...], device: str, constraint: str,
+                                 state: tuple[Tensor, ...], step_fn: Callable, constraint_fn: Callable,
+                                 candidates: tuple[int, ...] = (1, 2, 4, 8)) -> int:
+        if not self.tune and not getenv("TINYGRAD_PHYSICS_PROJ_TUNE", 0):
+            stride = self.projection_stride(constraint)
+            key = (constraint, steps, shape, device, self.accuracy, self.drift_target, candidates)
+            self._proj_cache[key] = stride
+            return stride
+        key = (constraint, steps, shape, device, self.accuracy, self.drift_target, candidates)
+        cached = self._proj_cache.get(key)
+        if cached is not None:
+            return cached
+        strict_drift = self.drift_target is not None and self.drift_target <= 1e-6
+        if self.accuracy in ("precise", "ultra_precise") or strict_drift:
+            target = 1e-6
+        elif self.accuracy == "fast":
+            target = 1e-3
+        else:
+            target = 1e-4
+        probe_steps = min(steps, int(getenv("TINYGRAD_PHYSICS_PROJ_STEPS", 200)))
+        best = candidates[0]
+        for stride in sorted(candidates, reverse=True):
+            s = tuple(x.detach() for x in state)
+            max_drift = 0.0
+            for i in range(probe_steps):
+                s = step_fn(s, i, stride)
+                s = tuple(x.detach().realize() for x in s)
+                val = constraint_fn(s)
+                try:
+                    v = float(val.numpy())
+                except Exception:
+                    v = float(val)
+                drift = abs(v - 1.0)
+                if drift > max_drift:
+                    max_drift = drift
+                if max_drift > target:
+                    break
+            if max_drift <= target:
+                best = stride
+                break
+        self._proj_cache[key] = best
+        return best
 
     def adjust_dt(self, steps: int, shape: tuple[int, ...], device: str, state: tuple[Tensor, ...],
                   make_step: Callable[[float], Callable], energy_fn: Callable, drift_env_key: str) -> tuple[float, float | None]:
@@ -142,6 +231,54 @@ class SymplecticPolicy:
             rep = self.report(steps, shape, device)
             if rep is not None:
                 print(f"Policy: {rep}")
+
+
+def compile_system(kind: str, *, H=None, policy: SymplecticPolicy | None = None,
+                   integrator: str = "auto", **kwargs):
+    if policy is None:
+        from tinygrad.physics_profile import get_default_profile
+        policy = get_default_profile().policy
+    kind = kind.lower()
+    if kind in ("canonical", "hamiltonian"):
+        if H is None:
+            raise ValueError("Hamiltonian H is required for canonical systems")
+        return HamiltonianSystem(H, integrator=integrator, policy=policy)
+    if kind in ("so3", "lie_poisson"):
+        if H is None:
+            raise ValueError("Hamiltonian H is required for Lie-Poisson systems")
+        return LiePoissonSystem(H, algebra="so3", integrator=integrator, policy=policy)
+    if kind in ("rigid_body", "so3_rigid"):
+        I = kwargs.get("I")
+        if I is None:
+            raise ValueError("Inertia tensor I is required for rigid_body systems")
+        return RigidBodySystem(I, integrator=integrator, policy=policy)
+    if kind in ("heavy_top", "e3"):
+        Htop = kwargs.get("hamiltonian", H)
+        if Htop is None:
+            I1 = kwargs.get("I1")
+            I2 = kwargs.get("I2")
+            I3 = kwargs.get("I3")
+            mgl = kwargs.get("mgl")
+            if None in (I1, I2, I3, mgl):
+                raise ValueError("Heavy top requires hamiltonian or I1/I2/I3/mgl")
+            Htop = HeavyTopHamiltonian(I1, I2, I3, mgl, dtype=kwargs.get("dtype", dtypes.float64))
+        dt = kwargs.get("dt", 0.001)
+        return HeavyTopIntegrator(Htop, dt, policy=policy)
+    if kind in ("satellite_control", "control"):
+        I_inv = kwargs.get("I_inv")
+        control = kwargs.get("control")
+        dt = kwargs.get("dt")
+        if I_inv is None or control is None or dt is None:
+            raise ValueError("satellite_control requires I_inv, control, and dt")
+        return SatelliteControlIntegrator(I_inv, control, dt, policy=policy)
+    raise ValueError(f"Unknown system kind: {kind}")
+
+
+def simulate_hamiltonian(H, q: Tensor, p: Tensor, dt: float, steps: int,
+                         policy: SymplecticPolicy | None = None,
+                         record_every: int = 1) -> tuple[Tensor, Tensor, list]:
+    system = compile_system("canonical", H=H, policy=policy, integrator="auto")
+    return system.evolve(q, p, dt=dt, steps=steps, record_every=record_every, scan=None, unroll=None, policy=policy)
 
 
 @dataclass
@@ -619,6 +756,31 @@ def _grad_H(q: Tensor, p: Tensor, H_func) -> tuple[Tensor, Tensor]:
 # SYMPLECTIC INTEGRATORS
 # ============================================================================
 
+def _grad_LP_compute(z: Tensor, H_func) -> Tensor:
+    z_grad = z.detach().requires_grad_(True)
+    H = H_func(z_grad)
+    H.backward()
+    return z_grad.grad.detach() if z_grad.grad is not None else z * 0
+
+
+def _grad_LP(z: Tensor, H_func) -> Tensor:
+    if not getenv("TINYGRAD_GRADH_JIT", 1):
+        return _grad_LP_compute(z, H_func)
+    if capturing:
+        return _grad_LP_compute(z, H_func)
+    z_use = z.contiguous().realize()
+    key = (H_func, z_use.device, z_use.shape, z_use.dtype)
+    jit = _grad_LP_jit_cache.get(key)
+    if jit is None:
+        def grad_fn(z_in: Tensor) -> Tensor:
+            return _grad_LP_compute(z_in, H_func)
+        jit = _grad_LP_jit_cache.setdefault(key, TinyJit(grad_fn))
+    try:
+        return jit(z_use)
+    except JitError:
+        _grad_LP_jit_cache.pop(key, None)
+        return _grad_LP_compute(z_use, H_func)
+
 def symplectic_euler(q: Tensor, p: Tensor, H_func, dt: float = 0.01) -> tuple[Tensor, Tensor]:
     """1st-order Symplectic Euler (Kick-Drift). Order: O(dt)"""
     dHdq, _ = _grad_H(q, p, H_func)
@@ -854,6 +1016,7 @@ class HamiltonianSystem:
         self._update_kernel_coupled_fused_ok: dict[tuple[float, str, tuple[int, ...], object, int], bool] = {}
         self._scan_kernel_coupled_tune_cache: dict[tuple[float, int, str, tuple[int, ...], object], int] = {}
         self._fused_kernel_coupled_tune_cache: dict[tuple[float, int, str, tuple[int, ...], object], tuple[int, int]] = {}
+        self._fused_reduce_vec_tune_cache: dict[tuple[float, str, tuple[int, ...], object], int] = {}
         self._reduce_kernel_coupled_cache: dict[tuple[UOp, str, tuple[int, ...], object], Callable] = {}
         self._reduce_kernel_coupled_multi_cache: dict[tuple[tuple[UOp, ...], str, tuple[int, ...], object, int], Callable] = {}
         self._reduce_kernel_coupled_qnew_cache: dict[tuple[tuple[UOp, ...], object, str, tuple[int, ...], object, float, int], Callable] = {}
@@ -1095,6 +1258,12 @@ class HamiltonianSystem:
         integrator = self._select_integrator_name(q, p)
         if integrator != "leapfrog" or info.constraints:
             use_scan = False
+        op_cost = None
+        if getenv("TINYGRAD_PHYSICS_UNROLL_COST", 1):
+            try:
+                op_cost = _count_uops_limit(self.H(q, p).uop, 512)
+            except Exception:
+                op_cost = None
         def make_step(scale: float):
             return lambda q_in, p_in: self._jit_step(q_in, p_in, dt * scale)
         def energy_fn(q_in: Tensor, p_in: Tensor):
@@ -1103,7 +1272,7 @@ class HamiltonianSystem:
         if dt_scale != 1.0:
             dt *= dt_scale
         if unroll is None and use_scan:
-            unroll = policy.choose_unroll(steps, q.shape, q.device)
+            unroll = policy.choose_unroll(steps, q.shape, q.device, op_cost=op_cost)
         if use_scan and unroll is not None:
             if record_every % unroll != 0:
                 record_every = unroll
@@ -2006,6 +2175,7 @@ class HamiltonianSystem:
                     op_groups.setdefault(red.arg[0], []).append(i)
                 stores = []
                 idx = tuple(UOp.const(dtypes.index, 0) for _ in range(len(reduce_ranges)))
+                expr_cache: dict[bytes, UOp] = {}
                 for op_kind, group in op_groups.items():
                     exprs = []
                     for gi in group:
@@ -2014,6 +2184,11 @@ class HamiltonianSystem:
                         expr = rewrite_elem(expr, reduce_ranges)
                         if expr.dtype.count > 1:
                             expr = _hreduce_vector(expr, op_kind)
+                        cached = expr_cache.get(expr.key)
+                        if cached is None:
+                            expr_cache[expr.key] = expr
+                        else:
+                            expr = cached
                         exprs.append(expr)
                     vec_expr = exprs[0].vectorize(*exprs[1:]) if len(exprs) > 1 else exprs[0]
                     red = UOp(Ops.REDUCE, vec_expr.dtype, src=(vec_expr,)+tuple(reduce_ranges), arg=op_kind)
@@ -2096,7 +2271,56 @@ class HamiltonianSystem:
 
             stores = []
             opts = ()
-            for reduce_uop, out in zip(reduce_uops, outs, strict=True):
+            groupable = []
+            groupable_idx = set()
+            for i, red in enumerate(reduce_uops):
+                if any(u.op is Ops.REDUCE_AXIS for u in red.src[0].toposort()): continue
+                if red.arg[1] is None or len(red.arg[1]) != len(shape): continue
+                if not all(j in red.arg[1] for j in range(len(shape))): continue
+                groupable.append((i, red))
+                groupable_idx.add(i)
+            if len(groupable) > 1:
+                expr_cache: dict[bytes, UOp] = {}
+                if use_vec:
+                    reduce_ranges_group = [UOp.range(s, i+1, AxisType.REDUCE) for i, s in enumerate(shape[:-1])]
+                    reduce_ranges_group.append(UOp.range(shape[-1] // vector_width, len(shape), AxisType.REDUCE))
+                    base = reduce_ranges_group[-1] * UOp.const(dtypes.index, vector_width)
+                    q_ptr = q.index(*reduce_ranges_group[:-1], base, ptr=True)
+                    p_ptr = p.index(*reduce_ranges_group[:-1], base, ptr=True)
+                    vec_dtype = q.dtype.base.vec(vector_width)
+                    q_val_red = q_ptr.cast(vec_dtype.ptr(size=q_ptr.dtype.size, addrspace=q_ptr.dtype.addrspace)).load()
+                    p_val_red = p_ptr.cast(vec_dtype.ptr(size=p_ptr.dtype.size, addrspace=p_ptr.dtype.addrspace)).load()
+                else:
+                    reduce_ranges_group = [UOp.range(s, i+1, AxisType.REDUCE) for i, s in enumerate(shape)]
+                    q_val_red = q.vindex(*reduce_ranges_group)
+                    p_val_red = p.vindex(*reduce_ranges_group)
+                idx = tuple(UOp.const(dtypes.index, 0) for _ in range(len(reduce_ranges_group)))
+                op_groups: dict[Ops, list[tuple[int, UOp]]] = {}
+                for i, red in groupable:
+                    op_groups.setdefault(red.arg[0], []).append((i, red))
+                for op_kind, group in op_groups.items():
+                    exprs = []
+                    for _, red in group:
+                        expr = red.src[0].substitute({q_sym_uop: q_val_red, p_sym_uop: p_val_red})
+                        expr = rewrite_elem(expr, reduce_ranges_group)
+                        if expr.dtype.count > 1:
+                            expr = _hreduce_vector(expr, op_kind)
+                        cached = expr_cache.get(expr.key)
+                        if cached is None:
+                            expr_cache[expr.key] = expr
+                        else:
+                            expr = cached
+                        exprs.append(expr)
+                    vec_expr = exprs[0].vectorize(*exprs[1:]) if len(exprs) > 1 else exprs[0]
+                    red = UOp(Ops.REDUCE, vec_expr.dtype, src=(vec_expr,)+tuple(reduce_ranges_group), arg=op_kind)
+                    red_val = red.vindex(*idx)
+                    for j, (i, _) in enumerate(group):
+                        out = outs[i]
+                        stores.append(out.index(UOp.const(dtypes.index, 0), ptr=True).store(red_val.gep(j)).end(*reduce_ranges_group))
+                if not opts and reduce_unroll > 1 and reduce_ranges_group:
+                    opts = (Opt(OptOps.UNROLL, reduce_ranges_group[-1].arg[0], reduce_unroll),)
+            for i, (reduce_uop, out) in enumerate(zip(reduce_uops, outs, strict=True)):
+                if i in groupable_idx: continue
                 red = reduce_uop.substitute({q_sym_uop: q_val, p_sym_uop: p_val})
                 red = graph_rewrite(
                     red,
@@ -3096,7 +3320,8 @@ class HamiltonianSystem:
                                                  dHdq_elem_uop: UOp, dHdp_elem_uop: UOp,
                                                  dHdq_reduce_uops: list[UOp], dHdp_reduce_uops: list[UOp],
                                                  placeholders_dHdq: list[UOp], placeholders_dHdp: list[UOp],
-                                                 unroll_steps: int = 1, vector_width: int = 1) -> Callable:
+                                                 unroll_steps: int = 1, vector_width: int = 1,
+                                                 reduce_unroll: int = 1) -> Callable:
         q_sym_uop, p_sym_uop, _, _ = self._get_coupled_grad_uops(device, shape, dtype)
         if placeholders_dHdq and len(placeholders_dHdq) != len(dHdq_reduce_uops):
             raise ValueError("placeholders_dHdq must match dHdq_reduce_uops length")
@@ -3116,6 +3341,8 @@ class HamiltonianSystem:
             raise ValueError("vector_width must be >= 1")
         if vector_width > 1 and shape and shape[-1] % vector_width != 0:
             raise ValueError("vector_width must divide the last dimension")
+        if reduce_unroll < 1:
+            raise ValueError("reduce_unroll must be >= 1")
 
         def kernel(q: UOp, p: UOp, q_out: UOp, p_out: UOp) -> UOp:
             use_vec = vector_width > 1
@@ -3412,6 +3639,7 @@ class HamiltonianSystem:
                 half_dt = UOp.const(const_dtype, 0.5 * dt).vindex(*ranges)
                 neg_one = UOp.const(const_dtype, -1.0).vindex(*ranges)
                 dt_uop = UOp.const(const_dtype, dt).vindex(*ranges)
+            reduce_unroll_axis = None
             for step in range(unroll_steps):
                 acc0_vals = []
                 acc0_idx = UOp.const(dtypes.index, step)
@@ -3432,7 +3660,11 @@ class HamiltonianSystem:
                         ctx={},
                         name="broadcast_scalar_alu_red0",
                     )
+                    if use_vec and red0.dtype.count > 1:
+                        red0 = _hreduce_vector(red0, reduce_uop.arg[0])
                     reduce_ranges0 = [r for r in red0.ranges if r.arg[-1] == AxisType.REDUCE]
+                    if reduce_unroll_axis is None and reduce_ranges0:
+                        reduce_unroll_axis = reduce_ranges0[-1].arg[0]
                     acc0_store = acc0_regs[i].index(acc0_idx).store(red0).end(*reduce_ranges0)
                     acc0_val = acc0_regs[i].after(acc0_store).vindex(acc0_idx)
                     if not use_vec:
@@ -3485,7 +3717,11 @@ class HamiltonianSystem:
                             ctx={},
                             name="broadcast_scalar_alu_red_hdp",
                         )
+                        if use_vec and red_hdp.dtype.count > 1:
+                            red_hdp = _hreduce_vector(red_hdp, reduce_uop.arg[0])
                         reduce_ranges_hdp = [r for r in red_hdp.ranges if r.arg[-1] == AxisType.REDUCE]
+                        if reduce_unroll_axis is None and reduce_ranges_hdp:
+                            reduce_unroll_axis = reduce_ranges_hdp[-1].arg[0]
                         acc_hdp_store = acc_hdp_regs[i].index(acc_hdp_idx).store(red_hdp).end(*reduce_ranges_hdp)
                         acc_hdp_val = acc_hdp_regs[i].after(acc_hdp_store).vindex(acc_hdp_idx)
                         if not use_vec:
@@ -3537,7 +3773,11 @@ class HamiltonianSystem:
                         ctx={},
                         name="broadcast_scalar_alu_red1",
                     )
+                    if use_vec and red1.dtype.count > 1:
+                        red1 = _hreduce_vector(red1, reduce_uop.arg[0])
                     reduce_ranges1 = [r for r in red1.ranges if r.arg[-1] == AxisType.REDUCE]
+                    if reduce_unroll_axis is None and reduce_ranges1:
+                        reduce_unroll_axis = reduce_ranges1[-1].arg[0]
                     acc1_store = acc1_regs[i].index(acc1_idx).store(red1).end(*reduce_ranges1)
                     acc1_val = acc1_regs[i].after(acc1_store).vindex(acc1_idx)
                     if not use_vec:
@@ -3586,8 +3826,11 @@ class HamiltonianSystem:
             else:
                 store_q = q_out.index(*ranges, ptr=True).store(q_val)
                 store_p = p_out.index(*ranges, ptr=True).store(p_val)
+            opts_to_apply = ()
+            if reduce_unroll_axis is not None and reduce_unroll > 1:
+                opts_to_apply = (Opt(OptOps.UNROLL, reduce_unroll_axis, reduce_unroll),)
             sink = UOp.group(store_q, store_p).end(*ranges).sink(
-                arg=KernelInfo(name=f"coupled_qp_new_with_reduce_{unroll_steps}", opts_to_apply=()))
+                arg=KernelInfo(name=f"coupled_qp_new_with_reduce_{unroll_steps}", opts_to_apply=opts_to_apply))
             def strip_const_ptr_index(ctx: dict, x: UOp) -> UOp|None:
                 if x.op is not Ops.INDEX: return None
                 base = x.src[0]
@@ -3697,6 +3940,11 @@ class HamiltonianSystem:
         q_sym_uop, p_sym_uop, dHdq_uop, dHdp_uop = self._get_coupled_grad_uops(q.device, q.shape, q.dtype)
         dHdq_reduce_nodes = [u for u in dHdq_uop.toposort() if u.op is Ops.REDUCE_AXIS]
         dHdp_reduce_nodes = [u for u in dHdp_uop.toposort() if u.op is Ops.REDUCE_AXIS]
+        if vector_width == 1 and q.device == "CPU" and q.shape:
+            if q.shape[-1] % 4 == 0:
+                vector_width = 4
+            elif q.shape[-1] % 2 == 0:
+                vector_width = 2
         reduce_placeholders_dHdq = {red: UOp.const(red.dtype, 0, q.device) for red in dHdq_reduce_nodes}
         reduce_placeholders_dHdp = {red: UOp.const(red.dtype, 0, q.device) for red in dHdp_reduce_nodes}
         if reduce_placeholders_dHdq or reduce_placeholders_dHdp:
@@ -3717,11 +3965,54 @@ class HamiltonianSystem:
         dHdp_placeholders = [reduce_placeholders_dHdp[r] for r in dHdp_reduce_nodes]
 
         use_fused_qp = bool(dHdq_reduce_nodes or dHdp_reduce_nodes)
-        if use_fused_qp and getenv("TINYGRAD_COUPLED_FUSED_TUNE", 0):
+        if use_fused_qp and vector_width == 1 and q.device == "CPU" and q.shape and getenv("TINYGRAD_COUPLED_FUSED_VEC_TUNE_AUTO", 1):
+            tune_key = (dt, q.device, q.shape, q.dtype)
+            cached = self._fused_reduce_vec_tune_cache.get(tune_key)
+            if cached is not None:
+                vector_width = cached
+            else:
+                cand_vw = [1, 2, 4, 8]
+                cand_vw = [v for v in cand_vw if q.shape[-1] % v == 0]
+                if not cand_vw:
+                    cand_vw = [1]
+                best_vw = 1
+                best_time = float("inf")
+                for vw in cand_vw:
+                    key_qp = (self.H, q.device, q.shape, q.dtype, "qp_new_reduce", dt, 1,
+                              vw, 1, tuple(dHdq_reduce_nodes), tuple(dHdp_reduce_nodes))
+                    kernel = self._elem_kernel_coupled_cache.get(key_qp)
+                    if kernel is None:
+                        kernel = self._build_coupled_kernel_qp_new_with_reduce(
+                            dt, q.device, q.shape, q.dtype, dHdq_elem_uop, dHdp_elem_uop,
+                            dHdq_reduce_nodes, dHdp_reduce_nodes, dHdq_placeholders, dHdp_placeholders,
+                            unroll_steps=1, vector_width=vw, reduce_unroll=1)
+                        self._elem_kernel_coupled_cache[key_qp] = kernel
+                    q_tmp = q.detach().clone().realize()
+                    p_tmp = p.detach().clone().realize()
+                    q_out = Tensor.empty(*q.shape, device=q.device, dtype=q.dtype)
+                    p_out = Tensor.empty(*p.shape, device=p.device, dtype=p.dtype)
+                    start = time.perf_counter()
+                    out = Tensor.custom_kernel(q_tmp, p_tmp, q_out, p_out, fxn=kernel)
+                    Tensor.realize(out[2], out[3])
+                    elapsed = time.perf_counter() - start
+                    if elapsed < best_time:
+                        best_time = elapsed
+                        best_vw = vw
+                vector_width = best_vw
+                self._fused_reduce_vec_tune_cache[tune_key] = best_vw
+        reduce_unroll = 1
+        reduce_unroll_tuned = False
+        tune_fused = use_fused_qp and (getenv("TINYGRAD_COUPLED_FUSED_TUNE", 0) or
+                                       (q.device == "CPU" and getenv("TINYGRAD_COUPLED_FUSED_TUNE_AUTO", 1)))
+        if tune_fused:
             tune_key = (dt, steps, q.device, q.shape, q.dtype)
             cached = self._fused_kernel_coupled_tune_cache.get(tune_key)
             if cached is not None:
-                vector_width, unroll_steps = cached
+                if len(cached) == 2:
+                    vector_width, unroll_steps = cached
+                else:
+                    vector_width, unroll_steps, reduce_unroll = cached
+                    reduce_unroll_tuned = True
             else:
                 cand_vw = [1, 2, 4, 8]
                 if vector_width > 1:
@@ -3744,36 +4035,44 @@ class HamiltonianSystem:
                 if not cand_unroll:
                     cand_unroll = [unroll_steps]
                 best_time = float("inf")
-                best = (vector_width, unroll_steps)
+                best = (vector_width, unroll_steps, reduce_unroll)
                 for vw in cand_vw:
                     for unroll in cand_unroll:
-                        key_qp = (self.H, q.device, q.shape, q.dtype, "qp_new_reduce", dt, unroll,
-                                  vw, tuple(dHdq_reduce_nodes), tuple(dHdp_reduce_nodes))
-                        kernel = self._elem_kernel_coupled_cache.get(key_qp)
-                        if kernel is None:
-                            kernel = self._build_coupled_kernel_qp_new_with_reduce(
-                                dt, q.device, q.shape, q.dtype, dHdq_elem_uop, dHdp_elem_uop,
-                                dHdq_reduce_nodes, dHdp_reduce_nodes, dHdq_placeholders, dHdp_placeholders,
-                                unroll_steps=unroll, vector_width=vw)
-                            self._elem_kernel_coupled_cache[key_qp] = kernel
-                        q_tmp = q.detach().clone().realize()
-                        p_tmp = p.detach().clone().realize()
-                        q_out = Tensor.empty(*q.shape, device=q.device, dtype=q.dtype)
-                        p_out = Tensor.empty(*p.shape, device=p.device, dtype=p.dtype)
-                        start = time.perf_counter()
-                        out = Tensor.custom_kernel(q_tmp, p_tmp, q_out, p_out, fxn=kernel)
-                        Tensor.realize(out[2], out[3])
-                        elapsed = time.perf_counter() - start
-                        if elapsed < best_time:
-                            best_time = elapsed
-                            best = (vw, unroll)
-                vector_width, unroll_steps = best
+                        cand_ru = [1, 2, 4, 8]
+                        if q.shape:
+                            last_extent = q.shape[-1] // vw if vw > 0 else q.shape[-1]
+                            cand_ru = [r for r in cand_ru if r <= last_extent]
+                        if not cand_ru:
+                            cand_ru = [1]
+                        for ru in cand_ru:
+                            key_qp = (self.H, q.device, q.shape, q.dtype, "qp_new_reduce", dt, unroll,
+                                      vw, ru, tuple(dHdq_reduce_nodes), tuple(dHdp_reduce_nodes))
+                            kernel = self._elem_kernel_coupled_cache.get(key_qp)
+                            if kernel is None:
+                                kernel = self._build_coupled_kernel_qp_new_with_reduce(
+                                    dt, q.device, q.shape, q.dtype, dHdq_elem_uop, dHdp_elem_uop,
+                                    dHdq_reduce_nodes, dHdp_reduce_nodes, dHdq_placeholders, dHdp_placeholders,
+                                    unroll_steps=unroll, vector_width=vw, reduce_unroll=ru)
+                                self._elem_kernel_coupled_cache[key_qp] = kernel
+                            q_tmp = q.detach().clone().realize()
+                            p_tmp = p.detach().clone().realize()
+                            q_out = Tensor.empty(*q.shape, device=q.device, dtype=q.dtype)
+                            p_out = Tensor.empty(*p.shape, device=p.device, dtype=p.dtype)
+                            start = time.perf_counter()
+                            out = Tensor.custom_kernel(q_tmp, p_tmp, q_out, p_out, fxn=kernel)
+                            Tensor.realize(out[2], out[3])
+                            elapsed = time.perf_counter() - start
+                            if elapsed < best_time:
+                                best_time = elapsed
+                                best = (vw, unroll, ru)
+                vector_width, unroll_steps, reduce_unroll = best
+                reduce_unroll_tuned = True
                 self._fused_kernel_coupled_tune_cache[tune_key] = best
         reduce_vector_width = 1
         if vector_width > 1 and q.shape and q.shape[-1] % vector_width == 0:
             reduce_vector_width = vector_width
-        reduce_unroll = 1
-        if (dHdq_reduce_nodes or dHdp_reduce_nodes) and q.shape and not getenv("TINYGRAD_COUPLED_REDUCE_TUNE", 0) and \
+        if (dHdq_reduce_nodes or dHdp_reduce_nodes) and q.shape and not reduce_unroll_tuned and \
+           not getenv("TINYGRAD_COUPLED_REDUCE_TUNE", 0) and \
            not getenv("TINYGRAD_COUPLED_REDUCE_TUNE_BOTH", 0) and not getenv("TINYGRAD_COUPLED_REDUCE_UNROLL_TUNE", 0):
             last_extent = q.shape[-1] // reduce_vector_width if reduce_vector_width > 0 else q.shape[-1]
             if last_extent >= 16384:
@@ -3940,13 +4239,13 @@ class HamiltonianSystem:
             dHdq_elem_use = dHdq_elem_uop
             dHdp_elem_use = dHdp_elem_uop
             key_qp = (self.H, q.device, q.shape, q.dtype, "qp_new_reduce", dt, unroll_steps,
-                      vector_width, tuple(dHdq_reduce_nodes), tuple(dHdp_reduce_nodes))
+                      vector_width, reduce_unroll, tuple(dHdq_reduce_nodes), tuple(dHdp_reduce_nodes))
             kernel_qp_reduce = self._elem_kernel_coupled_cache.get(key_qp)
             if kernel_qp_reduce is None:
                 kernel_qp_reduce = self._build_coupled_kernel_qp_new_with_reduce(
                     dt, q.device, q.shape, q.dtype, dHdq_elem_use, dHdp_elem_use,
                     dHdq_reduce_nodes, dHdp_reduce_nodes, dHdq_placeholders, dHdp_placeholders,
-                    unroll_steps=unroll_steps, vector_width=vector_width)
+                    unroll_steps=unroll_steps, vector_width=vector_width, reduce_unroll=reduce_unroll)
                 self._elem_kernel_coupled_cache[key_qp] = kernel_qp_reduce
         else:
             kernel_qp_new = None
@@ -4818,12 +5117,22 @@ class HamiltonianSystem:
                     ranges = [UOp.range(s, i+1) for i,s in enumerate(shape[:-1])]
                     ranges.append(UOp.range(shape[-1] // vector_width, len(shape)))
                     zero_idxs = tuple(UOp.const(dtypes.index, 0) for _ in range(len(shape)))
+                    ranges_reduce_vec = [UOp.range(s, i+1+len(shape)) for i, s in enumerate(shape[:-1])]
+                    ranges_reduce_vec.append(UOp.range(shape[-1] // vector_width, 2 * len(shape)))
+                    reduce_counter_vec = [max(r.arg[0] for r in ranges_reduce_vec) + 1]
                     def compute_accs(reduce_nodes: list[UOp], reduce_placeholders: dict[UOp, UOp],
                                      q_uop: UOp, p_uop: UOp, reg_base: int) -> dict[UOp, UOp]:
                         if not reduce_nodes: return {}
                         acc_loads = {}
                         index_map = {red: i for i, red in enumerate(reduce_nodes)}
                         sub_reduce = {q_sym_uop: q_uop.vindex(*ranges_reduce), p_sym_uop: p_uop.vindex(*ranges_reduce)}
+                        base = ranges_reduce_vec[-1] * UOp.const(dtypes.index, vector_width)
+                        q_ptr = q_uop.index(*ranges_reduce_vec[:-1], base, ptr=True)
+                        p_ptr = p_uop.index(*ranges_reduce_vec[:-1], base, ptr=True)
+                        vec_dtype = q_uop.dtype.base.vec(vector_width)
+                        q_val_red = q_ptr.cast(vec_dtype.ptr(size=q_ptr.dtype.size, addrspace=q_ptr.dtype.addrspace)).load()
+                        p_val_red = p_ptr.cast(vec_dtype.ptr(size=p_ptr.dtype.size, addrspace=p_ptr.dtype.addrspace)).load()
+                        sub_reduce_vec = {q_sym_uop: q_val_red, p_sym_uop: p_val_red}
                         full_nodes = [red for red in reduce_nodes if reduce_full.get(red, False)]
                         can_group = len(full_nodes) > 1
                         if can_group:
@@ -4833,17 +5142,26 @@ class HamiltonianSystem:
                                     break
                         grouped = set()
                         if can_group:
+                            expr_cache: dict[bytes, UOp] = {}
                             op_groups: dict[Ops, list[UOp]] = {}
                             for red in full_nodes:
                                 op_groups.setdefault(red.arg[0], []).append(red)
                             for op_kind, group in op_groups.items():
                                 exprs = []
                                 for red in group:
-                                    expr = red.src[0].substitute(sub_reduce)
-                                    expr = rewrite_with_ranges(expr, ranges_reduce, reduce_counter)
+                                    expr = red.src[0].substitute(sub_reduce_vec)
+                                    expr = rewrite_with_ranges(expr, ranges_reduce_vec, reduce_counter_vec)
+                                    if expr.dtype.count > 1:
+                                        expr = _hreduce_vector(expr, op_kind)
+                                    cached = expr_cache.get(expr.key)
+                                    if cached is None:
+                                        expr_cache[expr.key] = expr
+                                    else:
+                                        expr = cached
                                     exprs.append(expr)
                                 vec_expr = exprs[0].vectorize(*exprs[1:]) if len(exprs) > 1 else exprs[0]
-                                red_uop = UOp(Ops.REDUCE, vec_expr.dtype, src=(vec_expr,)+tuple(ranges_reduce), arg=op_kind)
+                                red_uop = UOp(
+                                    Ops.REDUCE, vec_expr.dtype, src=(vec_expr,)+tuple(ranges_reduce_vec), arg=op_kind)
                                 red_val = red_uop.vindex(*zero_idxs)
                                 reduce_ranges = [r for r in red_uop.ranges if r.arg[-1] == AxisType.REDUCE]
                                 for j, red in enumerate(group):
@@ -4855,15 +5173,19 @@ class HamiltonianSystem:
                                     grouped.add(red)
                         for i, red in enumerate(reduce_nodes):
                             if red in grouped: continue
-                            red_val = red.substitute(sub_reduce)
-                            red_val = rewrite_with_ranges(red_val, ranges_reduce, reduce_counter)
                             if reduce_full.get(red, False):
+                                red_val = red.substitute(sub_reduce_vec)
+                                red_val = rewrite_with_ranges(red_val, ranges_reduce_vec, reduce_counter_vec)
+                                if red_val.dtype.count > 1:
+                                    red_val = _hreduce_vector(red_val, red.arg[0])
                                 acc = UOp(Ops.DEFINE_REG, red.dtype.ptr(size=1, addrspace=AddrSpace.REG), arg=reg_base + i)
                                 reduce_ranges = [r for r in red_val.ranges if r.arg[-1] == AxisType.REDUCE]
                                 acc_store = acc.index(UOp.const(dtypes.int, 0)).store(red_val).end(*reduce_ranges, step)
                                 acc_idx = acc.after(acc_store).index(UOp.const(dtypes.int, 0))
                                 acc_loads[reduce_placeholders[red]] = acc_idx.broadcast(vector_width)
                             else:
+                                red_val = red.substitute(sub_reduce)
+                                red_val = rewrite_with_ranges(red_val, ranges_reduce, reduce_counter)
                                 red_val = red_val.vindex(*ranges)
                                 acc_loads[reduce_placeholders[red]] = red_val.broadcast(vector_width)
                         return acc_loads
@@ -4885,6 +5207,7 @@ class HamiltonianSystem:
                                     break
                         grouped = set()
                         if can_group:
+                            expr_cache: dict[bytes, UOp] = {}
                             op_groups: dict[Ops, list[UOp]] = {}
                             for red in full_nodes:
                                 op_groups.setdefault(red.arg[0], []).append(red)
@@ -4893,9 +5216,17 @@ class HamiltonianSystem:
                                 for red in group:
                                     expr = red.src[0].substitute(sub_reduce)
                                     expr = rewrite_with_ranges(expr, ranges_reduce, reduce_counter)
+                                    if expr.dtype.count > 1:
+                                        expr = _hreduce_vector(expr, op_kind)
+                                    cached = expr_cache.get(expr.key)
+                                    if cached is None:
+                                        expr_cache[expr.key] = expr
+                                    else:
+                                        expr = cached
                                     exprs.append(expr)
                                 vec_expr = exprs[0].vectorize(*exprs[1:]) if len(exprs) > 1 else exprs[0]
-                                red_uop = UOp(Ops.REDUCE, vec_expr.dtype, src=(vec_expr,)+tuple(ranges_reduce), arg=op_kind)
+                                red_uop = UOp(
+                                    Ops.REDUCE, vec_expr.dtype, src=(vec_expr,)+tuple(ranges_reduce), arg=op_kind)
                                 red_val = red_uop.vindex(*zero_idxs)
                                 reduce_ranges = [r for r in red_uop.ranges if r.arg[-1] == AxisType.REDUCE]
                                 for j, red in enumerate(group):
@@ -5379,6 +5710,21 @@ class HamiltonianSystem:
 #
 # This is Euler's equation when H = 0.5 * L · (I⁻¹ L)
 
+def _reshape_for_vec(z: Tensor, vec_width: int, vec_dim: int) -> tuple[Tensor, tuple[int, ...] | None]:
+  if vec_width <= 1:
+    return z, None
+  if not z.shape or z.shape[-1] != vec_dim:
+    return z, None
+  if z.numel() % (vec_width * vec_dim) != 0:
+    return z, None
+  orig = z.shape
+  return z.reshape(-1, vec_width, vec_dim), orig
+
+
+def _reshape_from_vec(z: Tensor, orig: tuple[int, ...] | None) -> Tensor:
+  return z.reshape(orig) if orig is not None else z
+
+
 def cross(a: Tensor, b: Tensor) -> Tensor:
   """Cross product a × b for 3-vectors (supports leading batch dims)."""
   ax, ay, az = a[..., 0], a[..., 1], a[..., 2]
@@ -5391,18 +5737,10 @@ def cross(a: Tensor, b: Tensor) -> Tensor:
   )
 
 
-def _grad_LP(z: Tensor, H_func) -> Tensor:
-  """Compute gradient of Hamiltonian for Lie-Poisson systems."""
-  z_grad = z.detach().requires_grad_(True)
-  H = H_func(z_grad)
-  H.backward()
-  return z_grad.grad.detach() if z_grad.grad is not None else z * 0
-
-
 def lie_poisson_euler_so3(L: Tensor, H_func, dt: float = 0.01) -> Tensor:
   """1st-order Lie-Poisson Euler for so(3): dL/dt = L × ∇H(L)"""
   dHdL = _grad_LP(L, H_func)
-  return (L + dt * cross(L, dHdL)).realize()
+  return L + dt * cross(L, dHdL)
 
 
 def lie_poisson_midpoint_so3(L: Tensor, H_func, dt: float = 0.01,
@@ -5419,7 +5757,7 @@ def lie_poisson_midpoint_so3(L: Tensor, H_func, dt: float = 0.01,
       break
     L_next = L_new
 
-  return L_next.realize()
+  return L_next
 
 
 def lie_poisson_rk4_so3(L: Tensor, H_func, dt: float = 0.01) -> Tensor:
@@ -5431,7 +5769,7 @@ def lie_poisson_rk4_so3(L: Tensor, H_func, dt: float = 0.01) -> Tensor:
   k2 = f(L + 0.5 * dt * k1)
   k3 = f(L + 0.5 * dt * k2)
   k4 = f(L + dt * k3)
-  return (L + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)).realize()
+  return L + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
 
 
 def lie_poisson_splitting_so3(L: Tensor, I_inv: Tensor, dt: float = 0.01) -> Tensor:
@@ -5453,7 +5791,7 @@ def lie_poisson_splitting_so3(L: Tensor, I_inv: Tensor, dt: float = 0.01) -> Ten
     L = rotate_axis(L, axis, 0.5 * dt * L[..., axis] * I_inv[axis])
   for axis in [2, 1, 0]:
     L = rotate_axis(L, axis, 0.5 * dt * L[..., axis] * I_inv[axis])
-  return L.realize()
+  return L
 
 
 class LiePoissonSystem:
@@ -5473,14 +5811,17 @@ class LiePoissonSystem:
       raise ValueError(f"Only so3 supported, got: {algebra}")
     self.H = H_func
     self.algebra = algebra
-    if integrator not in self.INTEGRATORS:
-      raise ValueError(f"Unknown integrator: {integrator}")
-    self._step = self.INTEGRATORS[integrator]
-    self.integrator_name = integrator
     if policy is None:
       from tinygrad.physics_profile import get_default_profile
       policy = get_default_profile().policy
     self.policy = policy
+    if integrator == "auto":
+      strict_drift = self.policy.drift_target is not None and self.policy.drift_target <= 1e-6
+      integrator = "midpoint" if self.policy.accuracy != "fast" or strict_drift else "euler"
+    if integrator not in self.INTEGRATORS:
+      raise ValueError(f"Unknown integrator: {integrator}")
+    self._step = self.INTEGRATORS[integrator]
+    self.integrator_name = integrator
 
   def step(self, z: Tensor, dt: float = 0.01) -> Tensor:
     return self._step(z, self.H, dt)
@@ -5493,9 +5834,16 @@ class LiePoissonSystem:
 
   def evolve(self, z: Tensor, dt: float, steps: int,
              record_every: int = 1, policy: SymplecticPolicy | None = None,
-             scan: bool | None = None, unroll: int | None = None) -> tuple[Tensor, list]:
+             scan: bool | None = None, unroll: int | None = None,
+             vector_width: int | None = None) -> tuple[Tensor, list]:
     policy = policy or self.policy
     use_scan = policy.should_scan(steps, z.shape, z.device) if scan is None else scan
+    op_cost = None
+    if getenv("TINYGRAD_PHYSICS_UNROLL_COST", 1):
+      try:
+        op_cost = _count_uops_limit(self.H(z).uop, 512)
+      except Exception:
+        op_cost = None
     def make_step(scale: float):
       return lambda z_in: self.step(z_in, dt * scale)
     def energy_fn(z_in: Tensor):
@@ -5503,23 +5851,32 @@ class LiePoissonSystem:
     dt_scale, _ = policy.adjust_dt(steps, z.shape, z.device, (z,), make_step, energy_fn, "TINYGRAD_PHYSICS_DRIFT_LIE")
     if dt_scale != 1.0:
       dt *= dt_scale
+    if vector_width is None:
+      vector_width = policy.choose_vector_width(z.shape, z.device, 3)
+    z_use, z_shape = _reshape_for_vec(z, vector_width, 3)
     if unroll is None and use_scan:
-      unroll = policy.choose_unroll(steps, z.shape, z.device)
-    if use_scan and unroll is not None:
+      unroll = policy.choose_unroll(steps, z_use.shape, z_use.device, op_cost=op_cost)
+    if unroll is not None:
       if record_every % unroll != 0:
         record_every = unroll
-      out = self.evolve_unrolled(z, dt, steps, unroll, record_every=record_every)
+      out = self.evolve_unrolled(z_use, dt, steps, unroll, record_every=record_every)
       policy.maybe_print_report(steps, z.shape, z.device)
-      return out
+      z_out, hist = out
+      if z_shape is not None:
+        hist = [(z_t.reshape(z_shape), e, c) for (z_t, e, c) in hist]
+      return _reshape_from_vec(z_out, z_shape), hist
     z_history: list[Tensor] = []
     for i in range(steps):
       if i % record_every == 0:
-        z_history.append(z.detach())
-      z = self.step(z, dt)
-    z_history.append(z.detach())
-    history = [(z_t.numpy().copy(), self.energy(z_t), self.casimir(z_t)) for z_t in z_history]
+        z_history.append(z_use.detach())
+      z_use = self.step(z_use, dt)
+    z_history.append(z_use.detach())
+    history = []
+    for z_t in z_history:
+      z_emit = _reshape_from_vec(z_t, z_shape)
+      history.append((z_emit.numpy().copy(), self.energy(z_emit), self.casimir(z_emit)))
     policy.maybe_print_report(steps, z.shape, z.device)
-    return z, history
+    return _reshape_from_vec(z_use, z_shape), history
 
   def compile_unrolled_step(self, dt: float, unroll: int):
     """Compile an unrolled step for Lie-Poisson systems."""
@@ -5572,12 +5929,15 @@ def quaternion_normalize(q: Tensor) -> Tensor:
   return q / norm.unsqueeze(-1)
 
 
-def integrate_orientation(quat: Tensor, omega: Tensor, dt: float) -> Tensor:
+def integrate_orientation(quat: Tensor, omega: Tensor, dt: float, project: bool = True) -> Tensor:
   """Integrate orientation quaternion: dq/dt = 0.5 * q ⊗ [0, ω]"""
   zero = omega[..., 0] * 0
   omega_quat = Tensor.stack([zero, omega[..., 0], omega[..., 1], omega[..., 2]], dim=-1)
   dq = quaternion_multiply(quat, omega_quat) * 0.5
-  return quaternion_normalize(quat + dt * dq).realize()
+  out = quat + dt * dq
+  if project:
+    out = quaternion_normalize(out)
+  return out
 
 
 class RigidBodySystem:
@@ -5588,22 +5948,30 @@ class RigidBodySystem:
     self.I = I
     self.I_inv = 1.0 / I
     self.H = lambda L: 0.5 * (L * L * self.I_inv).sum()
-    self.integrator_name = integrator
     if policy is None:
       from tinygrad.physics_profile import get_default_profile
       policy = get_default_profile().policy
     self.policy = policy
+    if integrator == "auto":
+      strict_drift = self.policy.drift_target is not None and self.policy.drift_target <= 1e-6
+      integrator = "midpoint" if self.policy.accuracy in ("precise", "ultra_precise") or strict_drift else "splitting"
+    self.integrator_name = integrator
     if integrator == "splitting":
       self._step_L = lambda L, dt: lie_poisson_splitting_so3(L, self.I_inv, dt)
-    elif integrator in LiePoissonSystem.INTEGRATORS:
-      self._lp = LiePoissonSystem(self.H, algebra="so3", integrator=integrator)
+    elif integrator in LiePoissonSystem.INTEGRATORS or integrator == "auto":
+      self._lp = LiePoissonSystem(self.H, algebra="so3", integrator=integrator, policy=self.policy)
       self._step_L = lambda L, dt: self._lp.step(L, dt)
     else:
       raise ValueError(f"Unknown integrator: {integrator}")
 
-  def step(self, L: Tensor, q: Tensor, dt: float = 0.01) -> tuple[Tensor, Tensor]:
+  def step(self, L: Tensor, q: Tensor, dt: float = 0.01, project: bool = True) -> tuple[Tensor, Tensor]:
     L_new = self._step_L(L, dt)
-    return L_new, integrate_orientation(q, L_new * self.I_inv, dt)
+    return L_new, integrate_orientation(q, L_new * self.I_inv, dt, project=project)
+
+  def step_fused(self, L: Tensor, q: Tensor, dt: float = 0.01, project: bool = True) -> tuple[Tensor, Tensor]:
+    L_new = self._step_L(L, dt)
+    q_new = integrate_orientation(q, L_new * self.I_inv, dt, project=project)
+    return L_new, q_new
 
   def energy(self, L: Tensor) -> float:
     return float(self.H(L).numpy())
@@ -5616,44 +5984,75 @@ class RigidBodySystem:
              scan: bool | None = None, unroll: int | None = None) -> tuple[Tensor, Tensor, list]:
     policy = policy or self.policy
     use_scan = policy.should_scan(steps, L.shape, L.device) if scan is None else scan
+    op_cost = None
+    if getenv("TINYGRAD_PHYSICS_UNROLL_COST", 1):
+      try:
+        op_cost = _count_uops_limit(self.H(L).uop, 512)
+      except Exception:
+        op_cost = None
     def make_step(scale: float):
-      return lambda L_in, q_in: self.step(L_in, q_in, dt * scale)
+      return lambda L_in, q_in: self.step_fused(L_in, q_in, dt * scale)
     def energy_fn(L_in: Tensor, q_in: Tensor):
       return float(self.H(L_in).numpy())
     dt_scale, _ = policy.adjust_dt(steps, L.shape, L.device, (L, q), make_step, energy_fn, "TINYGRAD_PHYSICS_DRIFT_RIGID")
     if dt_scale != 1.0:
       dt *= dt_scale
+    vec = policy.choose_vector_width(L.shape, L.device, 3)
+    L_use, L_shape = _reshape_for_vec(L, vec, 3)
+    q_use, q_shape = _reshape_for_vec(q, vec, 4)
+    if q_shape is None:
+      L_use, L_shape = L, None
+      q_use, q_shape = q, None
     if unroll is None and use_scan:
-      unroll = policy.choose_unroll(steps, L.shape, L.device)
-    if use_scan and unroll is not None:
+      unroll = policy.choose_unroll(steps, L_use.shape, L_use.device, op_cost=op_cost)
+    def constraint_fn(state: tuple[Tensor, Tensor]):
+      return (state[1] * state[1]).sum(axis=-1).mean()
+    def step_fn(state: tuple[Tensor, Tensor], i: int, stride: int):
+      L_i, q_i = state
+      project = (i + 1) % stride == 0
+      return self.step_fused(L_i, q_i, dt, project=project)
+    project_every = policy.choose_projection_stride(
+      steps, L_use.shape, L_use.device, "unit_norm_q", (L_use, q_use), step_fn, constraint_fn)
+    if unroll is not None:
       if record_every % unroll != 0:
         record_every = unroll
-      out = self.evolve_unrolled(L, q, dt, steps, unroll, record_every=record_every)
+      out = self.evolve_unrolled(L_use, q_use, dt, steps, unroll, record_every=record_every, project_every=project_every)
       policy.maybe_print_report(steps, L.shape, L.device)
-      return out
+      L_out, q_out, history = out
+      if L_shape is not None:
+        history = [(L_t.reshape(L_shape), q_t.reshape(q_shape), e, c) for (L_t, q_t, e, c) in history]
+      return _reshape_from_vec(L_out, L_shape), _reshape_from_vec(q_out, q_shape), history
     history = []
     for i in range(steps):
+      project = (i + 1) % project_every == 0
       if i % record_every == 0:
-        history.append((L.numpy().copy(), q.numpy().copy(), self.energy(L), self.casimir(L)))
-      L, q = self.step(L, q, dt)
-    history.append((L.numpy().copy(), q.numpy().copy(), self.energy(L), self.casimir(L)))
+        L_emit = _reshape_from_vec(L_use, L_shape)
+        q_emit = _reshape_from_vec(q_use, q_shape)
+        history.append((L_emit.numpy().copy(), q_emit.numpy().copy(), self.energy(L_emit), self.casimir(L_emit)))
+      L_use, q_use = self.step_fused(L_use, q_use, dt, project=project)
+    L_emit = _reshape_from_vec(L_use, L_shape)
+    q_emit = _reshape_from_vec(q_use, q_shape)
+    history.append((L_emit.numpy().copy(), q_emit.numpy().copy(), self.energy(L_emit), self.casimir(L_emit)))
     policy.maybe_print_report(steps, L.shape, L.device)
-    return L, q, history
+    return _reshape_from_vec(L_use, L_shape), _reshape_from_vec(q_use, q_shape), history
 
-  def compile_unrolled_step(self, dt: float, unroll: int):
+  def compile_unrolled_step(self, dt: float, unroll: int, project_every: int = 1):
     """Compile an unrolled rigid-body step."""
     if unroll < 1:
       raise ValueError("unroll must be >= 1")
+    if project_every < 1:
+      raise ValueError("project_every must be >= 1")
 
     def unrolled_step(L: Tensor, q: Tensor):
       for _ in range(unroll):
-        L, q = self.step(L, q, dt)
+        project = (_ + 1) % project_every == 0
+        L, q = self.step_fused(L, q, dt, project=project)
       return L, q
 
     return TinyJit(unrolled_step)
 
   def evolve_unrolled(self, L: Tensor, q: Tensor, dt: float, steps: int, unroll: int,
-                      record_every: int = 1) -> tuple[Tensor, Tensor, list]:
+                      record_every: int = 1, project_every: int = 1) -> tuple[Tensor, Tensor, list]:
     """Evolve using an unrolled compiled step to reduce Python overhead."""
     if unroll < 1:
       raise ValueError("unroll must be >= 1")
@@ -5662,7 +6061,7 @@ class RigidBodySystem:
     if record_every % unroll != 0:
       raise ValueError("record_every must be divisible by unroll")
 
-    step = self.compile_unrolled_step(dt, unroll)
+    step = self.compile_unrolled_step(dt, unroll, project_every=project_every)
     history = []
     for i in range(0, steps, unroll):
       if i % record_every == 0:
@@ -5732,32 +6131,35 @@ class SatelliteControlIntegrator:
       policy = get_default_profile().policy
     self.policy = policy
 
-  def step(self, L: Tensor, quat: Tensor) -> tuple[Tensor, Tensor]:
+  def step(self, L: Tensor, quat: Tensor, project: bool = True) -> tuple[Tensor, Tensor]:
     omega = L * self.I_inv
     q_err = (quat[..., 0:1] < 0).where(-quat, quat)
     u = self.control(q_err, omega)
     L_half = L + 0.5 * self.dt * u
     L_free = lie_poisson_splitting_so3(L_half, self.I_inv, self.dt)
     omega_free = L_free * self.I_inv
-    quat_free = integrate_orientation(quat, omega_free, self.dt)
+    quat_free = integrate_orientation(quat, omega_free, self.dt, project=project)
     q_err2 = (quat_free[..., 0:1] < 0).where(-quat_free, quat_free)
     u2 = self.control(q_err2, omega_free)
     L_next = L_free + 0.5 * self.dt * u2
     return L_next, quat_free
 
-  def compile_unrolled_step(self, unroll: int):
+  def compile_unrolled_step(self, unroll: int, project_every: int = 1):
     if unroll < 1:
       raise ValueError("unroll must be >= 1")
+    if project_every < 1:
+      raise ValueError("project_every must be >= 1")
 
     def unrolled_step(L: Tensor, quat: Tensor):
       for _ in range(unroll):
-        L, quat = self.step(L, quat)
+        project = (_ + 1) % project_every == 0
+        L, quat = self.step(L, quat, project=project)
       return L, quat
 
     return TinyJit(unrolled_step)
 
   def evolve_unrolled(self, L: Tensor, quat: Tensor, steps: int, unroll: int,
-                      record_every: int = 1) -> tuple[Tensor, Tensor, list]:
+                      record_every: int = 1, project_every: int = 1) -> tuple[Tensor, Tensor, list]:
     if unroll < 1:
       raise ValueError("unroll must be >= 1")
     if steps % unroll != 0:
@@ -5765,7 +6167,7 @@ class SatelliteControlIntegrator:
     if record_every % unroll != 0:
       raise ValueError("record_every must be divisible by unroll")
 
-    step = self.compile_unrolled_step(unroll)
+    step = self.compile_unrolled_step(unroll, project_every=project_every)
     history = []
     for i in range(0, steps, unroll):
       if i % record_every == 0:
@@ -5773,6 +6175,56 @@ class SatelliteControlIntegrator:
       L, quat = step(L, quat)
     history.append((L.detach(), quat.detach()))
     return L, quat, history
+
+  def evolve(self, L: Tensor, quat: Tensor, steps: int, record_every: int = 1,
+             policy: SymplecticPolicy | None = None, scan: bool | None = None,
+             unroll: int | None = None) -> tuple[Tensor, Tensor, list]:
+    policy = policy or self.policy
+    use_scan = policy.should_scan(steps, L.shape, L.device) if scan is None else scan
+    vec = policy.choose_vector_width(L.shape, L.device, 3)
+    L_use, L_shape = _reshape_for_vec(L, vec, 3)
+    q_use, q_shape = _reshape_for_vec(quat, vec, 4)
+    if q_shape is None:
+      L_use, L_shape = L, None
+      q_use, q_shape = quat, None
+    op_cost = None
+    if getenv("TINYGRAD_PHYSICS_UNROLL_COST", 1):
+      try:
+        op_cost = _count_uops_limit((L_use * L_use).sum().uop, 512)
+      except Exception:
+        op_cost = None
+    if unroll is None and use_scan:
+      unroll = policy.choose_unroll(steps, L_use.shape, L_use.device, candidates=[5, 10, 20], op_cost=op_cost)
+    def constraint_fn(state: tuple[Tensor, Tensor]):
+      return (state[1] * state[1]).sum(axis=-1).mean()
+    def step_fn(state: tuple[Tensor, Tensor], i: int, stride: int):
+      L_i, q_i = state
+      project = (i + 1) % stride == 0
+      return self.step(L_i, q_i, project=project)
+    project_every = policy.choose_projection_stride(
+      steps, L_use.shape, L_use.device, "unit_norm_q", (L_use, q_use), step_fn, constraint_fn)
+    if unroll is not None:
+      if record_every % unroll != 0:
+        record_every = unroll
+      out = self.evolve_unrolled(L_use, q_use, steps, unroll, record_every=record_every, project_every=project_every)
+      policy.maybe_print_report(steps, L.shape, L.device)
+      L_out, q_out, history = out
+      if L_shape is not None:
+        history = [(_reshape_from_vec(L_t, L_shape), _reshape_from_vec(q_t, q_shape)) for (L_t, q_t) in history]
+      return _reshape_from_vec(L_out, L_shape), _reshape_from_vec(q_out, q_shape), history
+    history = []
+    for i in range(steps):
+      project = (i + 1) % project_every == 0
+      if i % record_every == 0:
+        L_emit = _reshape_from_vec(L_use, L_shape)
+        q_emit = _reshape_from_vec(q_use, q_shape)
+        history.append((L_emit.detach(), q_emit.detach()))
+      L_use, q_use = self.step(L_use, q_use, project=project)
+    L_emit = _reshape_from_vec(L_use, L_shape)
+    q_emit = _reshape_from_vec(q_use, q_shape)
+    history.append((L_emit.detach(), q_emit.detach()))
+    policy.maybe_print_report(steps, L.shape, L.device)
+    return _reshape_from_vec(L_use, L_shape), _reshape_from_vec(q_use, q_shape), history
 
 
 class LiePoissonBracketE3:
@@ -5813,6 +6265,9 @@ class HeavyTopIntegrator:
     self.H = hamiltonian
     self.dt = dt
     self.bracket = LiePoissonBracketE3()
+    self._eps = Tensor([1e-10], dtype=self.H.dtype)
+    self._e3 = Tensor([0.0, 0.0, 1.0], dtype=self.H.dtype)
+    self._mgl_e3 = self._e3 * self.H.mgl
     if policy is None:
       from tinygrad.physics_profile import get_default_profile
       policy = get_default_profile().policy
@@ -5820,8 +6275,7 @@ class HeavyTopIntegrator:
 
   def _rotate_vector(self, v: Tensor, axis: Tensor, angle: Tensor) -> Tensor:
     axis_norm = (axis * axis).sum().sqrt()
-    eps = Tensor([1e-10], dtype=self.H.dtype)
-    k = axis / (axis_norm + eps)
+    k = axis / (axis_norm + self._eps)
     c = angle.cos()
     s = angle.sin()
     if c.ndim < v.ndim:
@@ -5835,8 +6289,7 @@ class HeavyTopIntegrator:
 
   def _derivatives(self, L: Tensor, gamma: Tensor) -> tuple[Tensor, Tensor]:
     omega = self.H.I_inv * L
-    e3 = Tensor([0.0, 0.0, 1.0], dtype=self.H.dtype)
-    dL = cross(L, omega) + cross(gamma, e3) * self.H.mgl
+    dL = cross(L, omega) + cross(gamma, self._e3) * self.H.mgl
     dgamma = cross(gamma, omega)
     return dL, dgamma
 
@@ -5874,7 +6327,7 @@ class HeavyTopIntegrator:
     state = ProductManifold(L_new, gamma_new).normalize_gamma()
     return state.L, state.gamma
 
-  def step_symmetric(self, state: ProductManifold) -> ProductManifold:
+  def step_symmetric(self, state: ProductManifold, project: bool = True) -> ProductManifold:
     L, gamma = state.L, state.gamma
     dt = self.dt
     omega3 = self.H.I_inv[2] * L[..., 2]
@@ -5892,9 +6345,12 @@ class HeavyTopIntegrator:
     angle = omega3 * (dt/2)
     L = self._rotate_vector(L, e3, angle)
     gamma = self._rotate_vector(gamma, e3, angle)
-    return ProductManifold(L, gamma).normalize_gamma().realize()
+    state = ProductManifold(L, gamma)
+    if project:
+      state = state.normalize_gamma()
+    return state.realize()
 
-  def step_symmetric_tensors(self, L: Tensor, gamma: Tensor) -> tuple[Tensor, Tensor]:
+  def step_symmetric_tensors(self, L: Tensor, gamma: Tensor, project: bool = True) -> tuple[Tensor, Tensor]:
     dt = self.dt
     omega3 = self.H.I_inv[2] * L[..., 2]
     angle = omega3 * (dt/2)
@@ -5911,38 +6367,48 @@ class HeavyTopIntegrator:
     angle = omega3 * (dt/2)
     L = self._rotate_vector(L, e3, angle)
     gamma = self._rotate_vector(gamma, e3, angle)
-    state = ProductManifold(L, gamma).normalize_gamma()
+    state = ProductManifold(L, gamma)
+    if project:
+      state = state.normalize_gamma()
     return state.L, state.gamma
 
-  def step(self, state: ProductManifold) -> ProductManifold:
-    return self.step_symmetric(state)
+  def step_fused_tensors(self, L: Tensor, gamma: Tensor, project: bool = True) -> tuple[Tensor, Tensor]:
+    return self.step_symmetric_tensors(L, gamma, project=project)
 
-  def step_tensors(self, L: Tensor, gamma: Tensor) -> tuple[Tensor, Tensor]:
-    return self.step_symmetric_tensors(L, gamma)
+  def step(self, state: ProductManifold, project: bool = True) -> ProductManifold:
+    return self.step_symmetric(state, project=project)
 
-  def step_explicit(self, state: ProductManifold) -> ProductManifold:
+  def step_tensors(self, L: Tensor, gamma: Tensor, project: bool = True) -> tuple[Tensor, Tensor]:
+    return self.step_symmetric_tensors(L, gamma, project=project)
+
+  def step_explicit(self, state: ProductManifold, project: bool = True) -> ProductManifold:
     omega = self.H.angular_velocity(state.L)
-    e3 = Tensor([0.0, 0.0, 1.0], dtype=self.H.dtype)
-    grad_gamma = e3 * self.H.mgl
+    grad_gamma = self._mgl_e3
     dL_dt, dgamma_dt = self.bracket.flow(state, omega, grad_gamma)
     L_new = state.L + dL_dt * self.dt
     gamma_new = state.gamma + dgamma_dt * self.dt
-    return ProductManifold(L_new, gamma_new).normalize_gamma().realize()
+    state = ProductManifold(L_new, gamma_new)
+    if project:
+      state = state.normalize_gamma()
+    return state.realize()
 
-  def step_explicit_tensors(self, L: Tensor, gamma: Tensor) -> tuple[Tensor, Tensor]:
+  def step_explicit_tensors(self, L: Tensor, gamma: Tensor, project: bool = True) -> tuple[Tensor, Tensor]:
     omega = self.H.angular_velocity(L)
-    e3 = Tensor([0.0, 0.0, 1.0], dtype=self.H.dtype)
-    grad_gamma = e3 * self.H.mgl
+    grad_gamma = self._mgl_e3
     dL_dt, dgamma_dt = self.bracket.flow(ProductManifold(L, gamma), omega, grad_gamma)
     L_new = L + dL_dt * self.dt
     gamma_new = gamma + dgamma_dt * self.dt
-    state = ProductManifold(L_new, gamma_new).normalize_gamma()
+    state = ProductManifold(L_new, gamma_new)
+    if project:
+      state = state.normalize_gamma()
     return state.L, state.gamma
 
-  def compile_unrolled_step(self, unroll: int, method: str = "splitting"):
+  def compile_unrolled_step(self, unroll: int, method: str = "splitting", project_every: int = 1):
     """Compile an unrolled heavy-top step."""
     if unroll < 1:
       raise ValueError("unroll must be >= 1")
+    if project_every < 1:
+      raise ValueError("project_every must be >= 1")
     if method == "rk4":
       raise ValueError("rk4 is not symplectic; use method='splitting'")
     if method == "splitting":
@@ -5952,13 +6418,15 @@ class HeavyTopIntegrator:
 
     def unrolled_step(L: Tensor, gamma: Tensor):
       for _ in range(unroll):
-        L, gamma = step_fn(L, gamma)
+        project = (_ + 1) % project_every == 0
+        L, gamma = step_fn(L, gamma, project=project)
       return L, gamma
 
     return TinyJit(unrolled_step)
 
   def evolve_unrolled(self, L: Tensor, gamma: Tensor, steps: int, unroll: int,
-                      method: str = "splitting", record_every: int = 1) -> tuple[Tensor, Tensor, list]:
+                      method: str = "splitting", record_every: int = 1,
+                      project_every: int = 1) -> tuple[Tensor, Tensor, list]:
     """Evolve heavy-top dynamics using unrolled compiled steps."""
     if unroll < 1:
       raise ValueError("unroll must be >= 1")
@@ -5967,7 +6435,7 @@ class HeavyTopIntegrator:
     if record_every % unroll != 0:
       raise ValueError("record_every must be divisible by unroll")
 
-    step = self.compile_unrolled_step(unroll, method=method)
+    step = self.compile_unrolled_step(unroll, method=method, project_every=project_every)
     history = []
     for i in range(0, steps, unroll):
       if i % record_every == 0:
@@ -5982,6 +6450,18 @@ class HeavyTopIntegrator:
     policy = policy or self.policy
     use_scan = policy.should_scan(steps, L.shape, L.device) if scan is None else scan
     base_dt = self.dt
+    op_cost = None
+    if getenv("TINYGRAD_PHYSICS_UNROLL_COST", 1):
+      try:
+        op_cost = _count_uops_limit(self.H(ProductManifold(L, gamma)).uop, 512)
+      except Exception:
+        op_cost = None
+    vec = policy.choose_vector_width(L.shape, L.device, 3)
+    L_use, L_shape = _reshape_for_vec(L, vec, 3)
+    g_use, g_shape = _reshape_for_vec(gamma, vec, 3)
+    if g_shape is None:
+      L_use, L_shape = L, None
+      g_use, g_shape = gamma, None
     def make_step(scale: float):
       def step_fn(L_in: Tensor, g_in: Tensor):
         self.dt = base_dt * scale
@@ -5994,18 +6474,40 @@ class HeavyTopIntegrator:
     dt_scale, _ = policy.adjust_dt(steps, L.shape, L.device, (L, gamma), make_step, energy_fn, "TINYGRAD_PHYSICS_DRIFT_HEAVY")
     self.dt = base_dt * dt_scale
     if unroll is None and use_scan:
-      unroll = policy.choose_unroll(steps, L.shape, L.device)
-    if use_scan and unroll is not None:
+      unroll = policy.choose_unroll(steps, L_use.shape, L_use.device, op_cost=op_cost)
+    def constraint_fn(state: tuple[Tensor, Tensor]):
+      return (state[1] * state[1]).sum(axis=-1).mean()
+    def step_fn(state: tuple[Tensor, Tensor], i: int, stride: int):
+      L_i, g_i = state
+      project = (i + 1) % stride == 0
+      if method == "splitting":
+        return self.step_tensors(L_i, g_i, project=project)
+      return self.step_explicit_tensors(L_i, g_i, project=project)
+    project_every = policy.choose_projection_stride(
+      steps, L_use.shape, L_use.device, "unit_norm_gamma", (L_use, g_use), step_fn, constraint_fn)
+    if unroll is not None:
       if record_every % unroll != 0:
         record_every = unroll
-      out = self.evolve_unrolled(L, gamma, steps, unroll, method=method, record_every=record_every)
+      out = self.evolve_unrolled(
+        L_use, g_use, steps, unroll, method=method, record_every=record_every, project_every=project_every)
       policy.maybe_print_report(steps, L.shape, L.device)
-      return out
+      L_out, g_out, history = out
+      if L_shape is not None:
+        history = [(_reshape_from_vec(L_t, L_shape), _reshape_from_vec(g_t, g_shape)) for (L_t, g_t) in history]
+      return _reshape_from_vec(L_out, L_shape), _reshape_from_vec(g_out, g_shape), history
     history = []
     for i in range(steps):
+      project = (i + 1) % project_every == 0
       if i % record_every == 0:
-        history.append((L.detach(), gamma.detach()))
-      L, gamma = self.step_tensors(L, gamma) if method == "splitting" else self.step_explicit_tensors(L, gamma)
-    history.append((L.detach(), gamma.detach()))
+        L_emit = _reshape_from_vec(L_use, L_shape)
+        g_emit = _reshape_from_vec(g_use, g_shape)
+        history.append((L_emit.detach(), g_emit.detach()))
+      if method == "splitting":
+        L_use, g_use = self.step_tensors(L_use, g_use, project=project)
+      else:
+        L_use, g_use = self.step_explicit_tensors(L_use, g_use, project=project)
+    L_emit = _reshape_from_vec(L_use, L_shape)
+    g_emit = _reshape_from_vec(g_use, g_shape)
+    history.append((L_emit.detach(), g_emit.detach()))
     policy.maybe_print_report(steps, L.shape, L.device)
-    return L, gamma, history
+    return _reshape_from_vec(L_use, L_shape), _reshape_from_vec(g_use, g_shape), history
