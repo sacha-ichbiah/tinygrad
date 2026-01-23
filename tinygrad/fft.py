@@ -443,11 +443,7 @@ def _ensure_autotuned(device: str, dtype):
   if (device, dtype) in _fft_autotune_active:
     return
   env = os.getenv("TINYGRAD_FFT_AUTOTUNE")
-  if env is None:
-    if device == "CPU":
-      autotune_fft_thresholds(device=device, dtype=dtype, sizes=(64, 128), thresholds=(8, 16), iters=1)
-      autotune_split_radix_thresholds(device=device, dtype=dtype, sizes=(8, 16), thresholds=(0, 16), iters=1)
-  elif getenv("TINYGRAD_FFT_AUTOTUNE", 0):
+  if env is not None and getenv("TINYGRAD_FFT_AUTOTUNE", 0):
     autotune_fft_thresholds(device=device, dtype=dtype)
     autotune_split_radix_thresholds(device=device, dtype=dtype)
   _fft_autotuned.add((device, dtype))
@@ -471,6 +467,25 @@ def _fft1d_impl(x: Tensor, inverse: bool = False) -> Tensor:
   if n <= 1:
     return x
   if _is_power_of_two(n):
+    if n == 2:
+      x0, x1 = x[..., 0, :], x[..., 1, :]
+      out = Tensor.stack([_complex_add(x0, x1), _complex_sub(x0, x1)], dim=-2)
+      if inverse:
+        scale = 0.5
+        out = Tensor.stack([out[..., 0] * scale, out[..., 1] * scale], dim=-1)
+      return out
+    if n == 4:
+      out = _fft_pow2_base4(x, inverse)
+      if inverse:
+        scale = 0.25
+        out = Tensor.stack([out[..., 0] * scale, out[..., 1] * scale], dim=-1)
+      return out
+    if n == 8:
+      out = _fft_pow2_base8(x, inverse)
+      if inverse:
+        scale = 0.125
+        out = Tensor.stack([out[..., 0] * scale, out[..., 1] * scale], dim=-1)
+      return out
     split_thr = _get_split_radix_threshold(x.device, x.dtype)
     if split_thr and n <= split_thr:
       out = _fft_pow2_split_radix(x, n, inverse)
