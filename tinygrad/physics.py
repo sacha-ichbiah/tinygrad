@@ -13,12 +13,14 @@ This is the "native language" of physics on AI hardware.
 """
 
 import math
+import numpy as np
 from tinygrad.engine.jit import TinyJit, JitError
 from tinygrad.engine.realize import capturing
 from tinygrad.helpers import getenv, CAPTURING
 from tinygrad.codegen.opt import Opt, OptOps
 from tinygrad.dtype import dtypes, AddrSpace, PtrDType
 from tinygrad.tensor import Tensor
+from tinygrad.fft import rfft2d, irfft2d
 from tinygrad.uop.ops import AxisType, GroupOp, KernelInfo, Ops, UOp, PatternMatcher, UPat, graph_rewrite, resolve
 from tinygrad.uop.symbolic import symbolic
 from typing import Callable
@@ -309,6 +311,16 @@ def compile_system(kind: str, *, H=None, policy: SymplecticPolicy | None = None,
         if I_inv is None or control is None or dt is None:
             raise ValueError("satellite_control requires I_inv, control, and dt")
         return SatelliteControlIntegrator(I_inv, control, dt, policy=policy)
+    if kind in ("point_vortex", "vortex"):
+        gamma = kwargs.get("gamma")
+        if gamma is None:
+            raise ValueError("point_vortex requires gamma")
+        return PointVortexSystem(gamma, integrator=integrator, softening=kwargs.get("softening", 1e-6))
+    if kind in ("conformal", "dissipative"):
+        if H is None:
+            raise ValueError("Hamiltonian H is required for conformal systems")
+        alpha = kwargs.get("alpha", 0.0)
+        return ConformalHamiltonianSystem(H, alpha=alpha)
     raise ValueError(f"Unknown system kind: {kind}")
 
 
@@ -1042,8 +1054,8 @@ class HamiltonianSystem:
             from tinygrad.physics_profile import get_default_profile
             policy = get_default_profile().policy
         self.policy = policy
-        self._jit_step = TinyJit(self.step)
-        self._jit_step_inplace = TinyJit(self.step_inplace)
+        self._jit_step = TinyJit(self._step_realize)
+        self._jit_step_inplace = TinyJit(self._step_inplace_realize)
         self._scan_kernel_cache: dict[tuple[float, int, int, int, bool, str, tuple[int, ...], object], Callable] = {}
         self._scan_kernel_coupled_cache: dict[tuple[float, int, int, int, str, tuple[int, ...], object], Callable] = {}
         self._scan_kernel_tune_cache: dict[tuple[float, int, str, tuple[int, ...], object], tuple[int, int]] = {}
@@ -1099,6 +1111,12 @@ class HamiltonianSystem:
         q.assign(q_new)
         p.assign(p_new)
         return q, p
+
+    def _step_realize(self, q: Tensor, p: Tensor, dt: float = 0.01) -> tuple[Tensor, Tensor]:
+        return _realize_state(self.step(q, p, dt))
+
+    def _step_inplace_realize(self, q: Tensor, p: Tensor, dt: float = 0.01) -> tuple[Tensor, Tensor]:
+        return _realize_state(self.step_inplace(q, p, dt))
 
     def energy(self, q: Tensor, p: Tensor) -> float:
         return float(self.H(q, p).numpy())
@@ -6668,3 +6686,801 @@ class HeavyTopIntegrator:
     return (_reshape_from_batch_tile(_reshape_from_vec(L_use, L_shape), L_tile_shape),
             _reshape_from_batch_tile(_reshape_from_vec(g_use, g_shape), g_tile_shape),
             history)
+
+# ============================================================================
+# FLUID DYNAMICS (Phase 3.1: Point Vortex Model)
+# ============================================================================
+#
+# Point vortices in 2D form a Hamiltonian system with a circulation-weighted
+# Poisson structure. Each vortex has position (x_i, y_i) and circulation Gamma_i.
+#
+# Hamiltonian:
+#   H = -1/(4*pi) * sum_{i<j} Gamma_i * Gamma_j * log(|r_ij|)
+#
+# Equations of motion (Kirchhoff):
+#   Gamma_i * dx_i/dt = +dH/dy_i
+#   Gamma_i * dy_i/dt = -dH/dx_i
+
+def _vortex_positions(z: Tensor, n: int) -> Tensor:
+  if z.ndim == 2 and z.shape[-1] == 2:
+    return z
+  if z.ndim == 1 and z.shape[0] == 2 * n:
+    return z.reshape(n, 2)
+  raise ValueError("z must be shape (N,2) or (2N,)")
+
+
+def _grad_vortex(z: Tensor, H_func) -> Tensor:
+  """Compute gradient of vortex Hamiltonian."""
+  z_grad = z.detach().requires_grad_(True)
+  H = H_func(z_grad)
+  H.backward()
+  return z_grad.grad.detach() if z_grad.grad is not None else z * 0
+
+
+def point_vortex_hamiltonian(gamma: Tensor, softening: float = 1e-6):
+  """
+  Returns the Hamiltonian for N point vortices.
+
+  H = -1/(4*pi) * sum_{i<j} Gamma_i * Gamma_j * log(|r_ij|)
+  """
+  import math
+  n = int(gamma.shape[0])
+  if n <= 0:
+    raise ValueError("gamma must have at least one vortex")
+  if (gamma == 0).any().numpy():
+    raise ValueError("gamma must be non-zero for all vortices")
+  mask = Tensor.ones(n, n, dtype=gamma.dtype, device=gamma.device).triu(1)
+
+  def H(z: Tensor) -> Tensor:
+    pos = _vortex_positions(z, n)
+    x = pos[:, 0]
+    y = pos[:, 1]
+    dx = x.unsqueeze(1) - x.unsqueeze(0)
+    dy = y.unsqueeze(1) - y.unsqueeze(0)
+    r2 = dx * dx + dy * dy + softening * softening
+    log_r = (r2.log()) * 0.5
+    gamma_ij = gamma.unsqueeze(1) * gamma.unsqueeze(0)
+    return -(gamma_ij * log_r * mask).sum() / (4 * math.pi)
+
+  return H
+
+
+def vortex_euler(z: Tensor, gamma: Tensor, H_func, dt: float = 0.01) -> Tensor:
+  """1st-order Euler for point vortices."""
+  dHdz = _grad_vortex(z, H_func)
+  n = int(gamma.shape[0])
+  dHdz_reshaped = _vortex_positions(dHdz, n)
+  dHdx = dHdz_reshaped[:, 0]
+  dHdy = dHdz_reshaped[:, 1]
+  vx = dHdy / gamma
+  vy = -dHdx / gamma
+  v = Tensor.stack([vx, vy], dim=1)
+  pos = _vortex_positions(z, n)
+  return (pos + dt * v).reshape(z.shape).realize()
+
+
+def vortex_rk4(z: Tensor, gamma: Tensor, H_func, dt: float = 0.01) -> Tensor:
+  """4th-order Runge-Kutta for point vortices."""
+  n = int(gamma.shape[0])
+  def velocity(z_val: Tensor) -> Tensor:
+    dHdz = _grad_vortex(z_val, H_func)
+    dHdz_reshaped = _vortex_positions(dHdz, n)
+    dHdx = dHdz_reshaped[:, 0]
+    dHdy = dHdz_reshaped[:, 1]
+    vx = dHdy / gamma
+    vy = -dHdx / gamma
+    return Tensor.stack([vx, vy], dim=1)
+
+  pos = _vortex_positions(z, n)
+  k1 = velocity(pos)
+  k2 = velocity(pos + 0.5 * dt * k1)
+  k3 = velocity(pos + 0.5 * dt * k2)
+  k4 = velocity(pos + dt * k3)
+  out = pos + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+  return out.reshape(z.shape).realize()
+
+
+def vortex_midpoint(z: Tensor, gamma: Tensor, H_func, dt: float = 0.01,
+                    tol: float = 1e-10, max_iter: int = 10) -> Tensor:
+  """Implicit midpoint for point vortices. Preserves invariants better."""
+  n = int(gamma.shape[0])
+  def velocity(z_val: Tensor) -> Tensor:
+    dHdz = _grad_vortex(z_val, H_func)
+    dHdz_reshaped = _vortex_positions(dHdz, n)
+    dHdx = dHdz_reshaped[:, 0]
+    dHdy = dHdz_reshaped[:, 1]
+    vx = dHdy / gamma
+    vy = -dHdx / gamma
+    return Tensor.stack([vx, vy], dim=1)
+
+  pos = _vortex_positions(z, n)
+  z_next = pos + dt * velocity(pos)
+  for _ in range(max_iter):
+    z_mid = 0.5 * (pos + z_next)
+    z_new = pos + dt * velocity(z_mid)
+    if (z_new - z_next).abs().max().numpy() < tol:
+      break
+    z_next = z_new
+  return z_next.reshape(z.shape).realize()
+
+
+class PointVortexSystem:
+  """
+  Point vortex dynamics in 2D - Kirchhoff's equations.
+
+  Example:
+    gamma = Tensor([1.0, 1.0, -1.0])
+    z = Tensor([[0.0, 1.0],
+                [1.0, 0.0],
+                [-1.0, 0.0]])
+    system = PointVortexSystem(gamma)
+    z = system.step(z, dt=0.01)
+  """
+  INTEGRATORS = {
+    "euler": vortex_euler,
+    "rk4": vortex_rk4,
+    "midpoint": vortex_midpoint,
+  }
+
+  def __init__(self, gamma: Tensor, integrator: str = "midpoint", softening: float = 1e-6):
+    self.gamma = gamma
+    self.n_vortices = int(gamma.shape[0])
+    self.H = point_vortex_hamiltonian(gamma, softening)
+    if integrator not in self.INTEGRATORS:
+      raise ValueError(f"Unknown integrator: {integrator}")
+    self._step_func = self.INTEGRATORS[integrator]
+    self.integrator_name = integrator
+
+  def _check_state(self, z: Tensor) -> None:
+    if z.device != self.gamma.device:
+      raise ValueError("z and gamma must be on the same device")
+    if z.dtype != self.gamma.dtype:
+      raise ValueError("z and gamma must have the same dtype")
+
+  def step(self, z: Tensor, dt: float = 0.01) -> Tensor:
+    self._check_state(z)
+    return self._step_func(z, self.gamma, self.H, dt)
+
+  def energy(self, z: Tensor) -> float:
+    self._check_state(z)
+    return float(self.H(z).numpy())
+
+  def momentum(self, z: Tensor) -> tuple[float, float]:
+    """Linear impulse: P = sum(Gamma_i * r_i) (conserved)."""
+    self._check_state(z)
+    pos = _vortex_positions(z, self.n_vortices)
+    px = (self.gamma * pos[:, 0]).sum().numpy()
+    py = (self.gamma * pos[:, 1]).sum().numpy()
+    return float(px), float(py)
+
+  def angular_momentum(self, z: Tensor) -> float:
+    """Angular impulse: L = sum(Gamma_i * |r_i|^2) (conserved)."""
+    self._check_state(z)
+    pos = _vortex_positions(z, self.n_vortices)
+    r_sq = (pos * pos).sum(axis=1)
+    return float((self.gamma * r_sq).sum().numpy())
+
+  def evolve(self, z: Tensor, dt: float, steps: int, record_every: int = 1) -> tuple[Tensor, list]:
+    self._check_state(z)
+    z_history: list[Tensor] = []
+    for i in range(steps):
+      if i % record_every == 0:
+        z_history.append(z.detach())
+      z = self.step(z, dt)
+    z_history.append(z.detach())
+
+    history = []
+    for z_t in z_history:
+      z_np = _vortex_positions(z_t, self.n_vortices).numpy().copy()
+      e = self.energy(z_t)
+      px, py = self.momentum(z_t)
+      L = self.angular_momentum(z_t)
+      history.append((z_np, e, px, py, L))
+    return z, history
+
+# ============================================================================
+# SYMPLECTIC COMPILER CORE (IR + OPS)
+# ============================================================================
+
+@dataclass
+class SymplecticOp:
+  name: str
+  fn: Callable
+  inplace_fn: Callable | None = None
+
+
+class SymplecticIR:
+  """Lightweight IR container for symplectic programs."""
+  def __init__(self, ops: list[SymplecticOp], kind: str):
+    self.ops = ops
+    self.kind = kind
+
+  def lower(self, policy: SymplecticPolicy | None = None) -> "SymplecticProgram":
+    return SymplecticProgram(self.ops, kind=self.kind, policy=policy)
+
+
+class SymplecticProgram:
+  """Low-level symplectic program composed of structure-aware ops."""
+  def __init__(self, ops: list[SymplecticOp], kind: str, policy: SymplecticPolicy | None = None):
+    if policy is None:
+      from tinygrad.physics_profile import get_default_profile
+      policy = get_default_profile().policy
+    self.ops = ops
+    self.kind = kind
+    self.policy = policy
+
+  def step(self, state, dt: float):
+    for op in self.ops:
+      state = op.fn(state, dt)
+    return state
+
+  def compile_unrolled_step(self, dt: float, unroll: int):
+    if unroll < 1:
+      raise ValueError("unroll must be >= 1")
+    def unrolled_step(state):
+      for _ in range(unroll):
+        state = self.step(state, dt)
+      return _realize_state(state)
+    return TinyJit(unrolled_step)
+
+  def compile_unrolled_step_inplace(self, dt: float, unroll: int):
+    if unroll < 1:
+      raise ValueError("unroll must be >= 1")
+    if len(self.ops) != 1 or self.ops[0].inplace_fn is None:
+      raise ValueError("inplace unroll requires a single inplace-capable op")
+    step_inplace = self.ops[0].inplace_fn
+    def unrolled_step(state):
+      for _ in range(unroll):
+        state = step_inplace(state, dt)
+      return _realize_state(state)
+    return TinyJit(unrolled_step)
+
+  def evolve(self, state, dt: float, steps: int, record_every: int = 1,
+             unroll: int | None = None, vector_width: int | None = None) -> tuple[object, list]:
+    if steps < 0:
+      raise ValueError("steps must be >= 0")
+    if unroll is None and self.policy.should_scan(steps, _state_shape(state), _state_device(state)):
+      unroll = self.policy.choose_unroll(steps, _state_shape(state), _state_device(state))
+    state, vec_meta = _vectorize_state(state, vector_width, self.policy)
+    history = []
+    if unroll is not None:
+      if steps % unroll != 0:
+        raise ValueError("steps must be divisible by unroll")
+      if record_every % unroll != 0:
+        record_every = unroll
+      if len(self.ops) == 1 and self.ops[0].inplace_fn is not None and _state_is_detached(state):
+        step = self.compile_unrolled_step_inplace(dt, unroll)
+        if step.captured is None:
+          _ = step(state)
+          _ = step(state)
+        i = 0
+        next_record = 0
+        while i < steps:
+          if i == next_record:
+            history.append(_detach_state(_unvectorize_state(state, vec_meta)))
+            next_record += record_every
+          remaining = steps - i
+          to_record = next_record - i if next_record <= steps else remaining
+          if remaining < unroll or to_record < unroll:
+            state = step(state)
+            i += unroll
+          else:
+            if isinstance(state, tuple):
+              if step.captured is not None and len(step.captured.expected_names) == 0:
+                step.call_repeat(state, dt, repeat=unroll)
+              else:
+                step.call_repeat(state[0], state[1], dt, repeat=unroll)
+            else:
+              step.call_repeat(state, dt, repeat=unroll)
+            i += unroll
+      else:
+        step = self.compile_unrolled_step(dt, unroll)
+        for i in range(0, steps, unroll):
+          if i % record_every == 0:
+            history.append(_detach_state(_unvectorize_state(state, vec_meta)))
+          state = step(state)
+      history.append(_detach_state(_unvectorize_state(state, vec_meta)))
+      return _unvectorize_state(state, vec_meta), history
+    for i in range(steps):
+      if i % record_every == 0:
+        history.append(_detach_state(_unvectorize_state(state, vec_meta)))
+      state = self.step(state, dt)
+    history.append(_detach_state(_unvectorize_state(state, vec_meta)))
+    return _unvectorize_state(state, vec_meta), history
+
+
+def _detach_state(state):
+  if isinstance(state, tuple):
+    return tuple(s.detach() for s in state)
+  return state.detach()
+
+
+def _realize_state(state):
+  if isinstance(state, tuple):
+    return tuple(s.realize() for s in state)
+  return state.realize()
+
+
+def _state_is_detached(state) -> bool:
+  if isinstance(state, tuple):
+    return not (state[0].requires_grad or state[1].requires_grad)
+  return not state.requires_grad
+
+
+def _state_shape(state) -> tuple[int, ...]:
+  if isinstance(state, tuple):
+    return state[0].shape
+  return state.shape
+
+
+def _state_device(state) -> str:
+  if isinstance(state, tuple):
+    return state[0].device
+  return state.device
+
+
+def _vectorize_state(state, vector_width: int | None, policy: SymplecticPolicy):
+  if isinstance(state, tuple):
+    q, p = state
+    vec_dim = q.shape[-1] if q.shape and q.shape == p.shape else 0
+    if vec_dim <= 1:
+      return state, None
+    if vector_width is None:
+      vector_width = policy.choose_vector_width(q.shape, q.device, vec_dim)
+    qv, q_shape = _reshape_for_vec(q, vector_width, vec_dim)
+    pv, p_shape = _reshape_for_vec(p, vector_width, vec_dim)
+    if q_shape is None or p_shape is None:
+      return state, None
+    return (qv, pv), (q_shape, p_shape)
+  vec_dim = state.shape[-1] if state.shape else 0
+  if vec_dim <= 1:
+    return state, None
+  if vector_width is None:
+    vector_width = policy.choose_vector_width(state.shape, state.device, vec_dim)
+  zv, z_shape = _reshape_for_vec(state, vector_width, vec_dim)
+  return (zv, z_shape) if z_shape is not None else (state, None)
+
+
+def _unvectorize_state(state, meta):
+  if meta is None:
+    return state
+  if isinstance(state, tuple):
+    q, p = state
+    q_shape, p_shape = meta
+    return _reshape_from_vec(q, q_shape), _reshape_from_vec(p, p_shape)
+  z_shape = meta
+  return _reshape_from_vec(state, z_shape)
+
+
+def symplectic_adjoint(step_fn: Callable, state_history: list, grad_final, dt: float):
+  """
+  Symplectic adjoint: propagate gradients backward using local VJPs.
+  This avoids storing the forward graph for long trajectories.
+  """
+  lam = grad_final
+  for i in range(len(state_history) - 2, -1, -1):
+    state = state_history[i]
+    if isinstance(state, tuple):
+      q, p = state
+      q = q.detach().requires_grad_(True)
+      p = p.detach().requires_grad_(True)
+      qn, pn = step_fn((q, p), dt)
+      loss = (qn * lam[0]).sum() + (pn * lam[1]).sum()
+      loss.backward()
+      lam = (q.grad.detach(), p.grad.detach())
+    else:
+      z = state.detach().requires_grad_(True)
+      zn = step_fn(z, dt)
+      loss = (zn * lam).sum()
+      loss.backward()
+      lam = z.grad.detach()
+  return lam
+
+
+def canonical_flow(q: Tensor, p: Tensor, H_func) -> tuple[Tensor, Tensor]:
+  """Canonical update form: dq/dt = +dH/dp, dp/dt = -dH/dq."""
+  dHdq, dHdp = _grad_H(q, p, H_func)
+  return dHdp, -dHdq
+
+
+def _numeric_separable_check(q: Tensor, p: Tensor, H_func, eps: float = 1e-3, tol: float = 1e-6) -> bool:
+  q0 = q.detach()
+  p0 = p.detach()
+  dHdq0, dHdp0 = _grad_H(q0, p0, H_func)
+  p1 = p0 + eps
+  dHdq1, _ = _grad_H(q0, p1, H_func)
+  q1 = q0 + eps
+  _, dHdp1 = _grad_H(q1, p0, H_func)
+  dHdq_dep_p = (dHdq1 - dHdq0).abs().max().numpy() > tol
+  dHdp_dep_q = (dHdp1 - dHdp0).abs().max().numpy() > tol
+  return not (dHdq_dep_p or dHdp_dep_q)
+
+
+class SymplecticStepKernel:
+  """Fused symplectic step op built from a Hamiltonian + integrator."""
+  def __init__(self, H_func, integrator: str = "leapfrog"):
+    self.H = H_func
+    self.integrator = integrator
+    self._jit = TinyJit(self._step)
+
+  def _step(self, q: Tensor, p: Tensor, dt: float) -> tuple[Tensor, Tensor]:
+    if self.integrator == "euler":
+      return symplectic_euler(q, p, self.H, dt)
+    if self.integrator == "leapfrog":
+      return leapfrog(q, p, self.H, dt)
+    if self.integrator == "yoshida4":
+      return yoshida4(q, p, self.H, dt)
+    if self.integrator == "implicit":
+      return implicit_midpoint(q, p, self.H, dt)
+    raise ValueError(f"Unknown integrator: {self.integrator}")
+
+  def __call__(self, state, dt: float):
+    q, p = state
+    if q.requires_grad or p.requires_grad:
+      return self._step(q, p, dt)
+    return self._jit(q, p, dt)
+
+
+class LinearSymplecticStepKernel:
+  """Small-dim linear fast path using precomputed symplectic matrices."""
+  def __init__(self, H_func, q0: Tensor, p0: Tensor):
+    from tinyphysics.linear import LinearSymplecticSystem, _build_leapfrog_step_matrix
+    self._build_step = _build_leapfrog_step_matrix
+    self._system = LinearSymplecticSystem(H_func, dt=1.0, linear_tol=1e-4, fd_eps=1e-3)
+    self._system.decompose(q0, p0)
+    self._dt: float | None = None
+
+  def _ensure_dt(self, dt: float):
+    if self._dt == dt:
+      return
+    self._system.dt = dt
+    self._system._M_step = self._build_step(self._system._K, self._system._M_inv, dt)
+    self._system._propagator_cache.clear()
+    self._dt = dt
+
+  def __call__(self, state, dt: float):
+    q, p = state
+    self._ensure_dt(dt)
+    return self._system.forward(q, p, steps=1)
+
+
+def symplectic_kick(q: Tensor, p: Tensor, H_func, dt: float) -> tuple[Tensor, Tensor]:
+  dHdq, _ = _grad_H(q, p, H_func)
+  return q, p - dt * dHdq
+
+
+def symplectic_drift(q: Tensor, p: Tensor, H_func, dt: float) -> tuple[Tensor, Tensor]:
+  _, dHdp = _grad_H(q, p, H_func)
+  return q + dt * dHdp, p
+
+
+def split_leapfrog(q: Tensor, p: Tensor, H_func, dt: float) -> tuple[Tensor, Tensor]:
+  q, p = symplectic_kick(q, p, H_func, 0.5 * dt)
+  q, p = symplectic_drift(q, p, H_func, dt)
+  q, p = symplectic_kick(q, p, H_func, 0.5 * dt)
+  return q, p
+
+
+def rattle_project(q: Tensor, p: Tensor, constraint_fn: Callable, tol: float = 1e-9, max_iter: int = 10) -> tuple[Tensor, Tensor]:
+  """RATTLE-style projection for holonomic constraints g(q)=0."""
+  for _ in range(max_iter):
+    q_req = q.detach().requires_grad_(True)
+    g = constraint_fn(q_req)
+    if g.abs().max().numpy() < tol:
+      q = q_req.detach()
+      break
+    g.backward()
+    grad = q_req.grad.detach()
+    denom = (grad * grad).sum()
+    if denom.numpy() == 0:
+      break
+    lam = g / denom
+    q = (q_req - grad * lam).detach()
+  q_req = q.detach().requires_grad_(True)
+  g = constraint_fn(q_req)
+  g.backward()
+  grad = q_req.grad.detach()
+  denom = (grad * grad).sum()
+  if denom.numpy() != 0:
+    mu = (grad * p).sum() / denom
+    p = (p - grad * mu).detach()
+  return q, p
+
+
+def conformal_symplectic_euler(q: Tensor, p: Tensor, H_func, dt: float = 0.01, alpha: float = 0.0) -> tuple[Tensor, Tensor]:
+  """Conformal symplectic Euler with linear dissipation."""
+  dHdq, dHdp = _grad_H(q, p, H_func)
+  p_new = p - dt * dHdq - dt * alpha * p
+  q_new = q + dt * dHdp
+  return q_new, p_new
+
+
+class ConformalHamiltonianSystem:
+  """Hamiltonian system with conformal (dissipative) symplectic flow."""
+  def __init__(self, H_func, alpha: float = 0.0):
+    self.H = H_func
+    self.alpha = alpha
+
+  def step(self, q: Tensor, p: Tensor, dt: float = 0.01) -> tuple[Tensor, Tensor]:
+    return conformal_symplectic_euler(q, p, self.H, dt, alpha=self.alpha)
+
+  def energy(self, q: Tensor, p: Tensor) -> float:
+    return float(self.H(q, p).numpy())
+
+  def evolve(self, q: Tensor, p: Tensor, dt: float, steps: int,
+             record_every: int = 1) -> tuple[Tensor, Tensor, list]:
+    history = []
+    for i in range(steps):
+      if i % record_every == 0:
+        history.append((q.detach(), p.detach(), self.energy(q, p)))
+      q, p = self.step(q, p, dt)
+    history.append((q.detach(), p.detach(), self.energy(q, p)))
+    return q, p, history
+
+
+def compile_symplectic_program(kind: str, *, H=None, policy: SymplecticPolicy | None = None,
+                               integrator: str = "auto", constraint: Callable | None = None,
+                               constraint_tol: float = 1e-9, constraint_iters: int = 10,
+                               sample_state: tuple[Tensor, Tensor] | None = None, **kwargs) -> SymplecticProgram:
+  if policy is None:
+    from tinygrad.physics_profile import get_default_profile
+    policy = get_default_profile().policy
+  kind = kind.lower()
+  ops: list[SymplecticOp] = []
+
+  if kind in ("canonical", "hamiltonian"):
+    if H is None:
+      raise ValueError("Hamiltonian H is required for canonical systems")
+    if integrator == "auto" and sample_state is not None:
+      q_s, p_s = sample_state
+      info = HamiltonianSystem(H, integrator="auto", policy=policy).analyze_structure(q_s, p_s)
+      if info.separable or _numeric_separable_check(q_s, p_s, H):
+        integrator = "split"
+      else:
+        integrator = "implicit"
+    if integrator == "auto":
+      integrator = "leapfrog"
+    if integrator == "split":
+      def kick_half(state, dt):
+        q, p = state
+        return symplectic_kick(q, p, H, 0.5 * dt)
+      def drift(state, dt):
+        q, p = state
+        return symplectic_drift(q, p, H, dt)
+      ops.append(SymplecticOp("SYMP_KICK_HALF", kick_half))
+      ops.append(SymplecticOp("SYMP_DRIFT", drift))
+      ops.append(SymplecticOp("SYMP_KICK_HALF", kick_half))
+    else:
+      linear_kernel = None
+      if sample_state is not None:
+        q_s, p_s = sample_state
+        if q_s.ndim == 1 and q_s.shape == p_s.shape and q_s.shape[0] in (2, 3, 4, 6):
+          try:
+            linear_kernel = LinearSymplecticStepKernel(H, q_s, p_s)
+          except Exception:
+            linear_kernel = None
+      if linear_kernel is not None:
+        def symp_step(state, dt):
+          return linear_kernel(state, dt)
+        ops.append(SymplecticOp("SYMP_STEP_LINEAR", symp_step))
+      else:
+        system = HamiltonianSystem(H, integrator=integrator, policy=policy)
+        def symp_step(state, dt):
+          q, p = state
+          if q.requires_grad or p.requires_grad or capturing:
+            return system.step(q, p, dt)
+          return system._jit_step(q, p, dt)
+        def symp_step_inplace(state, dt):
+          q, p = state
+          if q.requires_grad or p.requires_grad or capturing:
+            return system.step(q, p, dt)
+          return system._jit_step_inplace(q, p, dt)
+        ops.append(SymplecticOp("SYMP_STEP", symp_step, inplace_fn=symp_step_inplace))
+    if constraint is not None:
+      def project(state, dt):
+        q, p = state
+        return rattle_project(q, p, constraint, tol=constraint_tol, max_iter=constraint_iters)
+      ops.append(SymplecticOp("PROJECT_RATTLE", project))
+    return SymplecticIR(ops, kind="canonical").lower(policy=policy)
+
+  if kind in ("so3", "lie_poisson"):
+    if H is None:
+      raise ValueError("Hamiltonian H is required for Lie-Poisson systems")
+    system = LiePoissonSystem(H, algebra="so3", integrator=integrator, policy=policy)
+    def lie_step(state, dt):
+      return system.step(state, dt)
+    ops.append(SymplecticOp("LIE_FLOW", lie_step))
+    return SymplecticIR(ops, kind="lie_poisson").lower(policy=policy)
+
+  if kind in ("point_vortex", "vortex"):
+    gamma = kwargs.get("gamma")
+    if gamma is None:
+      raise ValueError("point_vortex requires gamma")
+    system = PointVortexSystem(gamma, integrator=integrator, softening=kwargs.get("softening", 1e-6))
+    def vortex_step(state, dt):
+      return system.step(state, dt)
+    ops.append(SymplecticOp("LIE_FLOW", vortex_step))
+    return SymplecticIR(ops, kind="point_vortex").lower(policy=policy)
+
+  if kind in ("e3", "heavy_top"):
+    Htop = kwargs.get("hamiltonian", H)
+    if Htop is None:
+      I1 = kwargs.get("I1")
+      I2 = kwargs.get("I2")
+      I3 = kwargs.get("I3")
+      mgl = kwargs.get("mgl")
+      if None in (I1, I2, I3, mgl):
+        raise ValueError("heavy_top requires hamiltonian or I1/I2/I3/mgl")
+      Htop = HeavyTopHamiltonian(I1, I2, I3, mgl, dtype=kwargs.get("dtype", dtypes.float64))
+    integrator_obj = HeavyTopIntegrator(Htop, dt=kwargs.get("dt", 0.001), policy=policy)
+    def e3_step(state, dt):
+      L, gamma = state
+      integrator_obj.dt = dt
+      return integrator_obj.step_tensors(L, gamma)
+    ops.append(SymplecticOp("LIE_FLOW", e3_step))
+    return SymplecticIR(ops, kind="e3").lower(policy=policy)
+
+  if kind in ("poisson", "solve_poisson"):
+    L = kwargs.get("L", 2 * math.pi)
+    def solve(state, dt):
+      return poisson_solve_fft2(state, L=L)
+    ops.append(SymplecticOp("SOLVE_POISSON", solve))
+    return SymplecticIR(ops, kind="poisson").lower(policy=policy)
+
+  if kind in ("conformal", "dissipative"):
+    if H is None:
+      raise ValueError("Hamiltonian H is required for conformal systems")
+    alpha = kwargs.get("alpha", 0.0)
+    system = ConformalHamiltonianSystem(H, alpha=alpha)
+    def conf_step(state, dt):
+      q, p = state
+      return system.step(q, p, dt)
+    ops.append(SymplecticOp("DISSIPATE", conf_step))
+    return SymplecticIR(ops, kind="conformal").lower(policy=policy)
+
+  raise ValueError(f"Unknown program kind: {kind}")
+
+
+def _complex_mul_real(z: Tensor, r: Tensor) -> Tensor:
+  return Tensor.stack([z[..., 0] * r, z[..., 1] * r], dim=-1)
+
+
+def _complex_mul_i(z: Tensor, r: Tensor, sign: float = 1.0) -> Tensor:
+  if sign >= 0:
+    return Tensor.stack([-z[..., 1] * r, z[..., 0] * r], dim=-1)
+  return Tensor.stack([z[..., 1] * r, -z[..., 0] * r], dim=-1)
+
+
+
+
+def poisson_solve_fft2(vorticity: Tensor, L: float = 2 * math.pi) -> Tensor:
+  """Solve Laplacian(psi) = vorticity using FFT on device."""
+  if vorticity.ndim != 2 or vorticity.shape[0] != vorticity.shape[1]:
+    raise ValueError("vorticity must be square 2D grid")
+  n = int(vorticity.shape[0])
+  kx = np.fft.fftfreq(n, d=L / n) * 2 * math.pi
+  ky = np.fft.rfftfreq(n, d=L / n) * 2 * math.pi
+  KX, KY = np.meshgrid(kx, ky, indexing="ij")
+  K2 = KX * KX + KY * KY
+  K2[0, 0] = 1.0
+  invK2 = 1.0 / K2
+  invK2[0, 0] = 0.0
+  K2_t = Tensor(invK2.astype(np.float32), device=vorticity.device, dtype=vorticity.dtype)
+  w_hat = rfft2d(vorticity)
+  psi_hat = _complex_mul_real(w_hat, -K2_t)
+  psi = irfft2d(psi_hat, n=(n, n))
+  return psi
+
+
+def velocity_from_streamfunction_fft2(psi: Tensor, L: float = 2 * math.pi) -> tuple[Tensor, Tensor]:
+  """Compute velocity field from streamfunction using FFT on device."""
+  if psi.ndim != 2 or psi.shape[0] != psi.shape[1]:
+    raise ValueError("psi must be square 2D grid")
+  n = int(psi.shape[0])
+  kx = np.fft.fftfreq(n, d=L / n) * 2 * math.pi
+  ky = np.fft.rfftfreq(n, d=L / n) * 2 * math.pi
+  KX, KY = np.meshgrid(kx, ky, indexing="ij")
+  KX_t = Tensor(KX.astype(np.float32), device=psi.device, dtype=psi.dtype)
+  KY_t = Tensor(KY.astype(np.float32), device=psi.device, dtype=psi.dtype)
+  psi_hat = rfft2d(psi)
+  dpsidx_hat = _complex_mul_i(psi_hat, KX_t, sign=1.0)
+  dpsidy_hat = _complex_mul_i(psi_hat, KY_t, sign=1.0)
+  dpsidx = irfft2d(dpsidx_hat, n=(n, n))
+  dpsidy = irfft2d(dpsidy_hat, n=(n, n))
+  u = dpsidy
+  v = -dpsidx
+  return u, v
+
+
+class IdealFluidVorticity2D:
+  """Fast 2D Euler vorticity solver with spectral Poisson and de-aliasing."""
+  def __init__(self, N: int, L: float = 2 * math.pi, dealias: float = 2.0 / 3.0, dtype=np.float32):
+    self.N = N
+    self.L = L
+    self.dtype = dtype
+    kx = np.fft.fftfreq(N, d=L / N) * 2 * math.pi
+    ky = np.fft.rfftfreq(N, d=L / N) * 2 * math.pi
+    KX, KY = np.meshgrid(kx, ky, indexing="ij")
+    K2 = KX * KX + KY * KY
+    K2[0, 0] = 1.0
+    invK2 = 1.0 / K2
+    invK2[0, 0] = 0.0
+    self.KX = Tensor(KX.astype(dtype))
+    self.KY = Tensor(KY.astype(dtype))
+    self.invK2 = Tensor(invK2.astype(dtype))
+    cutoff = dealias * np.max(np.abs(kx))
+    self.mask = Tensor(((np.abs(KX) < cutoff) & (np.abs(KY) < cutoff)).astype(dtype))
+    self._step_jit_cache: dict[tuple[float, int, str, tuple[int, ...], object], Callable] = {}
+    self.jit_threshold = int(getenv("TINYGRAD_FLUID_JIT_THRESHOLD", 50))
+
+  def _should_jit(self, steps: int | None = None) -> bool:
+    env = getenv("TINYGRAD_FLUID_JIT", -1)
+    if env != -1:
+      return bool(env)
+    if steps is None:
+      return False
+    return steps >= self.jit_threshold
+
+  def _rhs(self, w: Tensor) -> Tensor:
+    w_hat = rfft2d(w).realize()
+    psi_hat = _complex_mul_real(w_hat, self.invK2)
+
+    u_hat = _complex_mul_i(psi_hat, self.KY, sign=1.0)
+    v_hat = _complex_mul_i(psi_hat, self.KX, sign=-1.0)
+    dwdx_hat = _complex_mul_i(w_hat, self.KX, sign=1.0)
+    dwdy_hat = _complex_mul_i(w_hat, self.KY, sign=1.0)
+    batch = Tensor.stack([u_hat, v_hat, dwdx_hat, dwdy_hat], dim=0)
+    real_batch = irfft2d(batch, n=(self.N, self.N)).realize()
+    u = real_batch[0]
+    v = real_batch[1]
+    dwdx = real_batch[2]
+    dwdy = real_batch[3]
+
+    adv = u * dwdx + v * dwdy
+    adv_hat = _complex_mul_real(rfft2d(adv).realize(), self.mask)
+    return -irfft2d(adv_hat, n=(self.N, self.N))
+
+  def _step_tensor(self, w: Tensor, dt: float, method: str = "midpoint", iters: int = 5) -> Tensor:
+    if method == "euler":
+      return (w + dt * self._rhs(w))
+    if method != "midpoint":
+      raise ValueError(f"Unknown method: {method}")
+    w_next = w + dt * self._rhs(w)
+    for _ in range(max(1, iters)):
+      w_mid = 0.5 * (w + w_next)
+      w_next = w + dt * self._rhs(w_mid)
+    return w_next
+
+  def step(self, w: np.ndarray, dt: float, method: str = "midpoint", iters: int = 5) -> np.ndarray:
+    w_t = Tensor(w.astype(self.dtype, copy=False))
+    if not self._should_jit():
+      return self._step_tensor(w_t, dt, method=method, iters=iters).realize().numpy()
+    key = (float(dt), int(iters), w_t.device, w_t.shape, w_t.dtype)
+    step = self._step_jit_cache.get(key)
+    if step is None:
+      def step_fn(w_in: Tensor) -> Tensor:
+        return self._step_tensor(w_in, dt, method=method, iters=iters).realize()
+      step = self._step_jit_cache.setdefault(key, TinyJit(step_fn))
+    out = step(w_t)
+    return out.numpy()
+
+  def evolve(self, w0: np.ndarray, dt: float, steps: int, record_every: int = 1,
+             method: str = "midpoint", iters: int = 5) -> tuple[np.ndarray, list]:
+    w_t = Tensor(w0.astype(self.dtype, copy=True))
+    use_jit = self._should_jit(steps)
+    step = None
+    if use_jit:
+      key = (float(dt), int(iters), w_t.device, w_t.shape, w_t.dtype)
+      step = self._step_jit_cache.get(key)
+      if step is None:
+        def step_fn(w_in: Tensor) -> Tensor:
+          return self._step_tensor(w_in, dt, method=method, iters=iters).realize()
+        step = self._step_jit_cache.setdefault(key, TinyJit(step_fn))
+    history = []
+    for i in range(steps):
+      if i % record_every == 0:
+        history.append(w_t.detach())
+      w_t = step(w_t) if use_jit else self._step_tensor(w_t, dt, method=method, iters=iters).realize()
+    history.append(w_t.detach())
+    history_np = [h.numpy().copy() for h in history]
+    return w_t.numpy(), history_np

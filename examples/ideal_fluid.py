@@ -1,36 +1,7 @@
 import numpy as np
-from tinygrad.tensor import Tensor
+from tinygrad.physics import IdealFluidVorticity2D
 import json
 import os
-
-# --- FFT Ops Wrapper ---
-# Tinygrad doesn't have native FFT yet. 
-# We perform FFT in Numpy. 
-# For explicit time stepping, we can break the graph each step, 
-# as we don't need to backprop through the solver for this demo.
-
-def fft2(x: Tensor):
-    # x: (N, N) Real Tensor
-    # Returns: (N, N, 2) Complex Tensor (Real, Imag)
-    # 1. Sync to CPU/Numpy
-    dat = x.numpy()
-    # 2. FFT
-    ft = np.fft.fft2(dat)
-    # 3. Stack Real/Imag
-    out = np.stack([ft.real, ft.imag], axis=-1).astype(np.float32)
-    # 4. Return new Tensor
-    return Tensor(out)
-
-def ifft2(x: Tensor):
-    # x: (N, N, 2) Complex Tensor
-    # Returns: (N, N) Real Tensor
-    dat = x.numpy()
-    # Reconstruct complex
-    c = dat[..., 0] + 1j * dat[..., 1]
-    # IFFT
-    out = np.fft.ifft2(c)
-    # Real part
-    return Tensor(out.real.astype(np.float32))
 
 # --- Simulation ---
 
@@ -58,104 +29,23 @@ def run_simulation():
     omega_init -= (1/delta) * (1.0 / np.cosh((Y - y2)/delta)**2) * (1 + pert)
     
     # Vorticity State
-    W = Tensor(omega_init, requires_grad=False)
-    
-    # Pre-compute Wave Numbers k
-    kx = np.fft.fftfreq(N, d=L/N) * 2 * np.pi
-    ky = np.fft.fftfreq(N, d=L/N) * 2 * np.pi
-    KX, KY = np.meshgrid(kx, ky, indexing='ij')
-    
-    K2 = KX**2 + KY**2
-    K2[0,0] = 1.0 # Avoid division by zero
-    
-    # Tensor Constants
-    KX_T = Tensor(KX.astype(np.float32))
-    KY_T = Tensor(KY.astype(np.float32))
-    InvK2_T = Tensor((1.0/K2).astype(np.float32))
-    
-    # De-aliasing Cutoff (2/3 Rule)
-    k_max = np.max(np.abs(kx))
-    cutoff = (2.0/3.0) * k_max
-    Mask = Tensor(((np.abs(KX) < cutoff) & (np.abs(KY) < cutoff)).astype(np.float32))
-    
-    dt = 0.05
+    W = omega_init
+
+    dt = 0.02
     steps = 500
+    record_every = 10
     history_w = []
     
-    print(f"Start Ideal Fluid (Euler) Simulation N={N}")
-    
-    for step in range(steps):
-        
-        # RHS Calculation
-        def compute_rhs(w_field):
-            # w_field is Tensor
-            
-            # 1. FFT
-            w_hat = fft2(w_field)
-            
-            # 2. Psi_hat = w_hat / k^2
-            psi_hat = w_hat * InvK2_T.unsqueeze(-1)
-            
-            # 3. U_hat, V_hat
-            psi_r, psi_i = psi_hat[..., 0], psi_hat[..., 1]
-            u_hat_r = -KY_T * psi_i
-            u_hat_i = KY_T * psi_r
-            
-            v_hat_r = KX_T * psi_i
-            v_hat_i = -KX_T * psi_r
-            
-            u_hat = Tensor.stack([u_hat_r, u_hat_i], dim=-1)
-            v_hat = Tensor.stack([v_hat_r, v_hat_i], dim=-1)
-            
-            # 4. IFFT to Real
-            u = ifft2(u_hat)
-            v = ifft2(v_hat)
-            
-            # 5. Grad W in Fourier
-            w_r, w_i = w_hat[..., 0], w_hat[..., 1]
-            dwdx_hat_r = -KX_T * w_i
-            dwdx_hat_i = KX_T * w_r
-            dwdx_hat = Tensor.stack([dwdx_hat_r, dwdx_hat_i], dim=-1)
-            
-            dwdy_hat_r = -KY_T * w_i
-            dwdy_hat_i = KY_T * w_r
-            dwdy_hat = Tensor.stack([dwdy_hat_r, dwdy_hat_i], dim=-1)
-            
-            dwdx = ifft2(dwdx_hat)
-            dwdy = ifft2(dwdy_hat)
-            
-            # 6. Advection (Non-linear)
-            advection = u * dwdx + v * dwdy
-            
-            # 7. Mask
-            adv_hat = fft2(advection)
-            adv_hat_masked = adv_hat * Mask.unsqueeze(-1)
-            
-            rhs = -ifft2(adv_hat_masked)
-            return rhs
+    print(f"Start Ideal Fluid (Symplectic Midpoint) Simulation N={N}")
 
-        # RK4 Integration
-        # We need to be careful with breaking graphs.
-        # W is the state.
-        # k1, k2... calculate new tensors.
-        
-        k1 = compute_rhs(W)
-        k2 = compute_rhs(W + 0.5*dt*k1)
-        k3 = compute_rhs(W + 0.5*dt*k2)
-        k4 = compute_rhs(W + dt*k3)
-        
-        W_new = W + (dt/6.0)*(k1 + 2*k2 + 2*k3 + k4)
-        W = W_new.realize()
-        
-        if step % 10 == 0:
-            history_w.append(W.numpy().tolist())
-            
-        # Checks
-        if step == 0:
-            # Enstrophy
-            Z_start = (0.5 * (W**2).sum()).numpy() * (L/N)**2
-            
-    Z_end = (0.5 * (W**2).sum()).numpy() * (L/N)**2
+    solver = IdealFluidVorticity2D(N, L=L, dealias=2.0/3.0, dtype=np.float32)
+    W, history = solver.evolve(W, dt=dt, steps=steps, record_every=record_every, method="midpoint", iters=5)
+
+    for frame in history:
+        history_w.append(frame.tolist())
+
+    Z_start = 0.5 * (history[0] ** 2).sum() * (L / N) ** 2
+    Z_end = 0.5 * (history[-1] ** 2).sum() * (L / N) ** 2
     print(f"Enstrophy Z: Start {Z_start:.4f}, End {Z_end:.4f}, Drift {abs(Z_end-Z_start)/abs(Z_start):.2e}")
     
     generate_viewer(history_w, N)

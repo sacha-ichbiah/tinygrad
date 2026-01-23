@@ -253,6 +253,24 @@ class Tensor(OpMixin):
       raise RuntimeError("fused debug stop")
     return [Tensor(u, device=u.device) for u in UOp.custom_kernel(*[t.uop for t in (self,)+lst], fxn=fxn, grad_fxn=grad_fxn)]
 
+  # ***** fft helpers *****
+
+  def fft(self) -> Tensor:
+    from tinygrad.fft import fft1d
+    return fft1d(self)
+
+  def ifft(self) -> Tensor:
+    from tinygrad.fft import ifft1d
+    return ifft1d(self)
+
+  def fft2(self) -> Tensor:
+    from tinygrad.fft import fft2d
+    return fft2d(self)
+
+  def ifft2(self) -> Tensor:
+    from tinygrad.fft import ifft2d
+    return ifft2d(self)
+
   def schedule_with_vars(self, *lst:Tensor) -> tuple[list[ExecItem], dict[str, int]]:
     """
     Creates the schedule needed to realize these Tensor(s), with Variables.

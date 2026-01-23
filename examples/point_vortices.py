@@ -1,5 +1,6 @@
 import numpy as np
 from tinygrad.tensor import Tensor
+from tinygrad.physics import PointVortexSystem
 import json
 import os
 
@@ -24,149 +25,28 @@ def run_simulation():
     # Enforce sum(Gamma) != 0 to make it interesting, or 0.
     
     # Tinygrad Tensors
-    # State q = [x, y] of all vortices. 
-    # This acts as Phase Space! x ~ q, y ~ p (scaled by Gamma)
-    # Strictly: Gamma_i x_i is conjugate to y_i (or similar)
-    
-    q = Tensor(q_init, requires_grad=True)
+    q = Tensor(q_init)
     Gamma = Tensor(gamma_np)
     
     dt = 0.01
-    steps = 2000
+    steps = 600
+    record_every = 5
     
     print(f"Start Point Vortex Simulation (N={N})")
     print(f"Circulations: {Gamma.numpy()}")
     
     history_q = []
     
-    for i in range(steps):
-        # Hamiltonian Dynamics for Point Vortices
-        # H = -1/(2pi) * Sum_{i<j} Gamma_i Gamma_j ln(r_ij)
-        
-        # We need dH/dx and dH/dy to get velocity.
-        # But wait, the symplectic form is non-standard:
-        # Gamma_i dx/dt = dH/dy
-        # Gamma_i dy/dt = -dH/dx
-        
-        # So Velocity V = [dx/dt, dy/dt]
-        # dx/dt = (1/Gamma_i) dH/dy
-        # dy/dt = -(1/Gamma_i) dH/dx
-        
-        # Let's compute H and use Autograd!
-        
-        def hamiltonian(pos):
-            # pos is (N, 2)
-            # Pairwise distances
-            # (N, 1, 2) - (1, N, 2)
-            diff = pos.unsqueeze(1) - pos.unsqueeze(0)
-            
-            # r^2 = dx^2 + dy^2
-            r2 = (diff*diff).sum(axis=2)
-            
-            # Avoid diagonal (r=0) -> log(0)
-            # Add identity matrix to diagonal or mask?
-            # log(r) = 0.5 * log(r^2)
-            # We can just add epsilon, or better:
-            # Since i<j, we can mask the diagonal/lower triangle.
-            
-            # Softening for numerical stability
-            eps = 1e-2
-            log_r = (r2 + eps).log() * 0.5
-            
-            # Interaction Strength matrix: Gamma_i * Gamma_j
-            G_mat = Gamma.unsqueeze(1) * Gamma.unsqueeze(0)
-            
-            # Sum i < j
-            # We can sum all non-diagonal and divide by 2
-            # Mask diagonal
-            # tinygrad doesn't have diagonal mask easy?
-            # But log(r_ii) ~ log(eps).
-            # If we sum all and subtract diagonal, effectively.
-            # But the formula is Sum i != j.
-            
-            # H = -1/(2pi) * 0.5 * Sum_{i!=j} G_i G_j ln r_ij
-            # Factor 0.5 compensates for double counting ij and ji.
-            
-            # Diagonals: G_i^2 * ln(eps). This contributes constant shift to H. 
-            # Force gradient will be 0 if eps is constant?
-            # Wait, d/dx (x-x) = 0. So self-interaction force is 0. 
-            # So simple sum is fine!
-            
-            H_val = - (1.0 / (4.0 * np.pi)) * (G_mat * log_r).sum()
-            return H_val
+    system = PointVortexSystem(Gamma, integrator="midpoint", softening=1e-2)
+    H_start = system.energy(q)
+    C_start = (q.numpy() * Gamma.numpy()[:, None]).sum(axis=0)
+    L_start = (Gamma.numpy() * (q.numpy()**2).sum(axis=1)).sum()
 
-        # Get Gradients
-        # We need to act carefully. Compute H, backward.
-        
-        # We need current q to calculate grads.
-        # Detach to separate graph from previous steps?
-        # q is updated each step.
-        
-        # If we use RK4, we need dynamics function f(q).
-        
-        def dynamics(q_curr):
-            # q_curr is Tensor
-            H = hamiltonian(q_curr)
-            
-            # Calculate gradients
-            # We need to clear grads? 
-            # Creating new graph branch from q_curr.
-            grads = H.backward() # dH/dq is stored in q_curr.grad
-            
-            # Wait, if we pass q_curr which is intermediate node?
-            # We should pass a LEAF.
-            # So in RK4, we create `q_in = Tensor(val, requires_grad=True)`
-            
-            pass 
-            # But wait, inside dynamics() we need H(q).
-            # If we call H(q).backward(), tinygrad computes dH/dq.
-            # Return value.
-            
-            return None # Implementation below
-            
-        def f(q_vec):
-            # q_vec is numpy array
-            t = Tensor(q_vec, requires_grad=True)
-            H = hamiltonian(t)
-            H.backward()
-            grad = t.grad.numpy() # (N, 2) -> [dH/dx, dH/dy]
-            
-            dH_dx = grad[:, 0]
-            dH_dy = grad[:, 1]
-            
-            # Equations:
-            # dx/dt = (1/Gamma) * dH/dy
-            # dy/dt = -(1/Gamma) * dH/dx
-            
-            vx = dH_dy / Gamma.numpy()
-            vy = -dH_dx / Gamma.numpy()
-            
-            return np.stack([vx, vy], axis=1)
-            
-        # RK4 Step
-        q_np = q.numpy()
-        
-        k1 = f(q_np)
-        k2 = f(q_np + 0.5*dt*k1)
-        k3 = f(q_np + 0.5*dt*k2)
-        k4 = f(q_np + dt*k3)
-        
-        q_new = q_np + (dt/6.0)*(k1 + 2*k2 + 2*k3 + k4)
-        q = Tensor(q_new, requires_grad=True)
-        
-        if i % 10 == 0:
-            history_q.append(q_new.tolist())
-            
-        # Conservation Checks
-        if i == 0:
-            H_start = hamiltonian(q).numpy()
-            # Center of Vorticity: Sum Gamma * r
-            C_start = (q.numpy() * Gamma.numpy()[:, None]).sum(axis=0)
-            # Angular Momentum: Sum Gamma * r^2
-            L_start = (Gamma.numpy() * (q.numpy()**2).sum(axis=1)).sum()
-            
-    # Final Checks
-    H_end = hamiltonian(q).numpy()
+    for i in range(steps):
+        q = system.step(q, dt)
+        if i % record_every == 0:
+            history_q.append(q.numpy().tolist())
+    H_end = system.energy(q)
     C_end = (q.numpy() * Gamma.numpy()[:, None]).sum(axis=0)
     L_end = (Gamma.numpy() * (q.numpy()**2).sum(axis=1)).sum()
     
