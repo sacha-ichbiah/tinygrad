@@ -60,8 +60,28 @@ Practical, implementation‑ready queue based on the current codebase and design
 - [x] **LJ shift in barostat example**
 - [x] **LJ shift in barostat bench**
 - [x] **NPT bench test**
+- [x] **NPT sanity bench**
+- [x] **Universal bench fast mode**
+- [x] **Run universal bench (fast)**
+- [x] **Re-run universal bench in CI mode**
+- [x] **CI bench thresholds**
+- [x] **Optional CI threshold values**
+- [x] **CI bench scope**
+- [x] **Document CI bench thresholds**
+- [x] **NPT docs**
+- [x] **Bench fast mode default**
+- [x] **CI bench note**
+- [x] **CI superfast mode**
+- [x] **CI ultrafast mode**
 
 ## Next (ordered)
 
-- [ ] **NPT sanity bench**
-  - Consider a tiny smoke benchmark for NPT in CI (optional).
+- [x] **Phase 4 kickoff: Poisson 3D + PME baseline**
+  - Add `poisson_solve_fft3` and a minimal PME operator (deposit + solve + field).
+  - Add a small test for charge conservation and finite forces.
+
+- [ ] **Contact structure completion**
+  - Add explicit contact variable evolution and diagnostics for dissipative flows.
+
+- [ ] **Operator wrapper integration**
+  - Hook grad/div/curl/poisson ops into compiler-visible Operator nodes.

@@ -373,19 +373,39 @@ def _fft_pow2_radix8_plan(x: Tensor, n: int, inverse: bool) -> Tensor:
   radices = _radix_plan_pow2(n)
   if not radices:
     return x
-  m = 1
+
+  # DIT: apply digit reversal at INPUT
+  x = _digit_reverse_view(x, n, radices)
+
   prefix = x.shape[:-2]
+  m = 1  # current size of each DFT'd group
+
   for r in radices:
     m_new = m * r
-    blocks = n // m_new
-    x = x.reshape(*prefix, blocks, m, r, 2)
-    x = x.permute(*range(x.ndim - 4), x.ndim - 4, x.ndim - 2, x.ndim - 3, x.ndim - 1)
-    tw = _twiddle(n, r, m, inverse, x.device, x.dtype).reshape((1,) * (x.ndim - 3) + (r, m, 2))
-    x = _complex_mul(x, tw)
-    x = _dft_small(x, r, inverse, scale=False)
-    x = x.reshape(*prefix, blocks, m_new, 2)
+    num_supergroups = n // m_new
+
+    if m == 1:
+      # First stage: just do r-point DFT
+      x = x.reshape(*prefix, num_supergroups, r, 2)
+      x = _dft_small(x, r, inverse, scale=False)
+    else:
+      # Subsequent stages: reshape to access r groups of m
+      x = x.reshape(*prefix, num_supergroups, r, m, 2)
+
+      # Apply twiddles: W_{m_new}^{k*j} - uses m_new, not n!
+      tw = _twiddle(m_new, r, m, inverse, x.device, x.dtype)
+      tw = tw.reshape((1,) * (x.ndim - 3) + (r, m, 2))
+      x = _complex_mul(x, tw)
+
+      # Transpose to (supergroups, m, r, 2) for DFT
+      x = x.permute(*range(x.ndim - 4), x.ndim - 4, x.ndim - 2, x.ndim - 3, x.ndim - 1)
+      x = _dft_small(x, r, inverse, scale=False)
+      # Transpose back
+      x = x.permute(*range(x.ndim - 4), x.ndim - 4, x.ndim - 2, x.ndim - 3, x.ndim - 1)
+
+    x = x.reshape(*prefix, n, 2)
     m = m_new
-  x = x.reshape(*prefix, n, 2)
+
   if inverse:
     scale = 1.0 / n
     x = Tensor.stack([x[..., 0] * scale, x[..., 1] * scale], dim=-1)
@@ -739,16 +759,7 @@ def _fft1d_pow2_fast(x: Tensor, n: int, inverse: bool) -> Tensor:
     if getenv("TINYGRAD_FFT_128_FUSED", 0):
       return _fft_pow2_unrolled_128(x, inverse)
   if n >= 128:
-    # _fft_pow2_radix8_plan only works for exactly 2 same-radix stages (e.g., N=64 with [8,8])
-    # For other patterns, use split_radix which handles all cases correctly
-    radices = _radix_plan_pow2(n)
-    if len(radices) == 2 and radices[0] == radices[1]:
-      return _fft_pow2_radix8_plan(x, n, inverse)
-    out = _fft_pow2_split_radix(x, n, inverse)
-    if inverse:
-      scale = 1.0 / n
-      out = Tensor.stack([out[..., 0] * scale, out[..., 1] * scale], dim=-1)
-    return out
+    return _fft_pow2_radix8_plan(x, n, inverse)
   return _fft_pow2_iterative_radix8(x, n, inverse)
 
 

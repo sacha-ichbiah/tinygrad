@@ -125,6 +125,7 @@ Examples:
 Bench: see `tinyphysics/bench/README.md` (includes `TINYGRAD_BENCH_LJ_BAROSTAT`).
 Universal demo: `tinyphysics/examples_universal.py` (includes NPT barostat).
 LJ options: `lj_energy(..., shift=True)` and `LennardJonesSystem(force_shift=True)`.
+CI gating: set `TINYGRAD_BENCH_*_MAX` env vars (see `tinyphysics/bench/README.md`).
 
 ## Installation
 

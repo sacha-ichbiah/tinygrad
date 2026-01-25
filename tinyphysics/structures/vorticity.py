@@ -96,7 +96,7 @@ class VorticityStructure(Structure):
     enstrophy = 0.5 * (w * w).sum() * area
     return energy, enstrophy
 
-  def step(self, w: Tensor, dt: float, method: str = "midpoint", iters: int = 3) -> Tensor:
+  def step(self, w: Tensor, dt: float, method: str = "midpoint", iters: int = 2) -> Tensor:
     """Single timestep using implicit midpoint or explicit Euler."""
     if method == "euler":
       return (w + dt * self._rhs(w)).realize()
@@ -112,7 +112,7 @@ class VorticityStructure(Structure):
     return w_next.realize()
 
   def evolve(self, w0: Tensor | np.ndarray, dt: float, steps: int,
-             record_every: int = 1, method: str = "midpoint", iters: int = 3,
+             record_every: int = 1, method: str = "midpoint", iters: int = 2,
              unroll: int | None = None, diagnostics: bool = False) -> tuple[Tensor, list]:
     """Evolve vorticity field for multiple steps.
 

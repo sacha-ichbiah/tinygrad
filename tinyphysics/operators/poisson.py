@@ -2,7 +2,7 @@ import math
 import numpy as np
 
 from tinygrad.tensor import Tensor
-from tinygrad.fft import rfft2d, irfft2d
+from tinygrad.fft import rfft2d, irfft2d, fft3d, ifft3d
 
 
 def _complex_mul_real(z: Tensor, r: Tensor) -> Tensor:
@@ -34,6 +34,24 @@ def poisson_solve_fft2(vorticity: Tensor, L: float = 2 * math.pi) -> Tensor:
   return psi
 
 
+def poisson_solve_fft3(rho: Tensor, L: float = 2 * math.pi) -> Tensor:
+  """Solve Laplacian(phi) = -rho using FFT on device."""
+  if rho.ndim != 3 or rho.shape[0] != rho.shape[1] or rho.shape[1] != rho.shape[2]:
+    raise ValueError("rho must be cubic 3D grid")
+  n = int(rho.shape[0])
+  k = np.fft.fftfreq(n, d=L / n) * 2 * math.pi
+  KX, KY, KZ = np.meshgrid(k, k, k, indexing="ij")
+  K2 = KX * KX + KY * KY + KZ * KZ
+  K2[0, 0, 0] = 1.0
+  invK2 = 1.0 / K2
+  invK2[0, 0, 0] = 0.0
+  K2_t = Tensor(invK2.astype(np.float32), device=rho.device, dtype=rho.dtype)
+  rho_hat = fft3d(rho)
+  phi_hat = _complex_mul_real(rho_hat, -K2_t)
+  phi = ifft3d(phi_hat)[..., 0]
+  return phi
+
+
 def velocity_from_streamfunction_fft2(psi: Tensor, L: float = 2 * math.pi) -> tuple[Tensor, Tensor]:
   """Compute velocity field from streamfunction using FFT on device."""
   if psi.ndim != 2 or psi.shape[0] != psi.shape[1]:
@@ -58,5 +76,6 @@ __all__ = [
   "_complex_mul_real",
   "_complex_mul_i",
   "poisson_solve_fft2",
+  "poisson_solve_fft3",
   "velocity_from_streamfunction_fft2",
 ]

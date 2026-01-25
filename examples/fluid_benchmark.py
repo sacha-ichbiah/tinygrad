@@ -93,7 +93,7 @@ def main():
   parser.add_argument("--accuracy", action="store_true", help="Run accuracy test")
   parser.add_argument("-N", type=int, default=128, help="Grid size")
   parser.add_argument("--iters", type=int, default=100, help="Benchmark iterations")
-  parser.add_argument("--midpoint-iters", type=int, default=3, help="Midpoint iterations")
+  parser.add_argument("--midpoint-iters", type=int, default=2, help="Midpoint iterations")
   args = parser.parse_args()
 
   device = os.environ.get("DEVICE", "CPU")

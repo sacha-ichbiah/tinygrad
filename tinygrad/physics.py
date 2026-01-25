@@ -7453,16 +7453,16 @@ def compile_symplectic_program(kind: str, *, H=None, policy: SymplecticPolicy | 
         system = HamiltonianSystem(H, integrator=integrator, policy=policy)
         def symp_step(state, dt):
           q, p = state
-          if q.requires_grad or p.requires_grad or capturing:
-            return system.step(q, p, dt)
-          if uop_kernel is not None:
+          # Always use non-JIT path - nested JITs cause state pollution issues
+          # when inner JIT's captured state persists across outer JIT warmup phases.
+          # The outer JIT (compile_unrolled_step) handles caching, so inner JIT is redundant.
+          if uop_kernel is not None and not (q.requires_grad or p.requires_grad or capturing):
             return uop_kernel((q, p), dt)
-          return system._jit_step(q, p, dt)
+          return system.step(q, p, dt)
         def symp_step_inplace(state, dt):
           q, p = state
-          if q.requires_grad or p.requires_grad or capturing:
-            return system.step(q, p, dt)
-          return system._jit_step_inplace(q, p, dt)
+          # Always use non-JIT path for inplace too, for consistency
+          return system.step(q, p, dt)
         ops.append(SymplecticOp("SYMP_STEP", symp_step, inplace_fn=symp_step_inplace))
     if constraint is not None:
       def project(state, dt):

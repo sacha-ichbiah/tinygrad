@@ -32,6 +32,9 @@ PYTHONPATH=/workspaces/tinygrad python tinyphysics/bench/universal_physics_bench
 - Optional barostat bench: set `TINYGRAD_BENCH_BAROSTAT=1` and `TINYGRAD_BENCH_BAROSTAT_MAX`.
 - Optional LJ barostat bench: set `TINYGRAD_BENCH_LJ_BAROSTAT=1` and `TINYGRAD_BENCH_LJ_BAROSTAT_MAX`.
   - Use `_MAX` env vars to enforce time thresholds in CI for NPT-related benches.
+- Fast mode: set `TINYGRAD_BENCH_FAST=1` (or `2` for superfast, `3` for ultrafast) to reduce sizes/steps.
+- In CI, `bench/run_universal.py` enables ultrafast mode unless `TINYGRAD_BENCH_FAST` is set.
+- For CI gating, set `_MAX` thresholds like `TINYGRAD_BENCH_CANONICAL_MAX`, `TINYGRAD_BENCH_FLUID_MAX`, `TINYGRAD_BENCH_LJ_MAX`.
 
 ## Split-Operator Demo
 

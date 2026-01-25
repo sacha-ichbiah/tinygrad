@@ -43,6 +43,9 @@ tensor‑bins and Barnes‑Hut paths, plus a `NBodySystem` wrapper for batch‑a
 - [x] Langevin thermostat (dissipative structure)
 - [x] Berendsen barostat for NPT ensemble
 
+**NPT note:** Minimal Berendsen NPT is available via `BerendsenBarostatStructure` and the LJ barostat example at
+`examples/lennard_jones_barostat.py` (with `lj_pressure` virial estimate).
+
 ### Phase 4: Long-Range Forces
 **Goal:** Accurate electrostatics and gravity at scale
 

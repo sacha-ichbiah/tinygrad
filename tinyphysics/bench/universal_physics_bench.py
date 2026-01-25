@@ -64,7 +64,10 @@ def bench_constraint(steps: int = 100):
   p = Tensor([0.0, 1.0])
   prog = compile_structure(state=(q, p), H=H, structure=CanonicalStructure(), integrator="leapfrog", constraint=constraint_fn)
   t0 = time.time()
-  (q, p), _ = prog.evolve((q, p), 0.01, steps)
+  cur = (q, p)
+  for _ in range(steps):
+    cur = prog.step(cur, 0.01)
+  q, p = cur
   _ = q.realize(); _ = p.realize()
   return time.time() - t0
 
@@ -166,16 +169,25 @@ def _check_threshold(name: str, elapsed: float, max_s: float | None):
 
 
 if __name__ == "__main__":
-  t_can = bench_canonical()
-  t_lp = bench_so3()
-  t_q = bench_quantum()
-  t_c = bench_constraint()
-  t_d = bench_dissipative()
-  t_f = bench_fluid()
-  t_th = bench_thermostat() if os.getenv("TINYGRAD_BENCH_THERMOSTAT", "0") else None
-  t_lj = bench_lj_tensor_bins() if os.getenv("TINYGRAD_BENCH_LJ", "0") else None
-  t_baro = bench_barostat() if os.getenv("TINYGRAD_BENCH_BAROSTAT", "0") else None
-  t_lj_baro = bench_lj_barostat() if os.getenv("TINYGRAD_BENCH_LJ_BAROSTAT", "0") else None
+  fast_level = int(os.getenv("TINYGRAD_BENCH_FAST", "0") or "0")
+  fast = fast_level >= 1
+  superfast = fast_level >= 2
+  ultrafast = fast_level >= 3
+  t_can = bench_canonical(steps=8 if ultrafast else 10 if superfast else 25 if fast else 100,
+                          n=64 if ultrafast else 128 if superfast else 256 if fast else 1024)
+  t_lp = bench_so3(steps=8 if ultrafast else 10 if superfast else 25 if fast else 100)
+  t_q = bench_quantum(steps=2 if ultrafast else 5 if superfast else 10 if fast else 50,
+                      n=16 if ultrafast else 32 if superfast else 64 if fast else 128)
+  t_c = bench_constraint(steps=8 if ultrafast else 10 if superfast else 25 if fast else 100)
+  t_d = bench_dissipative(steps=16 if ultrafast else 20 if superfast else 50 if fast else 200)
+  t_f = bench_fluid(steps=1 if ultrafast else 2 if superfast else 5 if fast else 20,
+                    n=8 if ultrafast else 16 if superfast else 32 if fast else 64)
+  t_th = bench_thermostat(steps=16 if ultrafast else 20 if superfast else 50 if fast else 200) if os.getenv("TINYGRAD_BENCH_THERMOSTAT", "0") else None
+  t_lj = bench_lj_tensor_bins(steps=1 if ultrafast else 1 if superfast else 3 if fast else 10,
+                              n=32 if ultrafast else 64 if superfast else 128 if fast else 512) if os.getenv("TINYGRAD_BENCH_LJ", "0") else None
+  t_baro = bench_barostat(steps=8 if ultrafast else 10 if superfast else 25 if fast else 100) if os.getenv("TINYGRAD_BENCH_BAROSTAT", "0") else None
+  t_lj_baro = bench_lj_barostat(steps=1 if ultrafast else 1 if superfast else 3 if fast else 10,
+                                n=16 if ultrafast else 32 if superfast else 64 if fast else 256) if os.getenv("TINYGRAD_BENCH_LJ_BAROSTAT", "0") else None
   _check_threshold("canonical", t_can, _parse_threshold("TINYGRAD_BENCH_CANONICAL_MAX"))
   _check_threshold("so3", t_lp, _parse_threshold("TINYGRAD_BENCH_SO3_MAX"))
   _check_threshold("quantum", t_q, _parse_threshold("TINYGRAD_BENCH_QUANTUM_MAX"))
