@@ -14,7 +14,7 @@ This demonstrates the "compiler" + "broadcast" primitives from the roadmap.
 import argparse
 import numpy as np
 from tinygrad.tensor import Tensor
-from tinygrad.physics import simulate_hamiltonian
+from tinygrad.physics import HamiltonianSystem
 import json
 import os
 import time
@@ -192,7 +192,8 @@ def run_simulation(N=5, integrator="leapfrog", dt=0.001, steps=10000, config="ra
 
     # CREATE THE HAMILTONIAN SYSTEM
     H = nbody_hamiltonian(masses, G=G, use_soa=use_soa, block_size=block_size)
-    system = None
+    system = HamiltonianSystem(H, integrator=integrator)
+
     if unroll_steps <= 0 and use_scan and integrator == "leapfrog":
         for cand in (16, 8, 4, 2, 1):
             if steps % cand == 0:
@@ -215,24 +216,15 @@ def run_simulation(N=5, integrator="leapfrog", dt=0.001, steps=10000, config="ra
         return 1
 
     def evolve_steps(q, p, steps_run, record_every_run):
-        history = None
-        if use_scan and integrator == "leapfrog":
-            local_unroll = pick_unroll(steps_run)
-            if steps_run % local_unroll != 0:
-                local_unroll = 1
-            try:
-                if system is None:
-                    from tinygrad.physics import HamiltonianSystem
-                    system = HamiltonianSystem(H, integrator="leapfrog")
-                q, p, history = system.evolve_scan_kernel(
-                    q, p, dt=dt, steps=steps_run, coupled=True, coupled_fused=True,
-                    unroll_steps=local_unroll, scan_tune=scan_tune,
-                )
-            except Exception as e:
-                print(f"Scan kernel failed ({e}); falling back to evolve.")
-                history = None
-        if history is None:
-            q, p, history = simulate_hamiltonian(H, q, p, dt=dt, steps=steps_run, record_every=record_every_run)
+        # Manual stepping with proper history recording
+        history = []
+        for i in range(steps_run):
+            if i % record_every_run == 0:
+                # Explicitly copy to numpy to ensure independent snapshots
+                history.append((q.numpy().copy(), p.numpy().copy()))
+            q, p = system.step(q, p, dt)
+        # Record final state
+        history.append((q.numpy().copy(), p.numpy().copy()))
         return q, p, history
 
     from tinygrad.helpers import GlobalCounters
@@ -278,8 +270,14 @@ def run_simulation(N=5, integrator="leapfrog", dt=0.001, steps=10000, config="ra
             print(f"Compiler failed ({e}); retrying on PYTHON backend.")
             q = Tensor(q_init, requires_grad=False, device="PYTHON")
             p = Tensor(p_init, requires_grad=False, device="PYTHON")
-            system = HamiltonianSystem(H, integrator=integrator)
-            q, p, history = simulate_hamiltonian(H, q, p, dt=dt, steps=steps, record_every=record_every)
+            # Use HamiltonianSystem directly for PYTHON backend
+            system_fallback = HamiltonianSystem(H, integrator=integrator)
+            history = []
+            for i in range(steps):
+                if i % record_every == 0:
+                    history.append((q.numpy().copy(), p.numpy().copy()))
+                q, p = system_fallback.step(q, p, dt)
+            history.append((q.numpy().copy(), p.numpy().copy()))
         elapsed = time.perf_counter() - start_time
         steps_s = steps / elapsed if elapsed > 0 else float("inf")
         print(f"Performance: {steps_s:,.1f} steps/s")
@@ -295,6 +293,7 @@ def run_simulation(N=5, integrator="leapfrog", dt=0.001, steps=10000, config="ra
 
     # Generate viewer
     if render and history:
+        # History contains (q_numpy, p_numpy) tuples
         history_q = [h[0].tolist() for h in history]
         generate_viewer(history_q, N, masses)
 
@@ -436,6 +435,9 @@ if __name__ == "__main__":
     parser.add_argument("--bench-repeats", type=int, default=3)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--kernel-timing", action="store_true")
+    parser.add_argument("--render", action="store_true", help="Generate HTML viewer")
+    parser.add_argument("--diagnostics", action="store_true", help="Show energy diagnostics")
+    parser.add_argument("--record-every", type=int, default=10)
     args = parser.parse_args()
 
     if args.compare:
@@ -459,4 +461,7 @@ if __name__ == "__main__":
             use_soa=use_soa,
             block_size=args.block_size if args.block_size > 0 else None,
             block_auto=block_auto,
+            render=args.render,
+            diagnostics=args.diagnostics,
+            record_every=args.record_every,
         )

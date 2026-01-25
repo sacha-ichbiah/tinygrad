@@ -23,6 +23,8 @@ from tinygrad.tensor import Tensor
 from tinygrad.fft import rfft2d, irfft2d
 from tinygrad.uop.ops import AxisType, GroupOp, KernelInfo, Ops, UOp, PatternMatcher, UPat, graph_rewrite, resolve
 from tinygrad.uop.symbolic import symbolic
+from tinyphysics.operators.poisson import _complex_mul_real, _complex_mul_i, poisson_solve_fft2, velocity_from_streamfunction_fft2
+from tinyphysics.operators.spatial import FieldOperator
 from typing import Callable
 from dataclasses import dataclass
 import time
@@ -5923,6 +5925,7 @@ class LiePoissonSystem:
       from tinygrad.physics_profile import get_default_profile
       policy = get_default_profile().policy
     self.policy = policy
+    self._step_cache: dict[tuple, Callable] = {}  # Cache for compiled step functions
     if integrator == "auto":
       strict_drift = self.policy.drift_target is not None and self.policy.drift_target <= 1e-6
       integrator = "midpoint" if self.policy.accuracy != "fast" or strict_drift else "euler"
@@ -5946,8 +5949,9 @@ class LiePoissonSystem:
              vector_width: int | None = None) -> tuple[Tensor, list]:
     policy = policy or self.policy
     use_scan = policy.should_scan(steps, z.shape, z.device) if scan is None else scan
+    # Only compute op_cost if tuning is enabled (saves UOp graph traversal)
     op_cost = None
-    if getenv("TINYGRAD_PHYSICS_UNROLL_COST", 1):
+    if policy.tune and getenv("TINYGRAD_PHYSICS_UNROLL_COST", 1):
       try:
         op_cost = _count_uops_limit(self.H(z).uop, 512)
       except Exception:
@@ -5995,12 +5999,19 @@ class LiePoissonSystem:
     if unroll < 1:
       raise ValueError("unroll must be >= 1")
 
+    # Check cache first
+    key = (dt, unroll)
+    if key in self._step_cache:
+      return self._step_cache[key]
+
     def unrolled_step(z: Tensor):
       for _ in range(unroll):
         z = self.step(z, dt)
       return z
 
-    return TinyJit(unrolled_step)
+    jit_fn = TinyJit(unrolled_step)
+    self._step_cache[key] = jit_fn
+    return jit_fn
 
   def evolve_unrolled(self, z: Tensor, dt: float, steps: int, unroll: int,
                       record_every: int = 1) -> tuple[Tensor, list]:
@@ -6013,12 +6024,14 @@ class LiePoissonSystem:
       raise ValueError("record_every must be divisible by unroll")
 
     step = self.compile_unrolled_step(dt, unroll)
+    # Store tensor references during simulation (no CPU sync)
     z_history: list[Tensor] = []
     for i in range(0, steps, unroll):
       if i % record_every == 0:
         z_history.append(z.detach())
       z = step(z)
     z_history.append(z.detach())
+    # Convert to numpy AFTER simulation completes (batch CPU sync)
     history = [(z_t.numpy().copy(), self.energy(z_t), self.casimir(z_t)) for z_t in z_history]
     return z, history
 
@@ -6079,6 +6092,7 @@ class RigidBodySystem:
       from tinygrad.physics_profile import get_default_profile
       policy = get_default_profile().policy
     self.policy = policy
+    self._step_cache: dict[tuple, Callable] = {}  # Cache for compiled step functions
     if integrator == "auto":
       strict_drift = self.policy.drift_target is not None and self.policy.drift_target <= 1e-6
       integrator = "midpoint" if self.policy.accuracy in ("precise", "ultra_precise") or strict_drift else "splitting"
@@ -6111,8 +6125,9 @@ class RigidBodySystem:
              scan: bool | None = None, unroll: int | None = None) -> tuple[Tensor, Tensor, list]:
     policy = policy or self.policy
     use_scan = policy.should_scan(steps, L.shape, L.device) if scan is None else scan
+    # Only compute op_cost if tuning is enabled (saves UOp graph traversal)
     op_cost = None
-    if getenv("TINYGRAD_PHYSICS_UNROLL_COST", 1):
+    if policy.tune and getenv("TINYGRAD_PHYSICS_UNROLL_COST", 1):
       try:
         op_cost = _count_uops_limit(self.H(L).uop, 512)
       except Exception:
@@ -6184,13 +6199,20 @@ class RigidBodySystem:
     if project_every < 1:
       raise ValueError("project_every must be >= 1")
 
+    # Check cache first
+    key = (dt, unroll, project_every)
+    if key in self._step_cache:
+      return self._step_cache[key]
+
     def unrolled_step(L: Tensor, q: Tensor):
       for _ in range(unroll):
         project = (_ + 1) % project_every == 0
         L, q = self.step_fused(L, q, dt, project=project)
       return L, q
 
-    return TinyJit(unrolled_step)
+    jit_fn = TinyJit(unrolled_step)
+    self._step_cache[key] = jit_fn
+    return jit_fn
 
   def evolve_unrolled(self, L: Tensor, q: Tensor, dt: float, steps: int, unroll: int,
                       record_every: int = 1, project_every: int = 1) -> tuple[Tensor, Tensor, list]:
@@ -6203,12 +6225,17 @@ class RigidBodySystem:
       raise ValueError("record_every must be divisible by unroll")
 
     step = self.compile_unrolled_step(dt, unroll, project_every=project_every)
-    history = []
+    # Store tensor references during simulation (no CPU sync)
+    tensor_history: list[tuple[Tensor, Tensor]] = []
     for i in range(0, steps, unroll):
       if i % record_every == 0:
-        history.append((L.numpy().copy(), q.numpy().copy(), self.energy(L), self.casimir(L)))
+        tensor_history.append((L.detach(), q.detach()))
       L, q = step(L, q)
-    history.append((L.numpy().copy(), q.numpy().copy(), self.energy(L), self.casimir(L)))
+    tensor_history.append((L.detach(), q.detach()))
+    # Convert to numpy AFTER simulation completes (batch CPU sync)
+    history = []
+    for L_t, q_t in tensor_history:
+      history.append((L_t.numpy().copy(), q_t.numpy().copy(), self.energy(L_t), self.casimir(L_t)))
     return L, q, history
 
 
@@ -6887,6 +6914,7 @@ class SymplecticOp:
   name: str
   fn: Callable
   inplace_fn: Callable | None = None
+  is_projection: bool = False
 
 
 class SymplecticIR:
@@ -6908,18 +6936,30 @@ class SymplecticProgram:
     self.ops = ops
     self.kind = kind
     self.policy = policy
+    self.project = None
+    self.project_every = None
+    for op in self.ops:
+      if op.is_projection:
+        self.project = op.fn
+        break
 
   def step(self, state, dt: float):
     for op in self.ops:
       state = op.fn(state, dt)
     return state
 
-  def compile_unrolled_step(self, dt: float, unroll: int):
+  def compile_unrolled_step(self, dt: float, unroll: int, project_every: int | None = None):
     if unroll < 1:
       raise ValueError("unroll must be >= 1")
+    if project_every is None:
+      project_every = self.project_every or 1
+    if project_every < 1:
+      raise ValueError("project_every must be >= 1")
     def unrolled_step(state):
-      for _ in range(unroll):
+      for i in range(unroll):
         state = self.step(state, dt)
+        if project_every > 0 and (i + 1) % project_every == 0:
+          state = self.project(state, dt) if self.project is not None else state
       return _realize_state(state)
     return TinyJit(unrolled_step)
 
@@ -6936,9 +6976,14 @@ class SymplecticProgram:
     return TinyJit(unrolled_step)
 
   def evolve(self, state, dt: float, steps: int, record_every: int = 1,
-             unroll: int | None = None, vector_width: int | None = None) -> tuple[object, list]:
+             unroll: int | None = None, vector_width: int | None = None,
+             project_every: int | None = None, fused: bool = False) -> tuple[object, list]:
     if steps < 0:
       raise ValueError("steps must be >= 0")
+    if fused:
+      return self._evolve_fused(state, dt, steps, record_every, project_every)
+    if project_every is None and self.project is not None:
+      project_every = self.policy.projection_stride("constraint")
     if unroll is None and self.policy.should_scan(steps, _state_shape(state), _state_device(state)):
       unroll = self.policy.choose_unroll(steps, _state_shape(state), _state_device(state))
     state, vec_meta = _vectorize_state(state, vector_width, self.policy)
@@ -6948,7 +6993,7 @@ class SymplecticProgram:
         raise ValueError("steps must be divisible by unroll")
       if record_every % unroll != 0:
         record_every = unroll
-      if len(self.ops) == 1 and self.ops[0].inplace_fn is not None and _state_is_detached(state):
+      if len(self.ops) == 1 and self.ops[0].inplace_fn is not None and _state_is_detached(state) and project_every is None and self.project is None:
         step = self.compile_unrolled_step_inplace(dt, unroll)
         if step.captured is None:
           _ = step(state)
@@ -6974,31 +7019,96 @@ class SymplecticProgram:
               step.call_repeat(state, dt, repeat=unroll)
             i += unroll
       else:
-        step = self.compile_unrolled_step(dt, unroll)
+        step = self.compile_unrolled_step(dt, unroll, project_every=project_every)
         for i in range(0, steps, unroll):
           if i % record_every == 0:
             history.append(_detach_state(_unvectorize_state(state, vec_meta)))
           state = step(state)
       history.append(_detach_state(_unvectorize_state(state, vec_meta)))
       return _unvectorize_state(state, vec_meta), history
+    if project_every is None:
+      project_every = self.project_every
     for i in range(steps):
       if i % record_every == 0:
         history.append(_detach_state(_unvectorize_state(state, vec_meta)))
       state = self.step(state, dt)
+      if project_every is not None and project_every > 0 and (i + 1) % project_every == 0:
+        state = self.project(state, dt) if self.project is not None else state
     history.append(_detach_state(_unvectorize_state(state, vec_meta)))
     return _unvectorize_state(state, vec_meta), history
 
+  def _evolve_fused(self, state, dt: float, steps: int, record_every: int = 1,
+                    project_every: int | None = None) -> tuple[object, list]:
+    """Fused evolution - builds entire evolution as single UOp DAG.
+
+    This eliminates synchronization barriers between unroll batches by
+    constructing the full computation graph before any realize() call.
+    """
+    from tinyphysics.core.fused import FusedEvolution
+    fused = FusedEvolution(lambda s, d: self.step(s, d))
+    return fused.evolve(state, dt, steps, record_every, self.project, project_every or 0)
+
 
 def _detach_state(state):
+  # Clone data to avoid history entries sharing same buffer
   if isinstance(state, tuple):
-    return tuple(s.detach() for s in state)
-  return state.detach()
+    return tuple(Tensor(s.numpy().copy()) for s in state)
+  return Tensor(state.numpy().copy())
 
 
 def _realize_state(state):
   if isinstance(state, tuple):
     return tuple(s.realize() for s in state)
   return state.realize()
+
+
+class LinearizedSymplecticProgram(SymplecticProgram):
+  """Fast-path program for linear canonical systems using matrix-power leapfrog."""
+  def __init__(self, H, sample_state: tuple[Tensor, Tensor], policy: SymplecticPolicy | None = None,
+               linearize_max: int = 64, verify: bool = True):
+    super().__init__([], kind="canonical", policy=policy)
+    q_s, p_s = sample_state
+    if q_s.numel() > linearize_max:
+      raise ValueError("linear system too large for linearizer")
+    from tinyphysics.linear.symplectic import LinearSymplecticSystem
+    self._linear = LinearSymplecticSystem(H, dt=1.0)
+    if verify and not self._linear.verify_linearity(q_s, p_s):
+      raise ValueError("linearizer verification failed")
+    self._linear.decompose(q_s, p_s)
+    self._linearize_max = linearize_max
+    self._dt_cache: float | None = None
+
+  def _set_dt(self, dt: float):
+    if self._dt_cache is None or self._dt_cache != dt:
+      self._linear.set_dt(dt)
+      self._dt_cache = dt
+
+  def step(self, state, dt: float):
+    q, p = state
+    self._set_dt(dt)
+    return self._linear.forward(q, p, 1)
+
+  def compile_unrolled_step(self, dt: float, unroll: int):
+    if unroll < 1:
+      raise ValueError("unroll must be >= 1")
+    self._set_dt(dt)
+    def run(state):
+      q, p = state
+      return self._linear.forward(q, p, unroll)
+    return TinyJit(lambda state: _realize_state(run(state)))
+
+  def evolve(self, state, dt: float, steps: int, record_every: int = 1,
+             unroll: int | None = None, vector_width: int | None = None) -> tuple[object, list]:
+    if steps < 0:
+      raise ValueError("steps must be >= 0")
+    q, p = state
+    self._set_dt(dt)
+    history = []
+    for i in range(0, steps, record_every):
+      history.append(_detach_state((q, p)))
+      q, p = self._linear.forward(q, p, min(record_every, steps - i))
+    history.append(_detach_state((q, p)))
+    return (q, p), history
 
 
 def _state_is_detached(state) -> bool:
@@ -7268,7 +7378,12 @@ class ConformalHamiltonianSystem:
 def compile_symplectic_program(kind: str, *, H=None, policy: SymplecticPolicy | None = None,
                                integrator: str = "auto", constraint: Callable | None = None,
                                constraint_tol: float = 1e-9, constraint_iters: int = 10,
-                               sample_state: tuple[Tensor, Tensor] | None = None, **kwargs) -> SymplecticProgram:
+                               sample_state: tuple[Tensor, Tensor] | None = None,
+                               split_ops: list[Callable] | None = None,
+                               linearize: bool | None = None,
+                               linearize_max: int = 64,
+                               project_every: int | None = None,
+                               **kwargs) -> SymplecticProgram:
   if policy is None:
     from tinygrad.physics_profile import get_default_profile
     policy = get_default_profile().policy
@@ -7288,16 +7403,32 @@ def compile_symplectic_program(kind: str, *, H=None, policy: SymplecticPolicy | 
     if integrator == "auto":
       integrator = "leapfrog"
     if integrator == "split":
-      def kick_half(state, dt):
-        q, p = state
-        return symplectic_kick(q, p, H, 0.5 * dt)
-      def drift(state, dt):
-        q, p = state
-        return symplectic_drift(q, p, H, dt)
-      ops.append(SymplecticOp("SYMP_KICK_HALF", kick_half))
-      ops.append(SymplecticOp("SYMP_DRIFT", drift))
-      ops.append(SymplecticOp("SYMP_KICK_HALF", kick_half))
+      if split_ops is not None:
+        for op in split_ops:
+          ops.append(SymplecticOp("SYMP_SPLIT_OP", op))
+      else:
+        def kick_half(state, dt):
+          q, p = state
+          return symplectic_kick(q, p, H, 0.5 * dt)
+        def drift(state, dt):
+          q, p = state
+          return symplectic_drift(q, p, H, dt)
+        ops.append(SymplecticOp("SYMP_KICK_HALF", kick_half))
+        ops.append(SymplecticOp("SYMP_DRIFT", drift))
+        ops.append(SymplecticOp("SYMP_KICK_HALF", kick_half))
     else:
+      if linearize is None:
+        linearize = bool(getenv("TINYGRAD_PHYSICS_LINEARIZE", 1))
+      if linearize and sample_state is not None:
+        q_s, p_s = sample_state
+        if q_s.numel() <= linearize_max:
+          try:
+            return LinearizedSymplecticProgram(
+              H, (q_s, p_s), policy=policy, linearize_max=linearize_max,
+              verify=bool(getenv("TINYGRAD_PHYSICS_LINEARIZE_VERIFY", 1)),
+            )
+          except Exception:
+            pass
       linear_kernel = None
       if sample_state is not None:
         q_s, p_s = sample_state
@@ -7335,8 +7466,11 @@ def compile_symplectic_program(kind: str, *, H=None, policy: SymplecticPolicy | 
       def project(state, dt):
         q, p = state
         return rattle_project(q, p, constraint, tol=constraint_tol, max_iter=constraint_iters)
-      ops.append(SymplecticOp("PROJECT_RATTLE", project))
-    return SymplecticIR(ops, kind="canonical").lower(policy=policy)
+      ops.append(SymplecticOp("PROJECT_RATTLE", project, is_projection=True))
+    prog = SymplecticIR(ops, kind="canonical").lower(policy=policy)
+    if project_every is not None:
+      prog.project_every = project_every
+    return prog
 
   if kind in ("so3", "lie_poisson"):
     if H is None:
@@ -7402,15 +7536,6 @@ def compile_symplectic_program(kind: str, *, H=None, policy: SymplecticPolicy | 
   raise ValueError(f"Unknown program kind: {kind}")
 
 
-def _complex_mul_real(z: Tensor, r: Tensor) -> Tensor:
-  return Tensor.stack([z[..., 0] * r, z[..., 1] * r], dim=-1)
-
-
-def _complex_mul_i(z: Tensor, r: Tensor, sign: float = 1.0) -> Tensor:
-  if sign >= 0:
-    return Tensor.stack([-z[..., 1] * r, z[..., 0] * r], dim=-1)
-  return Tensor.stack([z[..., 1] * r, -z[..., 0] * r], dim=-1)
-
 def lie_flow(state: Tensor, H_func, J_func, dt: float) -> Tensor:
   """Generic Lie-Poisson flow: dz/dt = J(z) * dH/dz."""
   z = state.detach().requires_grad_(True)
@@ -7423,84 +7548,6 @@ def lie_flow(state: Tensor, H_func, J_func, dt: float) -> Tensor:
   else:
     flow = (J @ grad) if J.ndim == 2 else (J * grad).sum(axis=-1)
   return state + dt * flow
-
-
-class FieldOperator:
-  """Lightweight operator wrapper for periodic grid fields."""
-  @staticmethod
-  def grad2(f: Tensor, L: float | None = None) -> tuple[Tensor, Tensor]:
-    n = int(f.shape[0])
-    dx = (L / n) if L is not None else 1.0
-    fx = (f.roll(-1, 0) - f.roll(1, 0)) * (0.5 / dx)
-    fy = (f.roll(-1, 1) - f.roll(1, 1)) * (0.5 / dx)
-    return fx, fy
-
-  @staticmethod
-  def div2(u: Tensor, v: Tensor, L: float | None = None) -> Tensor:
-    n = int(u.shape[0])
-    dx = (L / n) if L is not None else 1.0
-    du = (u.roll(-1, 0) - u.roll(1, 0)) * (0.5 / dx)
-    dv = (v.roll(-1, 1) - v.roll(1, 1)) * (0.5 / dx)
-    return du + dv
-
-  @staticmethod
-  def curl2(u: Tensor, v: Tensor, L: float | None = None) -> Tensor:
-    n = int(u.shape[0])
-    dx = (L / n) if L is not None else 1.0
-    dv_dx = (v.roll(-1, 0) - v.roll(1, 0)) * (0.5 / dx)
-    du_dy = (u.roll(-1, 1) - u.roll(1, 1)) * (0.5 / dx)
-    return dv_dx - du_dy
-
-  @staticmethod
-  def laplacian2(f: Tensor, L: float | None = None) -> Tensor:
-    n = int(f.shape[0])
-    dx = (L / n) if L is not None else 1.0
-    return (f.roll(1, 0) + f.roll(-1, 0) + f.roll(1, 1) + f.roll(-1, 1) - 4 * f) * (1.0 / (dx * dx))
-
-  @staticmethod
-  def poisson_solve2(f: Tensor, L: float = 2 * math.pi) -> Tensor:
-    return poisson_solve_fft2(f, L=L)
-
-
-
-
-def poisson_solve_fft2(vorticity: Tensor, L: float = 2 * math.pi) -> Tensor:
-  """Solve Laplacian(psi) = vorticity using FFT on device."""
-  if vorticity.ndim != 2 or vorticity.shape[0] != vorticity.shape[1]:
-    raise ValueError("vorticity must be square 2D grid")
-  n = int(vorticity.shape[0])
-  kx = np.fft.fftfreq(n, d=L / n) * 2 * math.pi
-  ky = np.fft.rfftfreq(n, d=L / n) * 2 * math.pi
-  KX, KY = np.meshgrid(kx, ky, indexing="ij")
-  K2 = KX * KX + KY * KY
-  K2[0, 0] = 1.0
-  invK2 = 1.0 / K2
-  invK2[0, 0] = 0.0
-  K2_t = Tensor(invK2.astype(np.float32), device=vorticity.device, dtype=vorticity.dtype)
-  w_hat = rfft2d(vorticity)
-  psi_hat = _complex_mul_real(w_hat, -K2_t)
-  psi = irfft2d(psi_hat, n=(n, n))
-  return psi
-
-
-def velocity_from_streamfunction_fft2(psi: Tensor, L: float = 2 * math.pi) -> tuple[Tensor, Tensor]:
-  """Compute velocity field from streamfunction using FFT on device."""
-  if psi.ndim != 2 or psi.shape[0] != psi.shape[1]:
-    raise ValueError("psi must be square 2D grid")
-  n = int(psi.shape[0])
-  kx = np.fft.fftfreq(n, d=L / n) * 2 * math.pi
-  ky = np.fft.rfftfreq(n, d=L / n) * 2 * math.pi
-  KX, KY = np.meshgrid(kx, ky, indexing="ij")
-  KX_t = Tensor(KX.astype(np.float32), device=psi.device, dtype=psi.dtype)
-  KY_t = Tensor(KY.astype(np.float32), device=psi.device, dtype=psi.dtype)
-  psi_hat = rfft2d(psi)
-  dpsidx_hat = _complex_mul_i(psi_hat, KX_t, sign=1.0)
-  dpsidy_hat = _complex_mul_i(psi_hat, KY_t, sign=1.0)
-  dpsidx = irfft2d(dpsidx_hat, n=(n, n))
-  dpsidy = irfft2d(dpsidy_hat, n=(n, n))
-  u = dpsidy
-  v = -dpsidx
-  return u, v
 
 
 class IdealFluidVorticity2D:

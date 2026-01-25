@@ -12,11 +12,13 @@ Quantum mechanically: partial transmission (tunneling)!
 
 Transmission coefficient for rectangular barrier:
     T ≈ exp(-2κa) where κ = √(2m(V₀-E))/ℏ, a = barrier width
+
+Uses the TinyPhysics structure-preserving compiler (blueprint_v3).
 """
 
 import numpy as np
 from tinygrad.tensor import Tensor
-from tinygrad.physics import QuantumSystem
+from tinyphysics import QuantumSplitOperator1D, gaussian_wavepacket
 import json
 import os
 
@@ -26,11 +28,54 @@ def rectangular_barrier(x: np.ndarray, x0: float, width: float, V0: float) -> np
     return np.where(np.abs(x - x0) < width / 2, V0, 0.0)
 
 
+def compute_norm(psi: Tensor, dx: float) -> float:
+    """Compute norm: integral of |psi|^2 dx."""
+    prob = psi[..., 0] * psi[..., 0] + psi[..., 1] * psi[..., 1]
+    return float((prob.sum() * dx).numpy())
+
+
+def compute_probability_density(psi: Tensor) -> Tensor:
+    """Compute |psi|^2."""
+    return psi[..., 0] * psi[..., 0] + psi[..., 1] * psi[..., 1]
+
+
+def compute_energy(psi: Tensor, x: Tensor, V: Tensor, dx: float, hbar: float, m: float) -> float:
+    """Compute expectation value of energy <H> = <T> + <V>.
+
+    Uses momentum-space representation for kinetic energy.
+    Note: This is approximate due to FFT normalization conventions.
+    """
+    from tinyphysics.structures.commutator import fftfreq
+    from tinygrad.fft import fft1d
+    import math
+
+    N = x.shape[0]
+    k = fftfreq(N, dx, x.device, x.dtype) * (2.0 * math.pi)
+    k2 = k * k
+
+    # FFT of psi - note: fft1d uses standard normalization
+    psi_k = fft1d(psi)
+    # |psi_k|^2 needs to be normalized by N^2 for Parseval's theorem
+    psi_k_abs2 = psi_k[..., 0] * psi_k[..., 0] + psi_k[..., 1] * psi_k[..., 1]
+
+    # <T> = (1/N) * sum_k |psi_k|^2 * (hbar*k)^2 / (2m) * dx
+    # The factor of dx comes from the discrete->continuous conversion
+    T_expect = float(((psi_k_abs2 * k2).sum() / (N * N) * (hbar * hbar) / (2 * m) * dx).numpy())
+
+    # <V> = integral |psi|^2 * V(x) dx
+    prob = compute_probability_density(psi)
+    V_expect = float((prob * V).sum().numpy() * dx)
+
+    return T_expect + V_expect
+
+
 def run_simulation(N: int = 1024, L: float = 100.0, sigma: float = 3.0,
                    k0: float = 1.5, V0: float = 2.0, barrier_width: float = 1.0,
                    dt: float = 0.01, steps: int = 4000):
     """
     Simulate quantum tunneling through a rectangular barrier.
+
+    Uses TinyPhysics QuantumSplitOperator1D following blueprint_v3.
 
     Args:
         N: Number of grid points
@@ -43,15 +88,17 @@ def run_simulation(N: int = 1024, L: float = 100.0, sigma: float = 3.0,
         steps: Number of time steps
     """
     hbar, m = 1.0, 1.0
+    dx = L / N
 
     # Initial kinetic energy
     E_kinetic = hbar**2 * k0**2 / (2 * m)
 
     print("=" * 60)
-    print("QUANTUM TUNNELING - TinyPhysics")
+    print("QUANTUM TUNNELING - TinyPhysics (Blueprint v3)")
     print("=" * 60)
     print(f"\nHamiltonian: H = p²/2m + V(x)")
     print(f"Potential: Rectangular barrier at x=0")
+    print(f"Structure: QuantumSplitOperator1D (unitary evolution)")
     print(f"\nParameters:")
     print(f"  Grid: {N} points, Domain: [-{L/2:.0f}, {L/2:.0f}]")
     print(f"  Wavepacket: σ={sigma}, k₀={k0}")
@@ -60,7 +107,7 @@ def run_simulation(N: int = 1024, L: float = 100.0, sigma: float = 3.0,
     print(f"  E/V₀ = {E_kinetic/V0:.3f}")
 
     if E_kinetic < V0:
-        print(f"\n  ⚡ E < V₀: CLASSICALLY FORBIDDEN (tunneling regime)")
+        print(f"\n  E < V₀: CLASSICALLY FORBIDDEN (tunneling regime)")
         kappa = np.sqrt(2 * m * (V0 - E_kinetic)) / hbar
         T_theory = np.exp(-2 * kappa * barrier_width)
         print(f"  Theoretical T ≈ exp(-2κa) ≈ {T_theory:.4f}")
@@ -68,52 +115,51 @@ def run_simulation(N: int = 1024, L: float = 100.0, sigma: float = 3.0,
         print(f"\n  E > V₀: Classical transmission allowed")
         T_theory = None
 
-    # Create potential barrier
-    x_np = np.linspace(-L/2, L/2, N, endpoint=False)
-    V_np = rectangular_barrier(x_np, x0=0.0, width=barrier_width, V0=V0)
+    # Create grid and potential (blueprint pattern)
+    x_np = np.linspace(-L/2, L/2, N, endpoint=False).astype(np.float32)
+    x = Tensor(x_np)
+    V_np = rectangular_barrier(x_np, x0=0.0, width=barrier_width, V0=V0).astype(np.float32)
     V = Tensor(V_np)
 
-    # Create quantum system with potential
-    system = QuantumSystem(N=N, L=L, m=m, hbar=hbar, V=V)
+    # Create quantum solver using TinyPhysics API (blueprint_v3 Section 6.3)
+    solver = QuantumSplitOperator1D(x, dt=dt, mass=m, hbar=hbar, V=V)
 
-    # Initial wavepacket (starts on the left, moving right)
+    # Initial wavepacket using tinyphysics gaussian_wavepacket
     x_start = -25.0
-    psi_r, psi_i = system.gaussian_wavepacket(x0=x_start, sigma=sigma, k0=k0)
+    psi = gaussian_wavepacket(x, x0=x_start, k0=k0, sigma=sigma)
 
     # Initial measurements
-    norm_start = system.norm(psi_r, psi_i)
-    energy_start = system.energy(psi_r, psi_i)
+    norm_start = compute_norm(psi, dx)
+    energy_start = compute_energy(psi, x, V, dx, hbar, m)
 
     print(f"\nInitial state:")
     print(f"  Position: x₀ = {x_start}")
     print(f"  Norm: {norm_start:.6f}")
     print(f"  Total energy: {energy_start:.4f}")
 
-    # Evolve
+    # Evolve using JIT-compiled unrolled steps (blueprint pattern)
     print(f"\nEvolving for {steps} steps (dt={dt})...")
-    psi_r, psi_i, history = system.evolve(psi_r, psi_i, dt=dt, steps=steps,
-                                          record_every=max(1, steps // 200))
+    record_every = max(1, steps // 200)
 
-    # Final measurements
-    norm_end = system.norm(psi_r, psi_i)
-    energy_end = system.energy(psi_r, psi_i)
+    # Use compiler's evolve() method for JIT-compiled batched evolution
+    psi, prob_history = solver.evolve(psi, steps=steps, record_every=record_every)
+
+    # Compute diagnostics only at end (for conservation checking)
+    prob_final = prob_history[-1]
+    norm_final = compute_norm(psi, dx)
+    energy_final = compute_energy(psi, x, V, dx, hbar, m)
 
     # Calculate transmission and reflection coefficients
-    # T = integral of |ψ|² for x > barrier_width/2
-    # R = integral of |ψ|² for x < -barrier_width/2
-    prob = system.probability_density(psi_r, psi_i).numpy()
-    dx = L / N
-
-    transmitted_region = x_np > barrier_width / 2 + 5  # Well past barrier
-    reflected_region = x_np < -barrier_width / 2 - 5   # Well before barrier
-    T_measured = prob[transmitted_region].sum() * dx
-    R_measured = prob[reflected_region].sum() * dx
+    transmitted_region = x_np > barrier_width / 2 + 5
+    reflected_region = x_np < -barrier_width / 2 - 5
+    T_measured = prob_final[transmitted_region].sum() * dx
+    R_measured = prob_final[reflected_region].sum() * dx
 
     print(f"\nFinal state:")
-    print(f"  Norm: {norm_end:.6f}")
-    print(f"  Energy: {energy_end:.4f}")
-    print(f"  Norm drift: {abs(norm_end - norm_start):.2e}")
-    print(f"  Energy drift: {abs(energy_end - energy_start):.2e}")
+    print(f"  Norm: {norm_final:.6f}")
+    print(f"  Energy: {energy_final:.4f}")
+    print(f"  Norm drift: {abs(norm_final - norm_start):.2e}")
+    print(f"  Energy drift: {abs(energy_final - energy_start):.2e}")
 
     print(f"\nTunneling results:")
     print(f"  Transmission T: {T_measured:.4f}")
@@ -122,19 +168,24 @@ def run_simulation(N: int = 1024, L: float = 100.0, sigma: float = 3.0,
     if T_theory is not None:
         print(f"  Theoretical T: {T_theory:.4f}")
 
-    # Generate viewer
-    generate_viewer(history, V_np, x_np, V0, barrier_width, E_kinetic, T_theory, hbar, m, dt, L, N)
+    # Generate viewer (pass prob history and conservation values)
+    generate_viewer(prob_history, V_np, x_np, V0, barrier_width, E_kinetic, T_theory,
+                    hbar, m, dt, L, N, norm_start, norm_final, energy_start, energy_final)
 
-    return T_measured, R_measured, norm_end - norm_start
+    return T_measured, R_measured, norm_final - norm_start
 
 
-def generate_viewer(history, V_np, x_np, V0, barrier_width, E_kinetic, T_theory, hbar, m, dt, L, N):
+def generate_viewer(prob_history, V_np, x_np, V0, barrier_width, E_kinetic, T_theory, hbar, m, dt, L, N,
+                    norm_start, norm_final, energy_start, energy_final):
     """Generate HTML visualization."""
     x_data = x_np.tolist()
     V_data = V_np.tolist()
-    prob_data = [h[1].tolist() for h in history]
-    norm_data = [h[2] for h in history]
-    energy_data = [h[5] for h in history]
+    prob_data = [p.tolist() for p in prob_history]
+    # For conservation display, use start and final values
+    norm_start_val = norm_start
+    norm_final_val = norm_final
+    energy_start_val = energy_start
+    energy_final_val = energy_final
     dx = L / N
 
     html_content = f"""
@@ -205,7 +256,7 @@ def generate_viewer(history, V_np, x_np, V0, barrier_width, E_kinetic, T_theory,
 </head>
 <body>
     <h1>Quantum Tunneling</h1>
-    <div class="subtitle">Wavepacket passing through a classically forbidden barrier</div>
+    <div class="subtitle">Wavepacket passing through a classically forbidden barrier (TinyPhysics Blueprint v3)</div>
 
     <div class="main-container">
         <div class="wave-section">
@@ -246,12 +297,20 @@ def generate_viewer(history, V_np, x_np, V0, barrier_width, E_kinetic, T_theory,
             <div class="stat-group">
                 <h3>Conservation</h3>
                 <div class="stat-row">
-                    <span class="stat-label">Norm ∫|ψ|²dx</span>
-                    <span class="stat-value good" id="normValue">-</span>
+                    <span class="stat-label">Norm (initial)</span>
+                    <span class="stat-value good">{norm_start_val:.6f}</span>
                 </div>
                 <div class="stat-row">
-                    <span class="stat-label">Energy &lt;H&gt;</span>
-                    <span class="stat-value good" id="energyValue">-</span>
+                    <span class="stat-label">Norm (final)</span>
+                    <span class="stat-value good">{norm_final_val:.6f}</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Norm drift</span>
+                    <span class="stat-value good">{abs(norm_final_val - norm_start_val):.2e}</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Energy drift</span>
+                    <span class="stat-value good">{abs(energy_final_val - energy_start_val):.2e}</span>
                 </div>
             </div>
 
@@ -262,11 +321,11 @@ def generate_viewer(history, V_np, x_np, V0, barrier_width, E_kinetic, T_theory,
                     <span class="stat-value">{E_kinetic:.3f}</span>
                 </div>
                 <div class="stat-row">
-                    <span class="stat-label">Barrier V₀</span>
+                    <span class="stat-label">Barrier V0</span>
                     <span class="stat-value">{V0:.3f}</span>
                 </div>
                 <div class="stat-row">
-                    <span class="stat-label">E / V₀</span>
+                    <span class="stat-label">E / V0</span>
                     <span class="stat-value">{E_kinetic/V0:.3f}</span>
                 </div>
                 <div class="stat-row">
@@ -277,8 +336,8 @@ def generate_viewer(history, V_np, x_np, V0, barrier_width, E_kinetic, T_theory,
 
             <div class="quantum-info">
                 <div class="title">Quantum Tunneling</div>
-                <div class="desc">Classically, E &lt; V₀ means 100% reflection. Quantum mechanics allows the wavefunction to penetrate the barrier!</div>
-                <div class="formula">T ≈ e^(-2κa), κ = √(2m(V₀-E))/ℏ</div>
+                <div class="desc">Classically, E &lt; V0 means 100% reflection. Quantum mechanics allows the wavefunction to penetrate the barrier!</div>
+                <div class="formula">T = e^(-2*kappa*a), kappa = sqrt(2m(V0-E))/hbar</div>
             </div>
         </div>
     </div>
@@ -287,8 +346,6 @@ def generate_viewer(history, V_np, x_np, V0, barrier_width, E_kinetic, T_theory,
         const x = {json.dumps(x_data)};
         const V = {json.dumps(V_data)};
         const probHistory = {json.dumps(prob_data)};
-        const normHistory = {json.dumps(norm_data)};
-        const energyHistory = {json.dumps(energy_data)};
         const V0 = {V0};
         const barrierWidth = {barrier_width};
         const totalFrames = probHistory.length;
@@ -355,7 +412,7 @@ def generate_viewer(history, V_np, x_np, V0, barrier_width, E_kinetic, T_theory,
             ctx.font = '12px sans-serif';
             ctx.fillText('E', 655, eY + 4);
 
-            // Wavefunction |ψ|²
+            // Wavefunction |psi|^2
             const gradient = ctx.createLinearGradient(0, 100, 0, 350);
             gradient.addColorStop(0, 'rgba(170, 68, 255, 0.8)');
             gradient.addColorStop(1, 'rgba(170, 68, 255, 0.1)');
@@ -387,7 +444,7 @@ def generate_viewer(history, V_np, x_np, V0, barrier_width, E_kinetic, T_theory,
             ctx.fillStyle = '#888';
             ctx.font = '12px sans-serif';
             ctx.fillText('x', 660, 365);
-            ctx.fillText('|ψ|², V', 10, 45);
+            ctx.fillText('|psi|^2, V', 10, 45);
             ctx.fillStyle = '#f44';
             ctx.fillText('V(x)', 340, 120);
         }}
@@ -406,8 +463,6 @@ def generate_viewer(history, V_np, x_np, V0, barrier_width, E_kinetic, T_theory,
             document.getElementById('sumValue').textContent = (T + R).toFixed(4);
             document.getElementById('tBar').style.width = (T * 100) + '%';
             document.getElementById('rBar').style.width = (R * 100) + '%';
-            document.getElementById('normValue').textContent = normHistory[frame].toFixed(6);
-            document.getElementById('energyValue').textContent = energyHistory[frame].toFixed(4);
         }}
 
         function animate() {{

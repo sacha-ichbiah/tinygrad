@@ -1,24 +1,30 @@
 """
 TinyPhysics 2.2: The Heavy Top
-==============================
 
-A spinning top under gravity - the classic Euler-Poisson equations.
+THE TINYPHYSICS WAY (Blueprint-Compliant):
+    1. Define Hamiltonian H(L,γ) = ½ L·(I⁻¹L) + mgl γ₃
+    2. Use HeavyTopStructure (Product Manifold SO(3)* × S²)
+    3. Compile to StructureProgram
+    4. Euler-Poisson equations derived automatically
 
-The Heavy Top lives on a **Product Manifold**: SO(3) × S²
-- SO(3): The rotation group (represented by angular momentum L in body frame)
-- S²: The unit sphere (gravity direction γ in body frame)
+The Heavy Top lives on a **Product Manifold**: SO(3)* × S²
+- L: Angular momentum in body frame (on so(3)*)
+- γ: Gravity direction in body frame (on S²)
 
-The Lie-Poisson structure mixes both:
+The Lie-Poisson structure couples both:
   {Lᵢ, Lⱼ} = εᵢⱼₖ Lₖ   (angular momentum algebra)
   {γᵢ, Lⱼ} = εᵢⱼₖ γₖ   (γ transforms as a vector)
   {γᵢ, γⱼ} = 0          (γ components commute)
 
-This is the key insight: the Product Manifold has a NON-TRIVIAL coupling
-between the two factors through the Poisson bracket.
+Conservation laws:
+- Energy H is conserved (Hamiltonian)
+- Casimir C1 = |γ|² = 1 (γ lives on sphere)
+- Casimir C2 = L · γ (projection onto gravity)
 """
 
 from tinygrad import Tensor, dtypes
-from tinygrad.physics import ProductManifold, compile_system
+from tinygrad.physics import ProductManifold
+from tinyphysics.systems.heavy_top import HeavyTopSystem
 import argparse
 import time
 from tinygrad.physics_profile import get_profile
@@ -52,7 +58,12 @@ def simulate_heavy_top(
     report_policy: bool = False,
 ) -> dict:
   """
-  Simulate the Heavy Top and track conservation laws.
+  Simulate the Heavy Top using the TinyPhysics blueprint API.
+
+  The system uses:
+  - Product Manifold structure SO(3)* × S² with coupled Lie-Poisson bracket
+  - Symplectic splitting integrator
+  - Automatic conservation of energy and Casimirs
 
   Args:
     L0: Initial angular momentum [L1, L2, L3]
@@ -62,23 +73,44 @@ def simulate_heavy_top(
     mgl: Gravitational torque parameter
     dt: Time step
     steps: Number of steps
-    method: "splitting" (symplectic) or "euler" (explicit)
+    method: "splitting" (symplectic)
 
   Returns:
     Dictionary with trajectories and conservation diagnostics
   """
-  # Initialize
+  # Initialize state
   L = Tensor(L0, dtype=dtypes.float64)
   if batch_size > 1:
     L = L.reshape(1, 3).expand(batch_size, 3).contiguous()
   state = ProductManifold.from_euler_angles(L, theta0, phi0)
   gamma = state.gamma
+
+  # Setup policy
   if benchmark and profile == "balanced":
     profile = "fast"
   policy = get_profile(profile).policy
-  integrator = compile_system("heavy_top", I1=I1, I2=I2, I3=I3, mgl=mgl, dt=dt, policy=policy, dtype=dtypes.float64)
-  H = integrator.H
-  unroll_steps = unroll_steps
+
+  # BLUEPRINT API: Create HeavyTopSystem
+  system = HeavyTopSystem(
+    I1=I1, I2=I2, I3=I3,
+    mgl=mgl,
+    dt=dt,
+    dtype=dtypes.float64,
+    policy=policy
+  )
+
+  # COMPILE: Returns a StructureProgram
+  prog = system.compile()
+
+  print("=" * 60)
+  print("HEAVY TOP - TinyPhysics Blueprint API")
+  print("=" * 60)
+  print(f"\nStructure: Product Manifold SO(3)* × S²")
+  print(f"  {{Lᵢ, Lⱼ}} = εᵢⱼₖ Lₖ")
+  print(f"  {{γᵢ, Lⱼ}} = εᵢⱼₖ γₖ")
+  print(f"\nHamiltonian: H = ½ L·(I⁻¹L) + mgl γ₃")
+  print(f"Inertia: I1={I1}, I2={I2}, I3={I3}")
+  print(f"Gravity: mgl={mgl}")
 
   # Storage
   history = {
@@ -91,9 +123,8 @@ def simulate_heavy_top(
   if not benchmark:
     L_sample = L[0] if L.ndim > 1 else L
     gamma_sample = gamma[0] if gamma.ndim > 1 else gamma
-    E0 = H(ProductManifold(L_sample, gamma_sample)).numpy()
-    C1_0 = (gamma_sample * gamma_sample).sum().numpy()
-    C2_0 = (L_sample * gamma_sample).sum().numpy()
+    E0 = prog.program.energy(L_sample, gamma_sample)
+    C1_0, C2_0 = prog.program.casimirs(L_sample, gamma_sample)
 
   # Select integration method
   if method == "rk4":
@@ -102,56 +133,41 @@ def simulate_heavy_top(
   if unroll is not None and steps % unroll != 0:
     raise ValueError("steps must be divisible by unroll")
 
-  # Run simulation
+  # EVOLVE using compiled program
   sample_interval = steps if benchmark else max(1, steps // 100)
   start_time = time.perf_counter() if benchmark else None
   if benchmark:
     scan = True
-  if scan:
-    L, gamma, hist_t = integrator.evolve(L, gamma, steps, method=method, record_every=sample_interval, scan=True, unroll=unroll, policy=policy)
-    if collect_history:
-      for idx, (L_t, g_t) in enumerate(hist_t):
-        L_sample = L_t[:viewer_batch] if L_t.ndim > 1 else L_t
-        g_sample = g_t[:viewer_batch] if g_t.ndim > 1 else g_t
-        if isinstance(L_sample, Tensor) and L_sample.ndim > 1:
-          E = H(ProductManifold(L_sample[0], g_sample[0])).numpy()
-          C1 = (g_sample[0] * g_sample[0]).sum()
-          C2 = (L_sample[0] * g_sample[0]).sum()
-        else:
-          E = H(ProductManifold(L_sample, g_sample)).numpy()
-          C1 = (g_sample * g_sample).sum()
-          C2 = (L_sample * g_sample).sum()
-        history['time'].append(idx * sample_interval * dt)
-        history['L'].append(L_sample.numpy().copy())
-        history['gamma'].append(g_sample.numpy().copy())
-        history['energy'].append(E)
-        history['C1'].append(C1.numpy())
-        history['C2'].append(C2.numpy())
-  else:
-    L, gamma, hist_t = integrator.evolve(L, gamma, steps, method=method, record_every=sample_interval, scan=False, unroll=unroll, policy=policy)
-    if collect_history:
-      for idx, (L_t, g_t) in enumerate(hist_t):
-        L_sample = L_t[:viewer_batch] if L_t.ndim > 1 else L_t
-        g_sample = g_t[:viewer_batch] if g_t.ndim > 1 else g_t
-        if isinstance(L_sample, Tensor) and L_sample.ndim > 1:
-          E = H(ProductManifold(L_sample[0], g_sample[0])).numpy()
-          C1 = (g_sample[0] * g_sample[0]).sum()
-          C2 = (L_sample[0] * g_sample[0]).sum()
-        else:
-          E = H(ProductManifold(L_sample, g_sample)).numpy()
-          C1 = (g_sample * g_sample).sum()
-          C2 = (L_sample * g_sample).sum()
-        history['time'].append(idx * sample_interval * dt)
-        history['L'].append(L_sample.numpy().copy())
-        history['gamma'].append(g_sample.numpy().copy())
-        history['energy'].append(E)
-        history['C1'].append(C1.numpy())
-        history['C2'].append(C2.numpy())
+
+  (L, gamma), hist_t = prog.evolve((L, gamma), dt=dt, steps=steps,
+                                    method=method, record_every=sample_interval,
+                                    scan=scan, unroll=unroll, policy=policy)
+
+  # Collect history for visualization
+  if collect_history:
+    for idx, (L_t, g_t) in enumerate(hist_t):
+      L_sample = L_t[:viewer_batch] if L_t.ndim > 1 else L_t
+      g_sample = g_t[:viewer_batch] if g_t.ndim > 1 else g_t
+      if isinstance(L_sample, Tensor) and L_sample.ndim > 1:
+        E = prog.program.energy(L_sample[0], g_sample[0])
+        C1 = float((g_sample[0] * g_sample[0]).sum().numpy())
+        C2 = float((L_sample[0] * g_sample[0]).sum().numpy())
+      else:
+        E = prog.program.energy(L_sample, g_sample)
+        C1 = float((g_sample * g_sample).sum().numpy())
+        C2 = float((L_sample * g_sample).sum().numpy())
+      history['time'].append(idx * sample_interval * dt)
+      history['L'].append(L_sample.numpy().copy())
+      history['gamma'].append(g_sample.numpy().copy())
+      history['energy'].append(E)
+      history['C1'].append(C1)
+      history['C2'].append(C2)
 
   if benchmark and start_time is not None:
     elapsed = time.perf_counter() - start_time
     steps_s = steps / elapsed if elapsed > 0 else float("inf")
     print(f"Performance: {steps_s:,.1f} steps/s")
+
   if report_policy:
     report = policy.report(steps, L.shape, L.device)
     if report is not None:
@@ -161,18 +177,17 @@ def simulate_heavy_top(
   if not benchmark:
     L_sample = L[0] if L.ndim > 1 else L
     gamma_sample = gamma[0] if gamma.ndim > 1 else gamma
-    E_final = H(ProductManifold(L_sample, gamma_sample)).numpy()
-    C1_final = (gamma_sample * gamma_sample).sum()
-    C2_final = (L_sample * gamma_sample).sum()
+    E_final = prog.program.energy(L_sample, gamma_sample)
+    C1_final, C2_final = prog.program.casimirs(L_sample, gamma_sample)
 
     history['diagnostics'] = {
       'E0': E0,
       'E_final': E_final,
       'dE_relative': abs(E_final - E0) / abs(E0) if E0 != 0 else abs(E_final - E0),
       'C1_0': C1_0,
-      'C1_final': C1_final.numpy(),
+      'C1_final': C1_final,
       'C2_0': C2_0,
-      'C2_final': C2_final.numpy(),
+      'C2_final': C2_final,
     }
     if render:
       generate_viewer(history['gamma'])

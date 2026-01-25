@@ -1,29 +1,32 @@
 """
-Wavepacket Spreading - Free Particle Quantum Mechanics (Level 4.1)
+Wavepacket Spreading - Free Particle Quantum Mechanics
 
-THE TINYPHYSICS WAY:
-    1. Define the system via the Hamiltonian: H = p²/2m
-    2. Solve Schrödinger equation: iℏ ∂ψ/∂t = Hψ
-    3. Use split-operator method with FFT for unitary evolution
+THE TINYPHYSICS WAY (Blueprint-Compliant):
+    1. Define grids and parameters
+    2. Create QuantumHamiltonianCompiler with Hamiltonian H = p^2/2m
+    3. Compile to get unitary split-operator evolution
+    4. Evolve with compile() -> evolve() pattern
 
 A Gaussian wavepacket in free space spreads over time due to the
 uncertainty principle - different momentum components travel at
 different speeds.
 
-Theoretical spreading: σ(t) = σ₀ √(1 + (ℏt/2mσ₀²)²)
+Theoretical spreading: sigma(t) = sigma_0 * sqrt(1 + (hbar*t / 2*m*sigma_0^2)^2)
 
-This demonstrates quantum mechanics simulation using the same
-"compiler" philosophy - physics defined by energy alone.
+Structure: QUANTUM (unitary)
+Bracket: -i * grad (Schrodinger equation)
+Method: Split-operator FFT (exact unitary evolution)
 """
 
 import numpy as np
-from tinygrad.physics import QuantumSystem
+from tinygrad.tensor import Tensor
+from tinyphysics.structures.commutator import QuantumHamiltonianCompiler, gaussian_wavepacket
 import json
 import os
 
 
-def run_simulation(N: int = 512, L: float = 60.0, sigma: float = 1.0,
-                   k0: float = 0.0, dt: float = 0.02, steps: int = 1000):
+def run_simulation(N: int = 512, L: float = 32.0, sigma: float = 1.0,
+                   k0: float = 0.0, dt: float = 0.01, steps: int = 1000):
     """
     Simulate a Gaussian wavepacket spreading in free space.
 
@@ -35,63 +38,91 @@ def run_simulation(N: int = 512, L: float = 60.0, sigma: float = 1.0,
         dt: Time step
         steps: Number of time steps
     """
-    # Physical constants (natural units: ℏ = m = 1)
+    # Physical constants (natural units: hbar = m = 1)
     hbar = 1.0
     m = 1.0
 
     print("=" * 60)
-    print("WAVEPACKET SPREADING - Quantum Mechanics with TinyPhysics")
+    print("WAVEPACKET SPREADING - TinyPhysics Blueprint API")
     print("=" * 60)
-    print(f"\nSchrödinger equation: iℏ ∂ψ/∂t = Ĥψ")
-    print(f"Free particle Hamiltonian: Ĥ = p̂²/2m = -ℏ²∇²/2m")
+    print(f"\nStructure: QUANTUM (unitary)")
+    print(f"  bracket(psi, grad) = -i * grad")
+    print(f"\nSchrodinger equation: i*hbar * dpsi/dt = H*psi")
+    print(f"Free particle Hamiltonian: H = p^2/2m = -hbar^2 * nabla^2 / 2m")
     print(f"\nSplit-operator method:")
-    print(f"  ψ(t+dt) = FFT⁻¹[e^(-iℏk²dt/2m) · FFT[ψ(t)]]")
+    print(f"  psi(t+dt) = FFT^-1[e^(-i*hbar*k^2*dt/2m) * FFT[psi(t)]]")
     print(f"\nParameters:")
     print(f"  Grid points: {N}")
     print(f"  Domain: [-{L/2:.1f}, {L/2:.1f}]")
-    print(f"  Initial width σ₀: {sigma}")
-    print(f"  Initial momentum k₀: {k0}")
-    print(f"  ℏ = {hbar}, m = {m}")
+    print(f"  Initial width sigma_0: {sigma}")
+    print(f"  Initial momentum k_0: {k0}")
+    print(f"  hbar = {hbar}, m = {m}")
     print(f"  Time step dt: {dt}, Steps: {steps}")
     print(f"  Total time: {dt * steps:.2f}")
 
-    # Create quantum system
-    system = QuantumSystem(N=N, L=L, m=m, hbar=hbar, V=None)
+    # BLUEPRINT: Create 1D grid
+    x = Tensor.linspace(-L/2, L/2, N)
 
-    # Initial Gaussian wavepacket
-    psi_r, psi_i = system.gaussian_wavepacket(x0=0.0, sigma=sigma, k0=k0)
+    # BLUEPRINT: Create quantum compiler (free particle: V=None)
+    compiler = QuantumHamiltonianCompiler(
+        grids=(x,),
+        dt=dt,
+        mass=m,
+        hbar=hbar,
+        V=None,  # Free particle
+        g=0.0    # No nonlinearity
+    )
+
+    # Create initial Gaussian wavepacket
+    psi = gaussian_wavepacket(x, x0=0.0, k0=k0, sigma=sigma)
 
     # Initial measurements
-    norm_start = system.norm(psi_r, psi_i)
-    width_start = system.width(psi_r, psi_i)
-    energy_start = system.energy(psi_r, psi_i)
+    norm_start = compiler.norm(psi)
+    width_start = compiler.width(psi)
+    x_mean_start = compiler.expectation_x(psi)
+    energy_start = compiler.kinetic_energy(psi)
 
     print(f"\nInitial state:")
     print(f"  Norm: {norm_start:.6f} (should be 1)")
-    print(f"  Width σ: {width_start:.4f}")
-    print(f"  Energy <H>: {energy_start:.4f}")
+    print(f"  Width sigma: {width_start:.4f}")
+    print(f"  <x>: {x_mean_start:.4f}")
+    print(f"  Energy <T>: {energy_start:.4f}")
 
     # Theoretical prediction for width spreading
-    # σ(t) = σ₀ √(1 + (ℏt/2mσ₀²)²)
+    # sigma(t) = sigma_0 * sqrt(1 + (hbar*t / 2*m*sigma_0^2)^2)
     t_final = dt * steps
     alpha = hbar / (2 * m * sigma**2)
     width_theory = sigma * np.sqrt(1 + (alpha * t_final)**2)
     print(f"\nTheoretical final width: {width_theory:.4f}")
 
-    # Evolve
+    # BLUEPRINT: Evolve using compiled program
     print(f"\nEvolving wavefunction...")
-    psi_r, psi_i, history = system.evolve(psi_r, psi_i, dt=dt, steps=steps,
-                                          record_every=max(1, steps // 200))
+    record_every = max(1, steps // 200)
+    psi, raw_history = compiler.evolve(psi, dt=dt, steps=steps, record_every=record_every)
+
+    # Process history for visualization
+    x_np = x.numpy()
+    history = []
+    for psi_np, step_idx in raw_history:
+        psi_tensor = Tensor(psi_np)
+        prob = compiler.prob_density(psi_tensor).numpy()
+        norm = compiler.norm(psi_tensor)
+        width = compiler.width(psi_tensor)
+        x_mean = compiler.expectation_x(psi_tensor)
+        energy = compiler.kinetic_energy(psi_tensor)
+        history.append((x_np, prob, norm, width, x_mean, energy))
 
     # Final measurements
-    norm_end = system.norm(psi_r, psi_i)
-    width_end = system.width(psi_r, psi_i)
-    energy_end = system.energy(psi_r, psi_i)
+    norm_end = compiler.norm(psi)
+    width_end = compiler.width(psi)
+    x_mean_end = compiler.expectation_x(psi)
+    energy_end = compiler.kinetic_energy(psi)
 
     print(f"\nFinal state:")
     print(f"  Norm: {norm_end:.6f}")
-    print(f"  Width σ: {width_end:.4f}")
-    print(f"  Energy <H>: {energy_end:.4f}")
+    print(f"  Width sigma: {width_end:.4f}")
+    print(f"  <x>: {x_mean_end:.4f}")
+    print(f"  Energy <T>: {energy_end:.4f}")
 
     norm_drift = abs(norm_end - norm_start) / norm_start
     energy_drift = abs(energy_end - energy_start) / abs(energy_start) if energy_start != 0 else 0
@@ -120,11 +151,6 @@ def generate_viewer(history, sigma0, k0, hbar, m, dt):
 
     # Calculate theoretical width curve
     alpha = hbar / (2 * m * sigma0**2)
-    times = [i * dt * (len(history) - 1) / (len(history) - 1) for i in range(len(history))]
-    width_theory = [sigma0 * np.sqrt(1 + (alpha * t)**2) for t in
-                    np.linspace(0, dt * (len(history) - 1) * (len(prob_data) - 1) // max(len(prob_data) - 1, 1),
-                                len(history))]
-    # Recalculate times properly
     total_time = dt * (len(prob_data) - 1) * (2000 // 200) if len(prob_data) > 1 else 0
     width_theory = [sigma0 * np.sqrt(1 + (alpha * t)**2)
                     for t in np.linspace(0, total_time, len(history))]
@@ -264,7 +290,7 @@ def generate_viewer(history, sigma0, k0, hbar, m, dt):
 </head>
 <body>
     <h1>Quantum Wavepacket Spreading</h1>
-    <div class="subtitle">Free particle evolution via split-operator FFT method</div>
+    <div class="subtitle">TinyPhysics Blueprint API - Split-operator FFT method</div>
 
     <div class="main-container">
         <div class="wave-section">
@@ -293,11 +319,11 @@ def generate_viewer(history, sigma0, k0, hbar, m, dt):
                     <span class="stat-value" id="posValue">-</span>
                 </div>
                 <div class="stat-row">
-                    <span class="stat-label">Width σ</span>
+                    <span class="stat-label">Width sigma</span>
                     <span class="stat-value" id="widthValue">-</span>
                 </div>
                 <div class="stat-row">
-                    <span class="stat-label">Theory σ(t)</span>
+                    <span class="stat-label">Theory sigma(t)</span>
                     <span class="stat-value" id="theoryValue">-</span>
                 </div>
             </div>
@@ -305,11 +331,11 @@ def generate_viewer(history, sigma0, k0, hbar, m, dt):
             <div class="stat-group">
                 <h3>Conservation</h3>
                 <div class="stat-row">
-                    <span class="stat-label">Norm ∫|ψ|²dx</span>
+                    <span class="stat-label">Norm int|psi|^2 dx</span>
                     <span class="stat-value good" id="normValue">-</span>
                 </div>
                 <div class="stat-row">
-                    <span class="stat-label">Energy &lt;H&gt;</span>
+                    <span class="stat-label">Energy &lt;T&gt;</span>
                     <span class="stat-value good" id="energyValue">-</span>
                 </div>
             </div>
@@ -317,15 +343,15 @@ def generate_viewer(history, sigma0, k0, hbar, m, dt):
             <div class="stat-group">
                 <h3>Initial Parameters</h3>
                 <div class="stat-row">
-                    <span class="stat-label">Initial width σ₀</span>
+                    <span class="stat-label">Initial width sigma_0</span>
                     <span class="stat-value">{sigma0:.2f}</span>
                 </div>
                 <div class="stat-row">
-                    <span class="stat-label">Momentum k₀</span>
+                    <span class="stat-label">Momentum k_0</span>
                     <span class="stat-value">{k0:.2f}</span>
                 </div>
                 <div class="stat-row">
-                    <span class="stat-label">ℏ, m</span>
+                    <span class="stat-label">hbar, m</span>
                     <span class="stat-value">{hbar:.1f}, {m:.1f}</span>
                 </div>
             </div>
@@ -333,13 +359,13 @@ def generate_viewer(history, sigma0, k0, hbar, m, dt):
             <div class="quantum-info">
                 <div class="title">Uncertainty Principle</div>
                 <div class="desc">A localized wavepacket contains a spread of momenta. Higher momenta travel faster, causing the packet to spread.</div>
-                <div class="formula">σ(t) = σ₀√(1 + (ℏt/2mσ₀²)²)</div>
+                <div class="formula">sigma(t) = sigma_0 * sqrt(1 + (hbar*t/2m*sigma_0^2)^2)</div>
             </div>
 
             <div class="quantum-info">
                 <div class="title">Split-Operator Method</div>
                 <div class="desc">FFT transforms to momentum space where kinetic energy is diagonal. Exact unitary evolution!</div>
-                <div class="formula">ψ(t+dt) = F⁻¹[e^(-iℏk²dt/2m)F[ψ]]</div>
+                <div class="formula">psi(t+dt) = F^-1[e^(-i*hbar*k^2*dt/2m) * F[psi]]</div>
             </div>
         </div>
     </div>
@@ -408,7 +434,7 @@ def generate_viewer(history, sigma0, k0, hbar, m, dt):
             wctx.fillStyle = '#888';
             wctx.font = '12px sans-serif';
             wctx.fillText('x', 610, 355);
-            wctx.fillText('|ψ|²', 15, 45);
+            wctx.fillText('|psi|^2', 15, 45);
             wctx.fillText('0', 45, 365);
 
             // Initial wavepacket (faint)
@@ -477,8 +503,8 @@ def generate_viewer(history, sigma0, k0, hbar, m, dt):
             // Labels
             wdctx.fillStyle = '#888';
             wdctx.font = '12px sans-serif';
-            wdctx.fillText('Width σ(t) vs Time', 280, 20);
-            wdctx.fillText('σ', 15, 75);
+            wdctx.fillText('Width sigma(t) vs Time', 280, 20);
+            wdctx.fillText('sigma', 15, 75);
             wdctx.fillText('t', 620, 130);
 
             // Axes
@@ -567,7 +593,7 @@ def generate_viewer(history, sigma0, k0, hbar, m, dt):
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--test":
-        # Quick test with smaller parameters
-        run_simulation(N=256, L=30.0, sigma=1.0, k0=2.0, dt=0.02, steps=500)
+        # Quick test: domain ~10*sigma to avoid edge underflow
+        run_simulation(N=256, L=16.0, sigma=1.0, k0=0.0, dt=0.01, steps=500)
     else:
         run_simulation()

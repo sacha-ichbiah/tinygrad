@@ -1,9 +1,10 @@
 import numpy as np
 from tinygrad.tensor import Tensor
-from tinyphysics.compiler import UniversalSymplecticCompiler
 import json
 import os
 from tinygrad.physics import point_vortex_hamiltonian
+from tinyphysics.core.compiler import compile_structure
+from tinyphysics.systems.vortices import PointVortexStructure
 
 def run_simulation():
     # Parameters
@@ -39,7 +40,8 @@ def run_simulation():
     history_q = []
     
     H = point_vortex_hamiltonian(Gamma, softening=1e-2)
-    system = UniversalSymplecticCompiler(kind="point_vortex", integrator="midpoint", gamma=Gamma, softening=1e-2)
+    structure = PointVortexStructure(Gamma)
+    system = compile_structure(state=q, H=H, structure=structure, integrator="midpoint", softening=1e-2)
     H_start = float(H(q).numpy())
     C_start = (q.numpy() * Gamma.numpy()[:, None]).sum(axis=0)
     L_start = (Gamma.numpy() * (q.numpy()**2).sum(axis=1)).sum()

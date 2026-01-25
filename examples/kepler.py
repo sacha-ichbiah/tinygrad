@@ -1,19 +1,21 @@
 """
 Kepler Problem - Planet orbiting a star (Level 1.3)
 
-THE TINYPHYSICS WAY:
+THE TINYPHYSICS WAY (Blueprint-Compliant):
     1. Define the Hamiltonian H(q, p) - that's ALL the physics
-    2. The system automatically derives equations of motion via autograd
-    3. Symplectic integrator preserves energy
+    2. Create a PhysicalSystem with explicit CanonicalStructure
+    3. Compile to get a StructureProgram
+    4. Evolve preserves energy via symplectic integration
 
 Hamiltonian: H = |p|²/2m - GMm/|r|
 
-This demonstrates the "compiler" approach - physics defined by energy alone.
+This demonstrates the structure-preserving compiler approach.
 """
 
 import numpy as np
 from tinygrad.tensor import Tensor
-from tinygrad.physics import simulate_hamiltonian
+from tinyphysics import PhysicalSystem
+from tinyphysics.structures.canonical import CanonicalStructure
 import json
 import os
 import time
@@ -61,9 +63,10 @@ def kepler_hamiltonian(GM: float = 1.0, m: float = 1.0, softening: float = 0.0):
 
 def run_simulation(dt=0.01, steps=5000, eccentricity=0.6, render=True):
     """
-    Simulate the Kepler problem using the TinyPhysics compiler approach.
+    Simulate the Kepler problem using the TinyPhysics blueprint API.
 
-    User defines ONLY the Hamiltonian. Everything else is automatic.
+    User defines ONLY the Hamiltonian. The structure (CanonicalStructure)
+    defines the geometry. The compiler produces a structure-preserving program.
     """
     # Physical constants (normalized: GM = 1)
     GM = 1.0
@@ -83,37 +86,64 @@ def run_simulation(dt=0.01, steps=5000, eccentricity=0.6, render=True):
     T_orbital = 2 * np.pi * np.sqrt(a**3 / GM)
 
     print("=" * 60)
-    print("KEPLER PROBLEM - TinyPhysics Compiler Approach")
+    print("KEPLER PROBLEM - TinyPhysics Blueprint API")
     print("=" * 60)
     print(f"\nPhysics defined by Hamiltonian ONLY:")
     print(f"  H(q, p) = |p|²/2m - GMm/|r|")
+    print(f"\nStructure: CanonicalStructure (symplectic)")
+    print(f"  bracket(state, grad) -> (grad_p, -grad_q)")
     print(f"\nEquations of motion derived automatically via autograd:")
     print(f"  dq/dt = +dH/dp = p/m")
     print(f"  dp/dt = -dH/dq = -GMm*r/|r|³")
-    print(f"\nIntegrator: auto")
-    print(f"Eccentricity: {e}, Semi-major axis: {a}")
+    print(f"\nEccentricity: {e}, Semi-major axis: {a}")
     print(f"Orbital period: {T_orbital:.4f}")
     print(f"Simulation: {steps} steps, dt={dt} ({dt*steps/T_orbital:.1f} orbits)")
 
-    # CREATE THE HAMILTONIAN SYSTEM - This is the "compilation" step
+    # CREATE THE HAMILTONIAN
     H = kepler_hamiltonian(GM=GM, m=m)
-    # Initial energy
+
+    # Initial energy and angular momentum
     E_start = float(H(q, p).numpy())
     L_start = float((q.numpy()[0] * p.numpy()[1] - q.numpy()[1] * p.numpy()[0]))
 
     print(f"\nInitial Energy: {E_start:.6f}")
     print(f"Initial Angular Momentum: {L_start:.6f}")
 
-    # EVOLVE THE SYSTEM
+    # BLUEPRINT API: Create PhysicalSystem with explicit Structure
+    system = PhysicalSystem(
+        state=(q, p),
+        H_func=H,
+        structure=CanonicalStructure()
+    )
+
+    # COMPILE: Returns a StructureProgram
+    prog = system.compile()
+    print(f"\nCompiled: {type(prog.program).__name__}")
+
+    # EVOLVE THE SYSTEM with explicit history recording
+    # (tinygrad's lazy evaluation requires realizing values at each record point)
+    record_every = 10
+    history = []
     start_time = time.perf_counter()
-    q, p, history = simulate_hamiltonian(H, q, p, dt=dt, steps=steps, record_every=10)
+
+    for i in range(steps):
+        if i % record_every == 0:
+            # Realize and record current state
+            q_np, p_np = q.numpy().copy(), p.numpy().copy()
+            E_i = float(H(q, p).numpy())
+            history.append((q_np, p_np, E_i))
+        # Step using the compiled program
+        (q, p) = prog.step((q, p), dt)
+
+    # Record final state
+    q_np, p_np = q.numpy().copy(), p.numpy().copy()
+    E_end = float(H(q, p).numpy())
+    history.append((q_np, p_np, E_end))
 
     elapsed = time.perf_counter() - start_time
     steps_s = steps / elapsed if elapsed > 0 else float("inf")
 
     # Final state
-    E_end = float(H(q, p).numpy())
-    q_np, p_np = q.numpy(), p.numpy()
     L_end = float(q_np[0] * p_np[1] - q_np[1] * p_np[0])
 
     E_drift = abs(E_end - E_start) / abs(E_start)
@@ -126,7 +156,7 @@ def run_simulation(dt=0.01, steps=5000, eccentricity=0.6, render=True):
     print(f"Performance: {steps_s:,.1f} steps/s")
 
     # Generate viewer
-    if render and history is not None and len(history) > 2:
+    if render and len(history) > 2:
         history_q = [h[0].tolist() for h in history]
         history_E = [h[2] for h in history]
         generate_viewer(history_q, a, e, history_E, E_start)
@@ -604,21 +634,21 @@ def generate_viewer(history_q, a, e, history_E, E_start):
 
 
 def compare_integrators():
-    """Compare integrators."""
+    """Compare structure-preserving integrators."""
     print("=" * 60)
-    print("COMPARING SYMPLECTIC INTEGRATORS")
+    print("STRUCTURE-PRESERVING INTEGRATION (Blueprint API)")
     print("=" * 60)
 
     results = {}
-    for name in ["auto"]:
+    for name in ["canonical"]:
         print(f"\n{'='*60}")
-        _, _, E_drift, L_drift = run_simulation(dt=0.01, steps=5000)
+        _, _, E_drift, L_drift = run_simulation(dt=0.01, steps=5000, render=False)
         results[name] = (E_drift, L_drift)
 
     print(f"\n{'='*60}")
     print("SUMMARY")
     print("="*60)
-    print(f"{'Mode':<12} {'Energy Drift':<15} {'Ang.Mom. Drift':<15}")
+    print(f"{'Structure':<12} {'Energy Drift':<15} {'Ang.Mom. Drift':<15}")
     print("-"*42)
     for name, (e_drift, l_drift) in results.items():
         print(f"{name:<12} {e_drift:<15.2e} {l_drift:<15.2e}")

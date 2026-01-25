@@ -87,6 +87,24 @@ jobs:
         clang -O2 recognize.c -lm -o recognize
         cat test/models/efficientnet/Chicken.jpg | ./recognize | grep cock
 
+  tinyphysicsbench:
+    name: TinyPhysics Bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+    - name: Setup Environment
+      uses: ./.github/actions/setup-tinygrad
+      with:
+        key: tinyphysics-bench
+        deps: testing_minimal
+    - name: Run TinyPhysics Bench
+      run: |
+        CPU=1 TINYGRAD_BENCH_CANONICAL_MAX=5 TINYGRAD_BENCH_SO3_MAX=5 TINYGRAD_BENCH_QUANTUM_MAX=5 \
+        TINYGRAD_BENCH_CONSTRAINT_MAX=5 TINYGRAD_BENCH_DISSIPATIVE_MAX=5 TINYGRAD_BENCH_FLUID_MAX=5 \
+        python3 tinyphysics/bench/universal_physics_bench.py
+
   torchbackend:
     name: Torch Backend Tests
     runs-on: ubuntu-latest

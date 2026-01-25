@@ -1,10 +1,11 @@
 """
 Point Vortex Dynamics - The Hello World of Fluid Mechanics (Level 3.1)
 
-THE TINYPHYSICS WAY:
+THE TINYPHYSICS WAY (Blueprint-Compliant):
     1. Define the Hamiltonian H = -1/(4π) Σ Γ_i Γ_j log|r_ij|
-    2. Autograd computes all pairwise interaction forces
-    3. Non-standard symplectic structure: Γ acts as "mass"
+    2. Create PhysicalSystem with PointVortexStructure (Lie-Poisson)
+    3. Compile to get a StructureProgram
+    4. Autograd computes all pairwise interaction forces
 
 This demonstrates:
     - Kirchhoff's point vortex equations
@@ -15,7 +16,8 @@ This demonstrates:
 import numpy as np
 from tinygrad.tensor import Tensor
 from tinygrad.physics import point_vortex_hamiltonian
-from tinyphysics.compiler import UniversalSymplecticCompiler
+from tinyphysics import PhysicalSystem
+from tinyphysics.systems.vortices import PointVortexStructure
 import json
 import os
 
@@ -35,37 +37,62 @@ def run_vortex_pair():
          0.5, 0.0,  # vortex 1 at (0.5, 0)
     ])
 
-    system = UniversalSymplecticCompiler(kind="point_vortex", integrator="midpoint", gamma=gamma)
+    # CREATE THE HAMILTONIAN
     H = point_vortex_hamiltonian(gamma)
 
     print(f"\nPhysics defined by Hamiltonian ONLY:")
     print(f"  H = -1/(4π) Σ Γ_i Γ_j log|r_ij|")
+    print(f"\nStructure: PointVortexStructure (Lie-Poisson)")
+    print(f"  bracket(z, grad) -> (grad_y/Γ, -grad_x/Γ)")
     print(f"\nKirchhoff's equations derived via autograd:")
     print(f"  Γ_i dx_i/dt = +∂H/∂y_i")
     print(f"  Γ_i dy_i/dt = -∂H/∂x_i")
-    print(f"\nIntegrator: midpoint (symplectic)")
 
     # Initial conserved quantities
     E0 = float(H(z).numpy())
-    pos0 = z.reshape(2, -1).permute(1, 0)
-    px0 = float((gamma * pos0[:, 0]).sum().numpy())
-    py0 = float((gamma * pos0[:, 1]).sum().numpy())
-    L0 = float((gamma * (pos0 * pos0).sum(axis=1)).sum().numpy())
+    n_vortices = len(gamma.numpy())
+    pos0 = z.numpy().reshape(n_vortices, 2)
+    gamma_np = gamma.numpy()
+    px0 = float((gamma_np * pos0[:, 0]).sum())
+    py0 = float((gamma_np * pos0[:, 1]).sum())
+    L0 = float((gamma_np * (pos0 * pos0).sum(axis=1)).sum())
 
     print(f"\nInitial Energy: {E0:.6f}")
     print(f"Initial Momentum: ({px0:.6f}, {py0:.6f})")
     print(f"Initial Angular Momentum: {L0:.6f}")
 
-    # Evolve (reduced steps for faster iteration - autograd is slow)
-    dt, steps = 0.05, 100
-    z_final, history = system.evolve(z, dt=dt, steps=steps, record_every=2)
+    # BLUEPRINT API: Create PhysicalSystem with explicit Structure
+    system = PhysicalSystem(
+        state=z,
+        H_func=H,
+        structure=PointVortexStructure(gamma)
+    )
+
+    # COMPILE: Returns a StructureProgram
+    prog = system.compile()
+    print(f"\nCompiled: {type(prog.program).__name__}")
+
+    # EVOLVE with explicit history recording
+    dt, steps, record_every = 0.05, 100, 2
+    history = []
+
+    for i in range(steps):
+        if i % record_every == 0:
+            z_np = z.numpy().copy()
+            E_i = float(H(z).numpy())
+            history.append((z_np, E_i))
+        z = prog.step(z, dt)
+
+    # Record final state
+    z_np = z.numpy().copy()
+    E_final = float(H(z).numpy())
+    history.append((z_np, E_final))
 
     # Final state
-    E_final = float(H(z_final).numpy())
-    pos1 = z_final.reshape(2, -1).permute(1, 0)
-    px_final = float((gamma * pos1[:, 0]).sum().numpy())
-    py_final = float((gamma * pos1[:, 1]).sum().numpy())
-    L_final = float((gamma * (pos1 * pos1).sum(axis=1)).sum().numpy())
+    pos1 = z_np.reshape(n_vortices, 2)
+    px_final = float((gamma_np * pos1[:, 0]).sum())
+    py_final = float((gamma_np * pos1[:, 1]).sum())
+    L_final = float((gamma_np * (pos1 * pos1).sum(axis=1)).sum())
 
     print(f"\nFinal Energy: {E_final:.6f}")
     print(f"Final Momentum: ({px_final:.6f}, {py_final:.6f})")
@@ -93,31 +120,55 @@ def run_vortex_dipole():
         0.0,  0.5,  # antivortex at (0, 0.5)
     ])
 
-    system = UniversalSymplecticCompiler(kind="point_vortex", integrator="midpoint", gamma=gamma)
+    # CREATE THE HAMILTONIAN
     H = point_vortex_hamiltonian(gamma)
 
     print(f"\nA vortex-antivortex pair translates together.")
     print(f"The pair moves perpendicular to the line joining them.")
 
     E0 = float(H(z).numpy())
-    pos0 = z.reshape(2, -1).permute(1, 0)
-    px0 = float((gamma * pos0[:, 0]).sum().numpy())
-    py0 = float((gamma * pos0[:, 1]).sum().numpy())
+    n_vortices = len(gamma.numpy())
+    pos0 = z.numpy().reshape(n_vortices, 2)
+    gamma_np = gamma.numpy()
+    px0 = float((gamma_np * pos0[:, 0]).sum())
+    py0 = float((gamma_np * pos0[:, 1]).sum())
 
     print(f"\nInitial Energy: {E0:.6f}")
     print(f"Initial Momentum: ({px0:.6f}, {py0:.6f})")
 
-    dt, steps = 0.05, 100
-    z_final, history = system.evolve(z, dt=dt, steps=steps, record_every=2)
+    # BLUEPRINT API: Create PhysicalSystem with explicit Structure
+    system = PhysicalSystem(
+        state=z,
+        H_func=H,
+        structure=PointVortexStructure(gamma)
+    )
 
-    E_final = float(H(z_final).numpy())
+    # COMPILE: Returns a StructureProgram
+    prog = system.compile()
+
+    # EVOLVE with explicit history recording
+    dt, steps, record_every = 0.05, 100, 2
+    history = []
+
+    for i in range(steps):
+        if i % record_every == 0:
+            z_np = z.numpy().copy()
+            E_i = float(H(z).numpy())
+            history.append((z_np, E_i))
+        z = prog.step(z, dt)
+
+    # Record final state
+    z_np = z.numpy().copy()
+    E_final = float(H(z).numpy())
+    history.append((z_np, E_final))
+
     print(f"Final Energy: {E_final:.6f}")
     E_drift = abs(E_final - E0) / abs(E0) if abs(E0) > 1e-10 else abs(E_final - E0)
     print(f"Energy Drift: {E_drift:.2e}")
 
     # Show translation
     z0 = history[0][0].reshape(-1, 2)
-    zf = z_final.numpy().reshape(-1, 2)
+    zf = z_np.reshape(-1, 2)
     print(f"\nVortex 0 moved from ({z0[0,0]:.2f}, {z0[0,1]:.2f}) to ({zf[0,0]:.2f}, {zf[0,1]:.2f})")
 
     return history, gamma.numpy()
@@ -129,7 +180,7 @@ def run_three_vortices():
     print("THREE VORTICES - Complex dynamics")
     print("=" * 60)
 
-    # Three vortices with different circulations
+    # Three vortices with equal circulations
     gamma = Tensor([1.0, 1.0, 1.0])
 
     # Equilateral triangle configuration
@@ -140,25 +191,50 @@ def run_three_vortices():
         r * np.cos(4*np.pi/3), r * np.sin(4*np.pi/3),
     ])
 
-    system = UniversalSymplecticCompiler(kind="point_vortex", integrator="midpoint", gamma=gamma)
+    # CREATE THE HAMILTONIAN
     H = point_vortex_hamiltonian(gamma)
 
     print(f"\nThree equal vortices in equilateral triangle")
     print(f"They rotate rigidly about the center of vorticity")
 
     E0 = float(H(z).numpy())
-    pos0 = z.reshape(2, -1).permute(1, 0)
-    L0 = float((gamma * (pos0 * pos0).sum(axis=1)).sum().numpy())
+    n_vortices = len(gamma.numpy())
+    pos0 = z.numpy().reshape(n_vortices, 2)
+    gamma_np = gamma.numpy()
+    L0 = float((gamma_np * (pos0 * pos0).sum(axis=1)).sum())
 
     print(f"\nInitial Energy: {E0:.6f}")
     print(f"Initial Angular Momentum: {L0:.6f}")
 
-    dt, steps = 0.05, 100
-    z_final, history = system.evolve(z, dt=dt, steps=steps, record_every=2)
+    # BLUEPRINT API: Create PhysicalSystem with explicit Structure
+    system = PhysicalSystem(
+        state=z,
+        H_func=H,
+        structure=PointVortexStructure(gamma)
+    )
 
-    E_final = float(H(z_final).numpy())
-    pos1 = z_final.reshape(2, -1).permute(1, 0)
-    L_final = float((gamma * (pos1 * pos1).sum(axis=1)).sum().numpy())
+    # COMPILE: Returns a StructureProgram
+    prog = system.compile()
+
+    # EVOLVE with explicit history recording
+    dt, steps, record_every = 0.05, 100, 2
+    history = []
+
+    for i in range(steps):
+        if i % record_every == 0:
+            z_np = z.numpy().copy()
+            E_i = float(H(z).numpy())
+            history.append((z_np, E_i))
+        z = prog.step(z, dt)
+
+    # Record final state
+    z_np = z.numpy().copy()
+    E_final = float(H(z).numpy())
+    history.append((z_np, E_final))
+
+    # Final state
+    pos1 = z_np.reshape(n_vortices, 2)
+    L_final = float((gamma_np * (pos1 * pos1).sum(axis=1)).sum())
 
     print(f"\nFinal Energy: {E_final:.6f}")
     print(f"Final Angular Momentum: {L_final:.6f}")
@@ -173,6 +249,7 @@ def run_three_vortices():
 def generate_viewer(history, gamma, filename="examples/point_vortex_viewer.html"):
     """Generate HTML visualization."""
     n_vortices = len(gamma)
+    # history is list of (z_numpy, energy) tuples
     trajectories = [h[0].reshape(n_vortices, 2).tolist() for h in history]
     energies = [h[1] for h in history]
 

@@ -1,27 +1,24 @@
 """
 Free Rigid Body Simulation - Tennis Racket Theorem / Dzhanibekov Effect
 
-This demonstrates the tiny physics approach to rigid body dynamics using
-Lie-Poisson mechanics. Instead of manually implementing Euler's equations,
-we define only the Hamiltonian H(L) and let the system derive the dynamics.
+THE TINYPHYSICS WAY (Blueprint-Compliant):
+    1. Define Hamiltonian H(L) = 0.5 * L · (I⁻¹ L)
+    2. Use SO3Structure (Lie-Poisson bracket: L × grad)
+    3. Compile to StructureProgram
+    4. Euler's equations derived automatically: dL/dt = L × ∇H(L)
 
 The key insight: For rigid bodies, the Poisson bracket is not canonical.
-Instead of dq/dt = +∂H/∂p, dp/dt = -∂H/∂q, we have:
-
-    dL/dt = L × ∇H(L)    (Euler's equations)
-
-This is the so(3) Lie-Poisson structure. The cross product encodes the
-non-canonical geometry of rotational motion.
+The SO(3) Lie-Poisson structure encodes the geometry of rotational motion.
 
 Conservation laws:
-- Energy H = 0.5 * L · (I⁻¹ L) is conserved
-- Casimir |L|² is conserved (for any Hamiltonian on so(3))
+- Energy H = 0.5 * L · (I⁻¹ L) is conserved (Hamiltonian)
+- Casimir |L|² is conserved (for any Hamiltonian on so(3)*)
 """
 import argparse
 import time
 from tinygrad.physics_profile import get_profile
 from tinygrad.tensor import Tensor
-from tinygrad.physics import compile_system
+from tinyphysics.systems.free_rigid_body import FreeRigidBodySystem
 import json
 import os
 
@@ -30,20 +27,32 @@ def run_simulation(batch_size: int = 1, steps: int = 2000, dt: float = 0.01,
                    unroll_steps: int = 8, scan: bool = True, auto_unroll: bool = True,
                    viewer_batch: int = 4, benchmark: bool = False, profile: str = "balanced",
                    report_policy: bool = False):
+    """
+    Simulate free rigid body dynamics using the TinyPhysics blueprint API.
+
+    The system uses:
+    - SO(3) Lie-Poisson structure for angular momentum dynamics
+    - Quaternion kinematics for orientation tracking
+    - Structure-preserving integration (midpoint or splitting)
+    """
     # Principal moments of inertia: I1 < I2 < I3
     # Intermediate axis (I2) is unstable - the Tennis Racket Theorem!
     I = Tensor([1.0, 2.0, 3.0])
 
-    # Create the rigid body system using the tiny physics approach
-    # The Hamiltonian H(L) = 0.5 * L · (I⁻¹ L) is defined internally
+    # Setup policy
     if benchmark and profile == "balanced":
         profile = "fast"
     policy = get_profile(profile).policy
-    system = compile_system("rigid_body", I=I, integrator="auto", policy=policy)
 
-    dt = dt
-    steps = steps
-    unroll_steps = unroll_steps
+    # BLUEPRINT API: Create FreeRigidBodySystem
+    system = FreeRigidBodySystem(
+        I=I,
+        integrator="auto",
+        policy=policy
+    )
+
+    # COMPILE: Returns a StructureProgram
+    prog = system.compile()
 
     # Initial state: rotation near the intermediate axis (I2)
     # Small perturbations in L1 and L3 will cause tumbling
@@ -53,19 +62,23 @@ def run_simulation(batch_size: int = 1, steps: int = 2000, dt: float = 0.01,
         L = L.reshape(1, 3).expand(batch_size, 3).contiguous()
         q = q.reshape(1, 4).expand(batch_size, 4).contiguous()
 
-    print(f"Free Rigid Body Simulation (Tennis Racket Theorem)")
+    print("=" * 60)
+    print("FREE RIGID BODY - TinyPhysics Blueprint API")
+    print("=" * 60)
+    print(f"\nStructure: SO(3) Lie-Poisson")
+    print(f"  bracket(L, grad) = L × grad")
+    print(f"\nHamiltonian: H(L) = 0.5 * L · (I⁻¹ L)")
     print(f"Inertia: I = {I.numpy()}")
-    print(f"Integrator: {system.integrator_name}")
-    print(f"Initial L (body frame): {L.numpy()}")
-    print()
+    print(f"Integrator: {prog.program.integrator_name}")
+    print(f"Initial L (body frame): {L[0].numpy() if L.ndim > 1 else L.numpy()}")
 
     # Record initial conservation quantities
     L_sample = L[0] if L.ndim > 1 else L
     if not benchmark:
-        H_start = system.energy(L_sample)
-        C_start = system.casimir(L_sample)
+        H_start = prog.program.energy(L_sample)
+        C_start = prog.program.casimir(L_sample)
 
-    # Run simulation
+    # EVOLVE using compiled program
     record_every = steps if benchmark else 10
     unroll = None if auto_unroll else unroll_steps
     if unroll is not None and steps % unroll != 0:
@@ -74,14 +87,15 @@ def run_simulation(batch_size: int = 1, steps: int = 2000, dt: float = 0.01,
     start_time = time.perf_counter() if benchmark else None
     if benchmark:
         scan = True
-    if scan:
-        L, q, history = system.evolve(L, q, dt, steps, record_every=record_every, scan=True, unroll=unroll, policy=policy)
-    else:
-        L, q, history = system.evolve(L, q, dt, steps, record_every=record_every, scan=False, unroll=unroll, policy=policy)
+
+    (L, q), history = prog.evolve((L, q), dt=dt, steps=steps,
+                                   record_every=record_every, scan=scan, unroll=unroll, policy=policy)
+
     if benchmark and start_time is not None:
         elapsed = time.perf_counter() - start_time
         steps_s = steps / elapsed if elapsed > 0 else float("inf")
         print(f"Performance: {steps_s:,.1f} steps/s")
+
     if report_policy:
         report = policy.report(steps, L.shape, L.device)
         if report is not None:
@@ -89,10 +103,11 @@ def run_simulation(batch_size: int = 1, steps: int = 2000, dt: float = 0.01,
 
     if not benchmark:
         # Check conservation
-        H_end = system.energy(L_sample)
-        C_end = system.casimir(L_sample)
+        L_sample = L[0] if L.ndim > 1 else L
+        H_end = prog.program.energy(L_sample)
+        C_end = prog.program.casimir(L_sample)
 
-        print(f"Energy Conservation:")
+        print(f"\nEnergy Conservation:")
         print(f"  H_start: {H_start:.10f}")
         print(f"  H_end:   {H_end:.10f}")
         print(f"  Drift:   {abs(H_end - H_start)/abs(H_start):.2e}")

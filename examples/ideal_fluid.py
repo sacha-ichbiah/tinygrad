@@ -1,77 +1,74 @@
+"""Ideal Fluid (2D Euler) Simulation using TinyPhysics Structure Compiler.
+
+This example demonstrates the Kelvin-Helmholtz instability using the
+VorticityStructure, which is a proper Lie-Poisson structure that flows
+through the universal physics compiler.
+"""
+import os
+# Fix FFT for sizes N=128, 256, 512 (uses split_radix which is correct, instead of iterative_radix8 which has a bug)
+os.environ.setdefault("TINYGRAD_FFT_SPLIT_RADIX_THRESHOLD", "1024")
+
 import numpy as np
 from tinygrad.tensor import Tensor
-from tinygrad.physics import IdealFluidVorticity2D, FieldOperator
 import json
-import os
 
-# --- Simulation ---
+from tinyphysics.structures.vorticity import VorticityStructure
+from tinyphysics.systems.vorticity import kelvin_helmholtz_ic, compute_enstrophy
+
 
 def run_simulation():
     # Grid Parameters
-    N = 64 # Grid size
+    N = int(os.getenv("IDEAL_FLUID_N", "64"))
     L = 2 * np.pi
-    
-    # Coordinate Grid
-    x = np.linspace(0, L, N, endpoint=False)
-    y = np.linspace(0, L, N, endpoint=False)
-    X, Y = np.meshgrid(x, y, indexing='ij')
-    
-    # Initial Condition: Kelvin-Helmholtz Instability
-    omega_init = np.zeros((N, N), dtype=np.float32)
-    delta = 0.5
-    pert = 0.1 * np.sin(X) # Perturbation
-    
-    # Strip 1 at y = L/4
-    y1 = L/4
-    omega_init += (1/delta) * (1.0 / np.cosh((Y - y1)/delta)**2) * (1 + pert)
-    
-    # Strip 2 at y = 3L/4 (Reverse sign)
-    y2 = 3*L/4
-    omega_init -= (1/delta) * (1.0 / np.cosh((Y - y2)/delta)**2) * (1 + pert)
-    
-    # Vorticity State
-    W = omega_init
 
-    dt = 0.02
+    # Initial Condition: Kelvin-Helmholtz Instability
+    omega_init = kelvin_helmholtz_ic(N, L, delta=0.5, pert_amp=0.1)
+
+    # Scale dt with grid size for CFL stability
+    dt = float(os.getenv("IDEAL_FLUID_DT", str(0.02 * 64 / N)))
     steps = int(os.getenv("IDEAL_FLUID_STEPS", "5000"))
     record_every = int(os.getenv("IDEAL_FLUID_RECORD_EVERY", "50"))
     progress_every = int(os.getenv("IDEAL_FLUID_PROGRESS_EVERY", str(record_every * 5)))
     if progress_every % record_every != 0:
         progress_every = ((progress_every // record_every) + 1) * record_every
-    history_w = []
-    
-    print(f"Start Ideal Fluid (Symplectic Midpoint) Simulation N={N}")
 
-    solver = IdealFluidVorticity2D(N, L=L, dealias=2.0/3.0, dtype=np.float32)
-    _ = FieldOperator.poisson_solve2(Tensor(W.astype(np.float32)), L=L)
+    # Use fewer midpoint iterations (3 instead of 5) - converges fast for smooth flows
+    iters = int(os.getenv("IDEAL_FLUID_ITERS", "3"))
+
+    print(f"Start Ideal Fluid (VorticityStructure + Unrolling) Simulation N={N}")
+
+    # Create solver using the structure compiler
+    solver = VorticityStructure(N, L=L, dealias=2.0/3.0, dtype=np.float32)
+
+    # Run simulation with auto-unrolling
+    W = Tensor(omega_init)
     history = []
     steps_done = 0
+
     while steps_done < steps:
         chunk = min(progress_every, steps - steps_done)
-        W, chunk_history = solver.evolve(W, dt=dt, steps=chunk, record_every=record_every, method="midpoint", iters=5)
+        W, chunk_history = solver.evolve(
+            W, dt=dt, steps=chunk,
+            record_every=record_every,
+            method="midpoint",
+            iters=iters
+        )
         if history:
-            chunk_history = chunk_history[1:]
+            chunk_history = chunk_history[1:]  # Avoid duplicating last frame
         history.extend(chunk_history)
         steps_done += chunk
         print(f"Progress: {steps_done}/{steps} steps")
 
-    for frame in history:
-        history_w.append(frame.tolist())
+    history_w = [frame.tolist() for frame in history]
 
-    Z_start = 0.5 * (history[0] ** 2).sum() * (L / N) ** 2
-    Z_end = 0.5 * (history[-1] ** 2).sum() * (L / N) ** 2
+    Z_start = compute_enstrophy(history[0], L, N)
+    Z_end = compute_enstrophy(history[-1], L, N)
     print(f"Enstrophy Z: Start {Z_start:.4f}, End {Z_end:.4f}, Drift {abs(Z_end-Z_start)/abs(Z_start):.2e}")
-    
+
     generate_viewer(history_w, N)
 
+
 def generate_viewer(history, N):
-    # Flatten history for JS ? Or just keep 2D array
-    # N is small (64), so 64x64 = 4096 data points per frame.
-    # 50 frames = 200k floats.
-    
-    # Normalize data for visualization (0-255)
-    # We do this in JS to maintain dynamic range
-    
     html_content = f"""
 <!DOCTYPE html>
 <html>
@@ -95,10 +92,10 @@ def generate_viewer(history, N):
         const imageData = ctx.createImageData(N, N);
         const frameEl = document.getElementById('frame');
         const targetFPS = 30;
-        
+
         let frame = 0;
         let lastTime = 0;
-        
+
         function draw(ts) {{
             if (ts - lastTime < 1000 / targetFPS) {{
                 requestAnimationFrame(draw);
@@ -106,16 +103,14 @@ def generate_viewer(history, N):
             }}
             lastTime = ts;
             const W = history[frame];
-            // Find min/max for scaling? Or fixed
-            // Vorticity ~ [-2, 2] roughly
-            
+
             const data = imageData.data;
-            
+
             for(let i=0; i<N; i++) {{
                 for(let j=0; j<N; j++) {{
                     const idx = (i*N + j) * 4;
                     const val = W[i][j];
-                    
+
                     // Colormap: Blue -> Black -> Red
                     let r=0, g=0, b=0;
                     if(val > 0) {{
@@ -123,31 +118,32 @@ def generate_viewer(history, N):
                     }} else {{
                         b = Math.min(255, -val * 100);
                     }}
-                    
+
                     data[idx] = r;
                     data[idx+1] = g;
                     data[idx+2] = b;
                     data[idx+3] = 255;
                 }}
             }}
-            
+
             ctx.putImageData(imageData, 0, 0);
-            
+
             frameEl.textContent = frame;
             frame = (frame + 1) % history.length;
             requestAnimationFrame(draw);
         }}
-        
+
         ctx.imageSmoothingEnabled = false;
         requestAnimationFrame(draw);
     </script>
 </body>
 </html>
     """
-    
+
     with open('examples/ideal_fluid_viewer.html', 'w') as f:
         f.write(html_content)
     print(f"Viewer generated: {os.path.abspath('examples/ideal_fluid_viewer.html')}")
+
 
 if __name__ == "__main__":
     run_simulation()

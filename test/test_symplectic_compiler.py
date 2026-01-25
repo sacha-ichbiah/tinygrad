@@ -100,6 +100,26 @@ def test_rattle_projection():
   assert abs(ortho) < 1e-6
 
 
+def test_project_every_stride():
+  def H(q, p):
+    return (p * p).sum() / 2
+
+  def constraint(q):
+    return (q * q).sum() - 1.0
+
+  q = Tensor([1.0, 0.0, 0.0])
+  p = Tensor([0.4, 0.0, 0.0])
+  prog = compile_symplectic_program("canonical", H=H, constraint=constraint, project_every=2)
+  assert prog.project_every == 2
+  (_, _), history = prog.evolve((q, p), 0.1, 2, unroll=1)
+  q1, _ = history[1]
+  q2, _ = history[2]
+  g1 = float(constraint(q1).numpy())
+  g2 = float(constraint(q2).numpy())
+  assert abs(g1) < 1e-6
+  assert abs(g2) < 1e-6
+
+
 def test_conformal_dissipation_reduces_energy():
   def H(q, p):
     return (p * p).sum() / 2 + (q * q).sum() / 2

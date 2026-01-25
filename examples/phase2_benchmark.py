@@ -5,7 +5,7 @@ import os
 
 from tinygrad.tensor import Tensor
 from tinygrad.physics import RigidBodySystem, HeavyTopHamiltonian, ProductManifold, ControlInput, SatelliteControlIntegrator
-from tinyphysics.compiler import UniversalSymplecticCompiler
+from tinyphysics.core.compiler import compile_structure
 from tinygrad.physics_profile import get_profile
 
 
@@ -57,8 +57,7 @@ def bench_heavy_top(batch: int, steps: int, dt: float, unroll: int, scan: bool, 
   gamma = ProductManifold.from_euler_angles(L, np.pi/6, 0.0).gamma
   policy = get_profile(profile).policy
   H = HeavyTopHamiltonian(I1, I2, I3, mgl, dtype=L.dtype)
-  integrator = UniversalSymplecticCompiler(kind="e3", hamiltonian=H, dt=dt, policy=policy)
-  integrator.compile(sample_state=(L, gamma))
+  integrator = compile_structure(state=(L, gamma), H=H, kind="e3", policy=policy)
 
   def make_state():
     L0_state = L0.reshape(1, 3).expand(batch, 3).contiguous()
@@ -68,16 +67,16 @@ def bench_heavy_top(batch: int, steps: int, dt: float, unroll: int, scan: bool, 
   if auto_unroll:
     unroll = policy.choose_unroll(
       steps, L.shape, L.device, candidates=[2, 4, 8, 16],
-      step_factory=lambda u: (lambda: integrator.program.compile_unrolled_step(dt, u)((L, gamma))),
+      step_factory=lambda u: (lambda: integrator.compile_unrolled_step(dt, u)((L, gamma))),
     )
 
-  step = integrator.program.compile_unrolled_step(dt, unroll)
+  step = integrator.compile_unrolled_step(dt, unroll)
   for _ in range(5):
     L, gamma = step((L, gamma))
 
   start = time.perf_counter()
   if scan:
-    (L, gamma), _ = integrator.program.evolve((L, gamma), dt, steps, record_every=steps, unroll=unroll)
+    (L, gamma), _ = integrator.evolve((L, gamma), dt, steps, record_every=steps, unroll=unroll)
   else:
     for _ in range(steps // unroll):
       L, gamma = step((L, gamma))
