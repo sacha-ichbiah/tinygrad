@@ -104,6 +104,21 @@ class EncDec(Runner):
       Device[rawbufs[0].device].synchronize()
       return time.perf_counter() - st
 
+class MultiRunner(Runner):
+  def __init__(self, runners:list[CompiledRunner], device:str):
+    estimates = Estimates()
+    for r in runners: estimates += r.estimates
+    super().__init__("multi", device, estimates)
+    self.runners = runners
+  def __call__(self, rawbufs:list[Buffer], var_vals:dict[str, int], wait=False) -> float|None:
+    st = time.perf_counter()
+    for r in self.runners:
+      bufs = [rawbufs[i] for i in r.p.globals]
+      r(bufs, var_vals, wait=wait)
+    if wait:
+      Device[self.device].synchronize()
+      return time.perf_counter() - st
+
 # **************** method cache ****************
 
 method_cache: dict[tuple[str, type, bytes, tuple[int, ...], bool], CompiledRunner] = {}
@@ -125,6 +140,7 @@ def get_runner(device:str, ast:UOp) -> CompiledRunner:
 # NOTE: ctx is the buffers
 si_lowerer = PatternMatcher([
   (UPat((Ops.SINK, Ops.PROGRAM), name="sink"), lambda ctx,sink: get_runner(ctx[0].device, sink)),
+  (UPat(Ops.KERNEL_MULTI, name="km"), lambda ctx,km: MultiRunner([get_runner(ctx[0].device, a) for a in km.arg.asts], ctx[0].device)),
   (UPat(Ops.BUFFER_VIEW), lambda ctx: ViewOp(ctx[0])),
   (UPat(Ops.COPY, name="copy"), lambda ctx,copy: (BufferXfer(ctx[0].nbytes, ctx[0].device, ctx[1].device) \
       if hasattr(alc:=Device[ctx[0].device].allocator, '_transfer') and alc.supports_transfer and all_same([x.device.split(":")[0] for x in ctx]) \

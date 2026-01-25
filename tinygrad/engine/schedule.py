@@ -1,7 +1,7 @@
 import time
 from typing import cast
 from collections import deque
-from tinygrad.uop.ops import UOp, Ops, buffers, UOpMetaClass, track_rewrites, PatternMatcher, UPat, graph_rewrite, graph_rewrite_map
+from tinygrad.uop.ops import UOp, Ops, buffers, UOpMetaClass, track_rewrites, PatternMatcher, UPat, graph_rewrite, graph_rewrite_map, KernelMulti
 from tinygrad.uop.spec import type_verify, tensor_spec
 from tinygrad.device import Buffer, MultiBuffer
 from tinygrad.helpers import DEBUG, cpu_profile, TracingKey, SPEC, flatten, pluralize
@@ -52,11 +52,15 @@ def create_schedule(sched_sink:UOp) -> tuple[list[ExecItem], UOp]:
       k = rk = queue.popleft()
       if k.op is Ops.END: k = k.src[0]
       if k.op is Ops.RANGE: schedule.append(k)
-      elif k.op is Ops.KERNEL:
-        ast = k.arg.ast
+      elif k.op in (Ops.KERNEL, Ops.KERNEL_MULTI):
+        if k.op is Ops.KERNEL_MULTI:
+          ast = UOp(Ops.KERNEL_MULTI, arg=k.arg)
+        else:
+          ast = k.arg.ast
         buf_uops = tuple(_unwrap_src(s).buf_uop for s in k.src if s.op is not Ops.BIND)
         bound_ranges = tuple(s for s in k.src if s.op is Ops.BIND and len(s.src) > 1 and s.src[1].op is Ops.RANGE)
-        schedule.append((ast, buf_uops, k.arg.metadata, {}, bound_ranges))
+        metadata = k.arg.metadata if hasattr(k.arg, "metadata") else ()
+        schedule.append((ast, buf_uops, metadata, {}, bound_ranges))
         if rk.op is Ops.END: schedule.append(rk)
       else:
         raise RuntimeError(f"can't schedule {k.op}")

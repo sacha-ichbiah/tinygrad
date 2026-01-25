@@ -1,5 +1,7 @@
 import os, time, math
 from tinygrad.tensor import Tensor
+from tinygrad.uop.ops import UOp
+from tinygrad.uop import Ops
 from tinygrad.helpers import getenv
 from tinygrad.dtype import dtypes
 from tinygrad.engine.realize import capturing
@@ -120,6 +122,8 @@ _permute_last3_cache: dict[tuple[int, tuple[int, int, int]], tuple[int, ...]] = 
 _fft3d_contig_threshold_cache: dict[tuple[str, object], int] = {}
 _fft3d_plan_cache: dict[tuple[tuple[int, ...], str, object],
                         tuple[bool, bool, tuple[int, int, int] | None, tuple[bool, bool, bool] | None, int, tuple[bool, bool]]] = {}
+_twiddle128_cache: dict[tuple[bool, str, object], Tensor] = {}
+_fft3d_128_plan_cache: dict[tuple[str, object], str] = {}
 
 
 def _twiddle(n: int, r: int, m: int, inverse: bool, device: str, dtype) -> Tensor:
@@ -133,6 +137,19 @@ def _twiddle(n: int, r: int, m: int, inverse: bool, device: str, dtype) -> Tenso
   ang = (ar * am) * (sign * 2 * math.pi / n)
   t = Tensor.stack([ang.cos(), ang.sin()], dim=-1).realize()
   _twiddle_cache[key] = t
+  return t
+
+
+def _twiddle_128(inverse: bool, device: str, dtype) -> Tensor:
+  key = (inverse, device, dtype)
+  cached = _twiddle128_cache.get(key)
+  if cached is not None:
+    return cached
+  sign = 1.0 if inverse else -1.0
+  ar = Tensor.arange(128, device=device, dtype=dtype, requires_grad=False)
+  ang = ar * (sign * 2 * math.pi / 128.0)
+  t = Tensor.stack([ang.cos(), ang.sin()], dim=-1).realize()
+  _twiddle128_cache[key] = t
   return t
 
 
@@ -916,6 +933,410 @@ def _fft3d_fused_8(x: Tensor, inverse: bool) -> Tensor:
   return out
 
 
+def _uop_fft1d_128_stage_axis(x_ptr: UOp, out_ptr: UOp, tw_ptr: UOp, axis: int, inverse: bool, stage: int) -> UOp:
+  if axis not in (0, 1, 2):
+    raise ValueError("axis must be 0,1,2")
+  if stage not in range(7):
+    raise ValueError("stage must be 0..6")
+  sizes = (128, 128, 128)
+  ranges = [UOp.range(s, i) for i, s in enumerate(sizes)]
+  idx = [ranges[0], ranges[1], ranges[2]]
+  idx_axis = idx[axis]
+  shift = stage + 1
+  m = 1 << shift
+  half = m >> 1
+  stride_shift = 6 - stage
+  shift_idx = UOp.const(dtypes.index, shift)
+  m_mask = UOp.const(dtypes.index, m - 1)
+  half_mask = UOp.const(dtypes.index, half - 1)
+  half_idx = UOp.const(dtypes.index, half)
+  stride_shift_idx = UOp.const(dtypes.index, stride_shift)
+  block = idx_axis >> shift_idx
+  pos = idx_axis & m_mask
+  p = pos & half_mask
+  even_idx = (block << shift_idx) + p
+  odd_idx = even_idx + half_idx
+  idx_even = idx.copy()
+  idx_even[axis] = even_idx
+  idx_odd = idx.copy()
+  idx_odd[axis] = odd_idx
+  v_even = x_ptr.vindex(*idx_even)
+  v_odd = x_ptr.vindex(*idx_odd)
+  even_r, even_i = v_even.gep(0), v_even.gep(1)
+  odd_r, odd_i = v_odd.gep(0), v_odd.gep(1)
+  tw_idx = p << stride_shift_idx
+  w = tw_ptr.vindex(tw_idx)
+  w_r, w_i = w.gep(0), w.gep(1)
+  t_r = odd_r * w_r - odd_i * w_i
+  t_i = odd_r * w_i + odd_i * w_r
+  cond = pos < half_idx
+  out_r = cond.where(even_r + t_r, even_r - t_r)
+  out_i = cond.where(even_i + t_i, even_i - t_i)
+  if inverse and stage == 6:
+    scale = UOp.const(dtypes.float, 1.0 / 128.0)
+    out_r = out_r * scale
+    out_i = out_i * scale
+  out = UOp.vectorize(out_r, out_i)
+  store = out_ptr.index(*idx, ptr=True).store(out)
+  return UOp.sink(store).end(*ranges)
+
+
+def _uop_fft1d_128_stage4_axis(x_ptr: UOp, out_ptr: UOp, tw_ptr: UOp, axis: int, inverse: bool, stage4: int) -> UOp:
+  if axis not in (0, 1, 2):
+    raise ValueError("axis must be 0,1,2")
+  if stage4 not in range(3):
+    raise ValueError("stage4 must be 0..2")
+  if axis == 2 and stage4 == 0:
+    r0 = UOp.range(128, 0)
+    r1 = UOp.range(128, 1)
+    rblk = UOp.range(32, 2)
+    ranges = [r0, r1, rblk]
+    base = rblk << UOp.const(dtypes.index, 2)
+    ptr = x_ptr.index(r0, r1, base, ptr=True)
+    vec_dtype = x_ptr.dtype.base.vec(8)
+    vec_ptr = ptr.cast(vec_dtype.ptr(size=ptr.dtype.size, addrspace=ptr.dtype.addrspace))
+    v = vec_ptr.load()
+    x0r, x0i = v.gep(0), v.gep(1)
+    x1r, x1i = v.gep(2), v.gep(3)
+    x2r, x2i = v.gep(4), v.gep(5)
+    x3r, x3i = v.gep(6), v.gep(7)
+    t0r, t0i = x0r + x2r, x0i + x2i
+    t1r, t1i = x0r - x2r, x0i - x2i
+    t2r, t2i = x1r + x3r, x1i + x3i
+    u3r, u3i = x1r - x3r, x1i - x3i
+    if inverse:
+      t3r, t3i = -u3i, u3r
+    else:
+      t3r, t3i = u3i, -u3r
+    y0r, y0i = t0r + t2r, t0i + t2i
+    y1r, y1i = t1r + t3r, t1i + t3i
+    y2r, y2i = t0r - t2r, t0i - t2i
+    y3r, y3i = t1r - t3r, t1i - t3i
+    out_vec = UOp.vectorize(y0r, y0i, y1r, y1i, y2r, y2i, y3r, y3i)
+    out_ptr_vec = out_ptr.index(r0, r1, base, ptr=True).cast(vec_dtype.ptr(size=ptr.dtype.size, addrspace=ptr.dtype.addrspace))
+    store = out_ptr_vec.store(out_vec)
+    return UOp.sink(store).end(*ranges)
+  if axis == 2 and stage4 == 1:
+    r0 = UOp.range(128, 0)
+    r1 = UOp.range(128, 1)
+    rblk = UOp.range(8, 2)
+    rp = UOp.range(4, 3)
+    ranges = [r0, r1, rblk, rp]
+    base = (rblk << UOp.const(dtypes.index, 4)) + rp
+    ptr = x_ptr.index(r0, r1, base, ptr=True)
+    vec_dtype = x_ptr.dtype.base.vec(8)
+    vec_ptr = ptr.cast(vec_dtype.ptr(size=ptr.dtype.size, addrspace=ptr.dtype.addrspace))
+    v = vec_ptr.load()
+    x0r, x0i = v.gep(0), v.gep(1)
+    x1r, x1i = v.gep(2), v.gep(3)
+    x2r, x2i = v.gep(4), v.gep(5)
+    x3r, x3i = v.gep(6), v.gep(7)
+    t0r, t0i = x0r + x2r, x0i + x2i
+    t1r, t1i = x0r - x2r, x0i - x2i
+    t2r, t2i = x1r + x3r, x1i + x3i
+    u3r, u3i = x1r - x3r, x1i - x3i
+    if inverse:
+      t3r, t3i = -u3i, u3r
+    else:
+      t3r, t3i = u3i, -u3r
+    y0r, y0i = t0r + t2r, t0i + t2i
+    y1r, y1i = t1r + t3r, t1i + t3i
+    y2r, y2i = t0r - t2r, t0i - t2i
+    y3r, y3i = t1r - t3r, t1i - t3i
+    tw_idx = rp << UOp.const(dtypes.index, 3)
+    tw_idx2 = tw_idx << UOp.const(dtypes.index, 1)
+    tw_idx3 = tw_idx2 + tw_idx
+    w1 = tw_ptr.vindex(tw_idx)
+    w2 = tw_ptr.vindex(tw_idx2)
+    w3 = tw_ptr.vindex(tw_idx3)
+    w1r, w1i = w1.gep(0), w1.gep(1)
+    w2r, w2i = w2.gep(0), w2.gep(1)
+    w3r, w3i = w3.gep(0), w3.gep(1)
+    z1r = y1r * w1r - y1i * w1i
+    z1i = y1r * w1i + y1i * w1r
+    z2r = y2r * w2r - y2i * w2i
+    z2i = y2r * w2i + y2i * w2r
+    z3r = y3r * w3r - y3i * w3i
+    z3i = y3r * w3i + y3i * w3r
+    out_vec = UOp.vectorize(y0r, y0i, z1r, z1i, z2r, z2i, z3r, z3i)
+    out_ptr_vec = out_ptr.index(r0, r1, base, ptr=True).cast(vec_dtype.ptr(size=ptr.dtype.size, addrspace=ptr.dtype.addrspace))
+    store = out_ptr_vec.store(out_vec)
+    return UOp.sink(store).end(*ranges)
+  if axis == 2 and stage4 == 2:
+    r0 = UOp.range(128, 0)
+    r1 = UOp.range(128, 1)
+    rblk = UOp.range(2, 2)
+    rp = UOp.range(16, 3)
+    ranges = [r0, r1, rblk, rp]
+    base = (rblk << UOp.const(dtypes.index, 6)) + rp
+    ptr = x_ptr.index(r0, r1, base, ptr=True)
+    vec_dtype = x_ptr.dtype.base.vec(8)
+    vec_ptr = ptr.cast(vec_dtype.ptr(size=ptr.dtype.size, addrspace=ptr.dtype.addrspace))
+    v = vec_ptr.load()
+    x0r, x0i = v.gep(0), v.gep(1)
+    x1r, x1i = v.gep(2), v.gep(3)
+    x2r, x2i = v.gep(4), v.gep(5)
+    x3r, x3i = v.gep(6), v.gep(7)
+    t0r, t0i = x0r + x2r, x0i + x2i
+    t1r, t1i = x0r - x2r, x0i - x2i
+    t2r, t2i = x1r + x3r, x1i + x3i
+    u3r, u3i = x1r - x3r, x1i - x3i
+    if inverse:
+      t3r, t3i = -u3i, u3r
+    else:
+      t3r, t3i = u3i, -u3r
+    y0r, y0i = t0r + t2r, t0i + t2i
+    y1r, y1i = t1r + t3r, t1i + t3i
+    y2r, y2i = t0r - t2r, t0i - t2i
+    y3r, y3i = t1r - t3r, t1i - t3i
+    tw_idx = rp << UOp.const(dtypes.index, 1)
+    tw_idx2 = tw_idx << UOp.const(dtypes.index, 1)
+    tw_idx3 = tw_idx2 + tw_idx
+    w1 = tw_ptr.vindex(tw_idx)
+    w2 = tw_ptr.vindex(tw_idx2)
+    w3 = tw_ptr.vindex(tw_idx3)
+    w1r, w1i = w1.gep(0), w1.gep(1)
+    w2r, w2i = w2.gep(0), w2.gep(1)
+    w3r, w3i = w3.gep(0), w3.gep(1)
+    z1r = y1r * w1r - y1i * w1i
+    z1i = y1r * w1i + y1i * w1r
+    z2r = y2r * w2r - y2i * w2i
+    z2i = y2r * w2i + y2i * w2r
+    z3r = y3r * w3r - y3i * w3i
+    z3i = y3r * w3i + y3i * w3r
+    out_vec = UOp.vectorize(y0r, y0i, z1r, z1i, z2r, z2i, z3r, z3i)
+    out_ptr_vec = out_ptr.index(r0, r1, base, ptr=True).cast(vec_dtype.ptr(size=ptr.dtype.size, addrspace=ptr.dtype.addrspace))
+    store = out_ptr_vec.store(out_vec)
+    return UOp.sink(store).end(*ranges)
+  m_shift = 2 * (stage4 + 1)
+  quarter_shift = 2 * stage4
+  stride_shift = 5 - (2 * stage4)
+  m = 1 << m_shift
+  quarter = 1 << quarter_shift
+  if axis == 0:
+    r1 = UOp.range(128, 0)
+    r2 = UOp.range(128, 1)
+    rblk = UOp.range(128 // m, 2)
+    rp = UOp.range(quarter, 3)
+    ranges = [r1, r2, rblk, rp]
+    idx_base = [None, r1, r2]
+  elif axis == 1:
+    r0 = UOp.range(128, 0)
+    r2 = UOp.range(128, 1)
+    rblk = UOp.range(128 // m, 2)
+    rp = UOp.range(quarter, 3)
+    ranges = [r0, r2, rblk, rp]
+    idx_base = [r0, None, r2]
+  else:
+    r0 = UOp.range(128, 0)
+    r1 = UOp.range(128, 1)
+    rblk = UOp.range(128 // m, 2)
+    rp = UOp.range(quarter, 3)
+    ranges = [r0, r1, rblk, rp]
+    idx_base = [r0, r1, None]
+  base = (rblk << UOp.const(dtypes.index, m_shift)) + rp
+  quarter_idx = UOp.const(dtypes.index, quarter)
+  idx0 = idx_base.copy()
+  idx0[axis] = base
+  idx1 = idx_base.copy()
+  idx1[axis] = base + quarter_idx
+  idx2 = idx_base.copy()
+  idx2[axis] = base + quarter_idx + quarter_idx
+  idx3 = idx_base.copy()
+  idx3[axis] = base + quarter_idx + quarter_idx + quarter_idx
+  v0 = x_ptr.vindex(*idx0)
+  v1 = x_ptr.vindex(*idx1)
+  v2 = x_ptr.vindex(*idx2)
+  v3 = x_ptr.vindex(*idx3)
+  x0r, x0i = v0.gep(0), v0.gep(1)
+  x1r, x1i = v1.gep(0), v1.gep(1)
+  x2r, x2i = v2.gep(0), v2.gep(1)
+  x3r, x3i = v3.gep(0), v3.gep(1)
+  t0r, t0i = x0r + x2r, x0i + x2i
+  t1r, t1i = x0r - x2r, x0i - x2i
+  t2r, t2i = x1r + x3r, x1i + x3i
+  u3r, u3i = x1r - x3r, x1i - x3i
+  if inverse:
+    t3r, t3i = -u3i, u3r
+  else:
+    t3r, t3i = u3i, -u3r
+  y0r, y0i = t0r + t2r, t0i + t2i
+  y1r, y1i = t1r + t3r, t1i + t3i
+  y2r, y2i = t0r - t2r, t0i - t2i
+  y3r, y3i = t1r - t3r, t1i - t3i
+  if stage4 == 0:
+    z1r, z1i = y1r, y1i
+    z2r, z2i = y2r, y2i
+    z3r, z3i = y3r, y3i
+  else:
+    tw_idx = rp << UOp.const(dtypes.index, stride_shift)
+    w1 = tw_ptr.vindex(tw_idx)
+    tw_idx2 = tw_idx << UOp.const(dtypes.index, 1)
+    tw_idx3 = tw_idx2 + tw_idx
+    w2 = tw_ptr.vindex(tw_idx2)
+    w3 = tw_ptr.vindex(tw_idx3)
+    w1r, w1i = w1.gep(0), w1.gep(1)
+    w2r, w2i = w2.gep(0), w2.gep(1)
+    w3r, w3i = w3.gep(0), w3.gep(1)
+    z1r = y1r * w1r - y1i * w1i
+    z1i = y1r * w1i + y1i * w1r
+    z2r = y2r * w2r - y2i * w2i
+    z2i = y2r * w2i + y2i * w2r
+    z3r = y3r * w3r - y3i * w3i
+    z3i = y3r * w3i + y3i * w3r
+  out0 = UOp.vectorize(y0r, y0i)
+  out1 = UOp.vectorize(z1r, z1i)
+  out2 = UOp.vectorize(z2r, z2i)
+  out3 = UOp.vectorize(z3r, z3i)
+  s0 = out_ptr.index(*idx0, ptr=True).store(out0)
+  s1 = out_ptr.index(*idx1, ptr=True).store(out1)
+  s2 = out_ptr.index(*idx2, ptr=True).store(out2)
+  s3 = out_ptr.index(*idx3, ptr=True).store(out3)
+  return UOp.sink(s0, s1, s2, s3).end(*ranges)
+
+
+def _uop_fft1d_128_stage_last_axis(x_ptr: UOp, out_ptr: UOp, tw_ptr: UOp, axis: int, inverse: bool) -> UOp:
+  if axis not in (0, 1, 2):
+    raise ValueError("axis must be 0,1,2")
+  if axis == 2:
+    r0 = UOp.range(128, 0)
+    r1 = UOp.range(128, 1)
+    rp = UOp.range(64, 2)
+    ranges = [r0, r1, rp]
+    half_idx = UOp.const(dtypes.index, 64)
+    idx_even = [r0, r1, rp]
+    idx_odd = [r0, r1, rp + half_idx]
+    v_even = x_ptr.vindex(*idx_even)
+    v_odd = x_ptr.vindex(*idx_odd)
+    even_r, even_i = v_even.gep(0), v_even.gep(1)
+    odd_r, odd_i = v_odd.gep(0), v_odd.gep(1)
+    w = tw_ptr.vindex(rp)
+    w_r, w_i = w.gep(0), w.gep(1)
+    t_r = odd_r * w_r - odd_i * w_i
+    t_i = odd_r * w_i + odd_i * w_r
+    out0_r = even_r + t_r
+    out0_i = even_i + t_i
+    out1_r = even_r - t_r
+    out1_i = even_i - t_i
+    if inverse:
+      scale = UOp.const(dtypes.float, 1.0 / 128.0)
+      out0_r = out0_r * scale
+      out0_i = out0_i * scale
+      out1_r = out1_r * scale
+      out1_i = out1_i * scale
+    out_vec = UOp.vectorize(out0_r, out0_i, out1_r, out1_i)
+    out_ptr_vec = out_ptr.index(r0, r1, rp, ptr=True).cast(out_ptr.dtype.base.vec(4).ptr(size=out_ptr.dtype.size, addrspace=out_ptr.dtype.addrspace))
+    store = out_ptr_vec.store(out_vec)
+    return UOp.sink(store).end(*ranges)
+  r_other = [UOp.range(128, 0), UOp.range(128, 1)]
+  r_p = UOp.range(64, 2)
+  if axis == 0:
+    ranges = [r_p, r_other[0], r_other[1]]
+    idx = [None, r_other[0], r_other[1]]
+  elif axis == 1:
+    ranges = [r_other[0], r_p, r_other[1]]
+    idx = [r_other[0], None, r_other[1]]
+  else:
+    ranges = [r_other[0], r_other[1], r_p]
+    idx = [r_other[0], r_other[1], None]
+  half_idx = UOp.const(dtypes.index, 64)
+  idx_even = idx.copy()
+  idx_even[axis] = r_p
+  idx_odd = idx.copy()
+  idx_odd[axis] = r_p + half_idx
+  v_even = x_ptr.vindex(*idx_even)
+  v_odd = x_ptr.vindex(*idx_odd)
+  even_r, even_i = v_even.gep(0), v_even.gep(1)
+  odd_r, odd_i = v_odd.gep(0), v_odd.gep(1)
+  w = tw_ptr.vindex(r_p)
+  w_r, w_i = w.gep(0), w.gep(1)
+  t_r = odd_r * w_r - odd_i * w_i
+  t_i = odd_r * w_i + odd_i * w_r
+  out0_r = even_r + t_r
+  out0_i = even_i + t_i
+  out1_r = even_r - t_r
+  out1_i = even_i - t_i
+  if inverse:
+    scale = UOp.const(dtypes.float, 1.0 / 128.0)
+    out0_r = out0_r * scale
+    out0_i = out0_i * scale
+    out1_r = out1_r * scale
+    out1_i = out1_i * scale
+  out0 = UOp.vectorize(out0_r, out0_i)
+  out1 = UOp.vectorize(out1_r, out1_i)
+  idx_out0 = idx.copy()
+  idx_out0[axis] = r_p
+  idx_out1 = idx.copy()
+  idx_out1[axis] = r_p + half_idx
+  s0 = out_ptr.index(*idx_out0, ptr=True).store(out0)
+  s1 = out_ptr.index(*idx_out1, ptr=True).store(out1)
+  return UOp.sink(s0, s1).end(*ranges)
+
+
+def _uop_fft1d_128_axis(x_ptr: UOp, tmp_ptr: UOp, out_ptr: UOp, tw_ptr: UOp, axis: int, inverse: bool) -> list[UOp]:
+  kernels: list[UOp] = []
+  src = x_ptr
+  dst = out_ptr
+  for stage4 in range(3):
+    kernels.append(_uop_fft1d_128_stage4_axis(src, dst, tw_ptr, axis, inverse, stage4))
+    src, dst = dst, (tmp_ptr if dst is out_ptr else out_ptr)
+  kernels.append(_uop_fft1d_128_stage_last_axis(src, dst, tw_ptr, axis, inverse))
+  return kernels
+
+
+def _uop_fft1d_128_axis_radix2(x_ptr: UOp, tmp_ptr: UOp, out_ptr: UOp, tw_ptr: UOp, axis: int, inverse: bool) -> list[UOp]:
+  kernels: list[UOp] = []
+  src = x_ptr
+  dst = out_ptr
+  for stage in range(6):
+    kernels.append(_uop_fft1d_128_stage_axis(src, dst, tw_ptr, axis, inverse, stage))
+    src, dst = dst, (tmp_ptr if dst is out_ptr else out_ptr)
+  kernels.append(_uop_fft1d_128_stage_last_axis(src, dst, tw_ptr, axis, inverse))
+  return kernels
+
+
+def _fft3d_128_plan(device: str, dtype) -> str:
+  key = (device, dtype)
+  cached = _fft3d_128_plan_cache.get(key)
+  if cached is not None:
+    return cached
+  plan_env = getenv("TINYGRAD_FFT_3D_128_PLAN", "")
+  if plan_env in ("radix2", "radix4"):
+    _fft3d_128_plan_cache[key] = plan_env
+    return plan_env
+  if getenv("TINYGRAD_FFT_3D_128_AUTOTUNE", 1) == 0:
+    _fft3d_128_plan_cache[key] = "radix4"
+    return "radix4"
+  x = Tensor.empty(128, 128, 128, 2, device=device, dtype=dtypes.float32)
+  best_plan, best_time = "radix4", float("inf")
+  for plan in ("radix4", "radix2"):
+    _ = _fft3d_128_kernel_multi(x, False, plan=plan).realize()
+    start = time.perf_counter()
+    _ = _fft3d_128_kernel_multi(x, False, plan=plan).realize()
+    dt = time.perf_counter() - start
+    if dt < best_time:
+      best_time, best_plan = dt, plan
+  _fft3d_128_plan_cache[key] = best_plan
+  return best_plan
+
+
+def _fft3d_128_kernel_multi(x: Tensor, inverse: bool, plan: str | None = None) -> Tensor:
+  if x.shape != (128, 128, 128, 2):
+    raise ValueError("fft3d_128_kernel_multi expects complex shape (128,128,128,2)")
+  plan = _fft3d_128_plan(x.device, x.dtype) if plan is None else plan
+  axis_fn = _uop_fft1d_128_axis if plan == "radix4" else _uop_fft1d_128_axis_radix2
+  tw = _twiddle_128(inverse, x.device, x.dtype)
+  tmp = Tensor.empty(128, 128, 128, 2, device=x.device, dtype=x.dtype)
+  out = Tensor.empty(128, 128, 128, 2, device=x.device, dtype=x.dtype)
+  def kernel(x_uop: UOp, tmp_uop: UOp, tw_uop: UOp, out_uop: UOp):
+    k = []
+    k += axis_fn(x_uop, tmp_uop, out_uop, tw_uop, 2, inverse)
+    k += axis_fn(out_uop, out_uop, tmp_uop, tw_uop, 1, inverse)
+    k += axis_fn(tmp_uop, tmp_uop, out_uop, tw_uop, 0, inverse)
+    return tuple(k)
+  return Tensor.custom_kernel(x, tmp, tw, out, fxn=kernel)[-1]
+
+
 def _fft3d_128_special(x: Tensor, inverse: bool) -> Tensor:
   layout = int(getenv("TINYGRAD_FFT_3D_128_LAYOUT", 0))
   if layout == 1:
@@ -1017,7 +1438,7 @@ def _fft3d_impl_order(x: Tensor, inverse: bool, order: tuple[int, int, int],
 
 def _fft3d_autotune(x: Tensor, inverse: bool, use_pow2: bool, use_block2d: bool,
                     order: tuple[int, int, int] | None, pow2_axes: tuple[bool, bool, bool],
-                    contig_thr: int) -> tuple[tuple[int, int, int] | None, int]:
+                    contig_thr: int, contig_mask: tuple[bool, bool]) -> tuple[tuple[int, int, int] | None, int]:
   if x.device != "CPU":
     return order, contig_thr
   if x.ndim == 4:
@@ -1026,9 +1447,9 @@ def _fft3d_autotune(x: Tensor, inverse: bool, use_pow2: bool, use_block2d: bool,
       if v not in thr_list: thr_list.append(v)
     best_thr, best_time = contig_thr, float("inf")
     for thr in thr_list:
-      x0 = _fft3d_impl_4d(x, inverse, use_pow2, use_block2d, thr).realize()
+      x0 = _fft3d_impl_4d(x, inverse, use_pow2, use_block2d, thr, contig_mask).realize()
       start = time.perf_counter()
-      _ = _fft3d_impl_4d(x0, inverse, use_pow2, use_block2d, thr).realize()
+      _ = _fft3d_impl_4d(x0, inverse, use_pow2, use_block2d, thr, contig_mask).realize()
       dt = time.perf_counter() - start
       if dt < best_time:
         best_time, best_thr = dt, thr
@@ -1062,6 +1483,8 @@ def _fft3d_impl(x: Tensor, inverse: bool = False) -> Tensor:
   if x.ndim < 3:
     raise ValueError("fft3d requires at least 3D input")
   if x.ndim == 4 and tuple(int(s) for s in x.shape[-4:-1]) == (128, 128, 128):
+    if getenv("TINYGRAD_FFT_3D_128_KERNEL_MULTI", 1):
+      return _fft3d_128_kernel_multi(x, inverse)
     if getenv("TINYGRAD_FFT_3D_128_SPECIAL", 0):
       return _fft3d_128_special(x, inverse)
   if x.ndim == 4 and tuple(int(s) for s in x.shape[-4:-1]) == (8, 8, 8):
@@ -1085,7 +1508,7 @@ def _fft3d_impl(x: Tensor, inverse: bool = False) -> Tensor:
       order = (last2,) + tuple(sorted(others, key=lambda a: x.shape[a]))
     contig_thr = _get_fft3d_contig_threshold(x.device, x.dtype)
     if getenv("TINYGRAD_FFT_3D_AUTOTUNE", 0) and not capturing:
-      order, contig_thr = _fft3d_autotune(x, inverse, use_pow2, use_block2d, order, pow2_axes, contig_thr)
+      order, contig_thr = _fft3d_autotune(x, inverse, use_pow2, use_block2d, order, pow2_axes, contig_thr, contig_mask)
     plan = _fft3d_plan_cache.setdefault(plan_key, (use_block2d, use_pow2, order, pow2_axes, contig_thr, contig_mask))
   use_block2d, use_pow2, order, pow2_axes, contig_thr, contig_mask = plan
   if x.ndim == 4:

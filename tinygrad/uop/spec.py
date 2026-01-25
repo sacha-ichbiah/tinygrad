@@ -1,6 +1,6 @@
 import math
 from typing import cast, Any
-from tinygrad.uop.ops import PatternMatcher, UPat, GroupOp, Ops, UOp, print_uops, AxisType, KernelInfo, pyrender, Kernel, CustomKernel
+from tinygrad.uop.ops import PatternMatcher, UPat, GroupOp, Ops, UOp, print_uops, AxisType, KernelInfo, pyrender, Kernel, CustomKernel, KernelMulti
 from tinygrad.dtype import DType, ImageDType, dtypes, PtrDType, AddrSpace, Invalid
 from tinygrad.helpers import DEBUG, Context, prod, SPEC, Metadata, panic
 from tinygrad.uop.validate import validate_index
@@ -74,6 +74,7 @@ _tensor_spec = PatternMatcher([
 
   # KERNEL can attach to an AFTER to describe the compute required to realize a BUFFER
   (UPat(Ops.KERNEL, src=UPat((Ops.BUFFER, Ops.BUFFER_VIEW, Ops.AFTER, Ops.MSELECT, Ops.MSTACK, Ops.BIND, Ops.CONTIGUOUS))), lambda: True),
+  (UPat(Ops.KERNEL_MULTI, src=UPat((Ops.BUFFER, Ops.BUFFER_VIEW, Ops.AFTER, Ops.MSELECT, Ops.MSTACK, Ops.BIND, Ops.CONTIGUOUS))), lambda: True),
 
   # ASSIGN has a target and a value. It can also optionally depend on other assigns
   (UPat(Ops.ASSIGN, name="x"), lambda x: len(x.src) >= 2 and all(s.op is Ops.ASSIGN for s in x.src[2:])),

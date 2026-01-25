@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 import itertools
 from tinygrad.dtype import dtypes, PtrDType, ImageDType, AddrSpace
-from tinygrad.uop.ops import PatternMatcher, UPat, Ops, UOp, resolve, GroupOp, _substitute, KernelInfo
+from tinygrad.uop.ops import PatternMatcher, UPat, Ops, UOp, resolve, GroupOp, _substitute, KernelInfo, KernelMulti
 from tinygrad.uop.ops import graph_rewrite, identity_element, sint, AxisType, BottomUpGate, Kernel, _remove_all_tags, range_str
 from tinygrad.uop.symbolic import symbolic
 from tinygrad.helpers import argsort, prod, all_same, getenv, flatten, dedup, all_int, DEBUG, SPLIT_REDUCEOP, DEBUG_RANGEIFY
@@ -65,7 +65,10 @@ mop_cleanup = PatternMatcher([
 
 def resolve_custom_kernel(ck:UOp) -> UOp:
   placeholders = [UOp.placeholder_like(s, slot=i) for i,s in enumerate(ck.src)]
-  return UOp(Ops.KERNEL, src=ck.src, arg=Kernel(ck.arg.fxn(*placeholders)))
+  out = ck.arg.fxn(*placeholders)
+  if isinstance(out, (tuple, list)):
+    return UOp(Ops.KERNEL_MULTI, src=ck.src, arg=KernelMulti(tuple(out)))
+  return UOp(Ops.KERNEL, src=ck.src, arg=Kernel(out))
 
 earliest_rewrites = mop_cleanup+PatternMatcher([
   # just removing it works...
@@ -370,7 +373,7 @@ pm_add_buffers = pm_mops+pm_flatten_bufferize+to_bufferview+PatternMatcher([
    lambda m: m.replace(src=tuple([x.src[0].base for x in m.src]), tag=None).reshape(m.shape).rtag(m.tag)),
 
   # remove any RESHAPEs on KERNEL
-  (UPat(Ops.KERNEL, name="k"), lambda k: k.replace(src=tuple(x.src[0] if x.op is Ops.RESHAPE else x for x in k.src))),
+  (UPat((Ops.KERNEL, Ops.KERNEL_MULTI), name="k"), lambda k: k.replace(src=tuple(x.src[0] if x.op is Ops.RESHAPE else x for x in k.src))),
 ])
 
 pm_add_buffers_local = pm_mops+pm_flatten_bufferize+to_bufferview+PatternMatcher([
@@ -524,7 +527,7 @@ def tag_uop(ctx:list[UOp], x:UOp):
   return x.replace(tag=(len(ctx)-1,))
 add_tags = PatternMatcher([
   # don't tag BUFFERs, they are global
-  (UPat(GroupOp.All-{Ops.BUFFER, Ops.CONST, Ops.DEVICE, Ops.UNIQUE, Ops.LUNIQUE, Ops.DEFINE_VAR, Ops.BIND, Ops.KERNEL, Ops.END,
+  (UPat(GroupOp.All-{Ops.BUFFER, Ops.CONST, Ops.DEVICE, Ops.UNIQUE, Ops.LUNIQUE, Ops.DEFINE_VAR, Ops.BIND, Ops.KERNEL, Ops.KERNEL_MULTI, Ops.END,
                      Ops.MSTACK, Ops.MSELECT, Ops.RANGE}.union(GroupOp.Movement), name="x"), tag_uop),
   (UPat({Ops.MSTACK, Ops.MSELECT}, name="x"), lambda ctx,x: None if all(s.op is Ops.BUFFER for s in x.src) else tag_uop(ctx, x)),
 ])

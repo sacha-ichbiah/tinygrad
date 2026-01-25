@@ -199,7 +199,7 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
     match self.op:
       # late ops don't have shape
       case Ops.UNIQUE | Ops.LUNIQUE | Ops.DEVICE | Ops.RANGE | Ops.LOAD | Ops.IF | Ops.BARRIER | Ops.CUSTOM | Ops.CUSTOMI | \
-           Ops.VECTORIZE | Ops.VCONST | Ops.GEP | Ops.SPECIAL | Ops.UNROLL | Ops.CONTRACT | Ops.CUSTOM_KERNEL | \
+           Ops.VECTORIZE | Ops.VCONST | Ops.GEP | Ops.SPECIAL | Ops.UNROLL | Ops.CONTRACT | Ops.CUSTOM_KERNEL | Ops.KERNEL_MULTI | \
            Ops.LINEAR | Ops.PROGRAM | Ops.SOURCE | Ops.BINARY:
         return None
 
@@ -866,6 +866,11 @@ class Kernel:
   ast: UOp
   metadata: tuple[Metadata, ...] = ()
   grad_fxn: Callable|None = None
+
+@dataclass(frozen=True)
+class KernelMulti:
+  asts: tuple[UOp, ...]
+  metadata: tuple[Metadata, ...] = ()
 
 # ******** ops in python ********
 
