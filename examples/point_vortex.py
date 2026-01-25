@@ -14,7 +14,8 @@ This demonstrates:
 
 import numpy as np
 from tinygrad.tensor import Tensor
-from tinygrad.physics import PointVortexSystem
+from tinygrad.physics import point_vortex_hamiltonian
+from tinyphysics.compiler import UniversalSymplecticCompiler
 import json
 import os
 
@@ -34,19 +35,22 @@ def run_vortex_pair():
          0.5, 0.0,  # vortex 1 at (0.5, 0)
     ])
 
-    system = PointVortexSystem(gamma, integrator="rk4")
+    system = UniversalSymplecticCompiler(kind="point_vortex", integrator="midpoint", gamma=gamma)
+    H = point_vortex_hamiltonian(gamma)
 
     print(f"\nPhysics defined by Hamiltonian ONLY:")
     print(f"  H = -1/(4π) Σ Γ_i Γ_j log|r_ij|")
     print(f"\nKirchhoff's equations derived via autograd:")
     print(f"  Γ_i dx_i/dt = +∂H/∂y_i")
     print(f"  Γ_i dy_i/dt = -∂H/∂x_i")
-    print(f"\nIntegrator: {system.integrator_name}")
+    print(f"\nIntegrator: midpoint (symplectic)")
 
     # Initial conserved quantities
-    E0 = system.energy(z)
-    px0, py0 = system.momentum(z)
-    L0 = system.angular_momentum(z)
+    E0 = float(H(z).numpy())
+    pos0 = z.reshape(2, -1).permute(1, 0)
+    px0 = float((gamma * pos0[:, 0]).sum().numpy())
+    py0 = float((gamma * pos0[:, 1]).sum().numpy())
+    L0 = float((gamma * (pos0 * pos0).sum(axis=1)).sum().numpy())
 
     print(f"\nInitial Energy: {E0:.6f}")
     print(f"Initial Momentum: ({px0:.6f}, {py0:.6f})")
@@ -57,9 +61,11 @@ def run_vortex_pair():
     z_final, history = system.evolve(z, dt=dt, steps=steps, record_every=2)
 
     # Final state
-    E_final = system.energy(z_final)
-    px_final, py_final = system.momentum(z_final)
-    L_final = system.angular_momentum(z_final)
+    E_final = float(H(z_final).numpy())
+    pos1 = z_final.reshape(2, -1).permute(1, 0)
+    px_final = float((gamma * pos1[:, 0]).sum().numpy())
+    py_final = float((gamma * pos1[:, 1]).sum().numpy())
+    L_final = float((gamma * (pos1 * pos1).sum(axis=1)).sum().numpy())
 
     print(f"\nFinal Energy: {E_final:.6f}")
     print(f"Final Momentum: ({px_final:.6f}, {py_final:.6f})")
@@ -87,13 +93,16 @@ def run_vortex_dipole():
         0.0,  0.5,  # antivortex at (0, 0.5)
     ])
 
-    system = PointVortexSystem(gamma, integrator="rk4")
+    system = UniversalSymplecticCompiler(kind="point_vortex", integrator="midpoint", gamma=gamma)
+    H = point_vortex_hamiltonian(gamma)
 
     print(f"\nA vortex-antivortex pair translates together.")
     print(f"The pair moves perpendicular to the line joining them.")
 
-    E0 = system.energy(z)
-    px0, py0 = system.momentum(z)
+    E0 = float(H(z).numpy())
+    pos0 = z.reshape(2, -1).permute(1, 0)
+    px0 = float((gamma * pos0[:, 0]).sum().numpy())
+    py0 = float((gamma * pos0[:, 1]).sum().numpy())
 
     print(f"\nInitial Energy: {E0:.6f}")
     print(f"Initial Momentum: ({px0:.6f}, {py0:.6f})")
@@ -101,7 +110,7 @@ def run_vortex_dipole():
     dt, steps = 0.05, 100
     z_final, history = system.evolve(z, dt=dt, steps=steps, record_every=2)
 
-    E_final = system.energy(z_final)
+    E_final = float(H(z_final).numpy())
     print(f"Final Energy: {E_final:.6f}")
     E_drift = abs(E_final - E0) / abs(E0) if abs(E0) > 1e-10 else abs(E_final - E0)
     print(f"Energy Drift: {E_drift:.2e}")
@@ -131,13 +140,15 @@ def run_three_vortices():
         r * np.cos(4*np.pi/3), r * np.sin(4*np.pi/3),
     ])
 
-    system = PointVortexSystem(gamma, integrator="rk4")
+    system = UniversalSymplecticCompiler(kind="point_vortex", integrator="midpoint", gamma=gamma)
+    H = point_vortex_hamiltonian(gamma)
 
     print(f"\nThree equal vortices in equilateral triangle")
     print(f"They rotate rigidly about the center of vorticity")
 
-    E0 = system.energy(z)
-    L0 = system.angular_momentum(z)
+    E0 = float(H(z).numpy())
+    pos0 = z.reshape(2, -1).permute(1, 0)
+    L0 = float((gamma * (pos0 * pos0).sum(axis=1)).sum().numpy())
 
     print(f"\nInitial Energy: {E0:.6f}")
     print(f"Initial Angular Momentum: {L0:.6f}")
@@ -145,8 +156,9 @@ def run_three_vortices():
     dt, steps = 0.05, 100
     z_final, history = system.evolve(z, dt=dt, steps=steps, record_every=2)
 
-    E_final = system.energy(z_final)
-    L_final = system.angular_momentum(z_final)
+    E_final = float(H(z_final).numpy())
+    pos1 = z_final.reshape(2, -1).permute(1, 0)
+    L_final = float((gamma * (pos1 * pos1).sum(axis=1)).sum().numpy())
 
     print(f"\nFinal Energy: {E_final:.6f}")
     print(f"Final Angular Momentum: {L_final:.6f}")

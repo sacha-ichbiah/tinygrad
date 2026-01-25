@@ -4,6 +4,18 @@ This roadmap is structured by **complexity of the primitives**, not just complex
 
 ---
 
+# **Universal API (Hamiltonian in → Simulation out)**
+
+```python
+from tinyphysics import UniversalSymplecticCompiler
+
+def H(q, p):
+  return 0.5 * (q*q).sum() + 0.5 * (p*p).sum()
+
+sim = UniversalSymplecticCompiler(kind="canonical", H=H, integrator="leapfrog")
+(q, p), history = sim.evolve((q, p), dt=0.01, steps=100)
+```
+
 # **TinyPhysics: The Simulation Roadmap**
 
 ## **Phase 1: The Canonical Foundation**

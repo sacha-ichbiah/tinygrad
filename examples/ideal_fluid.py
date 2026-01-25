@@ -1,5 +1,6 @@
 import numpy as np
-from tinygrad.physics import IdealFluidVorticity2D
+from tinygrad.tensor import Tensor
+from tinygrad.physics import IdealFluidVorticity2D, FieldOperator
 import json
 import os
 
@@ -42,6 +43,7 @@ def run_simulation():
     print(f"Start Ideal Fluid (Symplectic Midpoint) Simulation N={N}")
 
     solver = IdealFluidVorticity2D(N, L=L, dealias=2.0/3.0, dtype=np.float32)
+    _ = FieldOperator.poisson_solve2(Tensor(W.astype(np.float32)), L=L)
     history = []
     steps_done = 0
     while steps_done < steps:

@@ -7083,6 +7083,15 @@ def canonical_flow(q: Tensor, p: Tensor, H_func) -> tuple[Tensor, Tensor]:
   return dHdp, -dHdq
 
 
+def canonical_uop_pass(H_func, device: str, shape: tuple[int, ...], dtype) -> tuple[UOp, UOp, UOp, UOp]:
+  """Return (q_sym, p_sym, dq_uop, dp_uop) canonical UOp graphs for H."""
+  system = HamiltonianSystem(H_func, integrator="auto")
+  q_sym, p_sym, dHdq, dHdp = system._get_coupled_grad_uops(device, shape, dtype)
+  dq_uop = dHdp
+  dp_uop = dHdq.neg()
+  return q_sym, p_sym, dq_uop, dp_uop
+
+
 def _numeric_separable_check(q: Tensor, p: Tensor, H_func, eps: float = 1e-3, tol: float = 1e-6) -> bool:
   q0 = q.detach()
   p0 = p.detach()
@@ -7119,6 +7128,44 @@ class SymplecticStepKernel:
     if q.requires_grad or p.requires_grad:
       return self._step(q, p, dt)
     return self._jit(q, p, dt)
+
+
+class SymplecticStepKernelUOp:
+  """UOp kernel-backed symplectic step (leapfrog + yoshida4 schedules)."""
+  def __init__(self, H_func, integrator: str = "leapfrog"):
+    self.H = H_func
+    self.integrator = integrator
+    self._kernel_cache: dict[tuple[float, str, tuple[int, ...], object], Callable] = {}
+    self._system = HamiltonianSystem(H_func, integrator="auto")
+
+  def _kernel(self, dt: float, device: str, shape: tuple[int, ...], dtype) -> Callable:
+    key = (float(dt), device, shape, dtype)
+    cached = self._kernel_cache.get(key)
+    if cached is not None:
+      return cached
+    kernel = self._system._build_leapfrog_step_kernel_coupled(dt, device, shape, dtype)
+    self._kernel_cache[key] = kernel
+    return kernel
+
+  def _apply_kernel(self, q: Tensor, p: Tensor, dt: float) -> tuple[Tensor, Tensor]:
+    q_out = Tensor.empty_like(q)
+    p_out = Tensor.empty_like(p)
+    kernel = self._kernel(dt, q.device, q.shape, q.dtype)
+    out = Tensor.custom_kernel(q, p, q_out, p_out, fxn=kernel)
+    return out[2], out[3]
+
+  def __call__(self, state, dt: float):
+    q, p = state
+    if self.integrator == "leapfrog":
+      return self._apply_kernel(q, p, dt)
+    if self.integrator == "yoshida4":
+      w1 = 1.0 / (2.0 - 2.0 ** (1.0 / 3.0))
+      w0 = -2.0 ** (1.0 / 3.0) * w1
+      q, p = self._apply_kernel(q, p, w1 * dt)
+      q, p = self._apply_kernel(q, p, w0 * dt)
+      q, p = self._apply_kernel(q, p, w1 * dt)
+      return q, p
+    return SymplecticStepKernel(self.H, integrator=self.integrator)(state, dt)
 
 
 class LinearSymplecticStepKernel:
@@ -7264,11 +7311,19 @@ def compile_symplectic_program(kind: str, *, H=None, policy: SymplecticPolicy | 
           return linear_kernel(state, dt)
         ops.append(SymplecticOp("SYMP_STEP_LINEAR", symp_step))
       else:
+        uop_kernel = None
+        if sample_state is not None and kwargs.get("uop_kernel", True) and integrator in ("leapfrog", "yoshida4"):
+          try:
+            uop_kernel = SymplecticStepKernelUOp(H, integrator=integrator)
+          except Exception:
+            uop_kernel = None
         system = HamiltonianSystem(H, integrator=integrator, policy=policy)
         def symp_step(state, dt):
           q, p = state
           if q.requires_grad or p.requires_grad or capturing:
             return system.step(q, p, dt)
+          if uop_kernel is not None:
+            return uop_kernel((q, p), dt)
           return system._jit_step(q, p, dt)
         def symp_step_inplace(state, dt):
           q, p = state
@@ -7286,9 +7341,15 @@ def compile_symplectic_program(kind: str, *, H=None, policy: SymplecticPolicy | 
   if kind in ("so3", "lie_poisson"):
     if H is None:
       raise ValueError("Hamiltonian H is required for Lie-Poisson systems")
-    system = LiePoissonSystem(H, algebra="so3", integrator=integrator, policy=policy)
+    J = kwargs.get("J")
+    if J is None:
+      system = LiePoissonSystem(H, algebra="so3", integrator=integrator, policy=policy)
+      def lie_step(state, dt):
+        return system.step(state, dt)
+      ops.append(SymplecticOp("LIE_FLOW", lie_step))
+      return SymplecticIR(ops, kind="lie_poisson").lower(policy=policy)
     def lie_step(state, dt):
-      return system.step(state, dt)
+      return lie_flow(state, H, J, dt)
     ops.append(SymplecticOp("LIE_FLOW", lie_step))
     return SymplecticIR(ops, kind="lie_poisson").lower(policy=policy)
 
@@ -7349,6 +7410,56 @@ def _complex_mul_i(z: Tensor, r: Tensor, sign: float = 1.0) -> Tensor:
   if sign >= 0:
     return Tensor.stack([-z[..., 1] * r, z[..., 0] * r], dim=-1)
   return Tensor.stack([z[..., 1] * r, -z[..., 0] * r], dim=-1)
+
+def lie_flow(state: Tensor, H_func, J_func, dt: float) -> Tensor:
+  """Generic Lie-Poisson flow: dz/dt = J(z) * dH/dz."""
+  z = state.detach().requires_grad_(True)
+  H = H_func(z)
+  H.backward()
+  grad = z.grad.detach()
+  J = J_func(z)
+  if callable(J):
+    flow = J(grad)
+  else:
+    flow = (J @ grad) if J.ndim == 2 else (J * grad).sum(axis=-1)
+  return state + dt * flow
+
+
+class FieldOperator:
+  """Lightweight operator wrapper for periodic grid fields."""
+  @staticmethod
+  def grad2(f: Tensor, L: float | None = None) -> tuple[Tensor, Tensor]:
+    n = int(f.shape[0])
+    dx = (L / n) if L is not None else 1.0
+    fx = (f.roll(-1, 0) - f.roll(1, 0)) * (0.5 / dx)
+    fy = (f.roll(-1, 1) - f.roll(1, 1)) * (0.5 / dx)
+    return fx, fy
+
+  @staticmethod
+  def div2(u: Tensor, v: Tensor, L: float | None = None) -> Tensor:
+    n = int(u.shape[0])
+    dx = (L / n) if L is not None else 1.0
+    du = (u.roll(-1, 0) - u.roll(1, 0)) * (0.5 / dx)
+    dv = (v.roll(-1, 1) - v.roll(1, 1)) * (0.5 / dx)
+    return du + dv
+
+  @staticmethod
+  def curl2(u: Tensor, v: Tensor, L: float | None = None) -> Tensor:
+    n = int(u.shape[0])
+    dx = (L / n) if L is not None else 1.0
+    dv_dx = (v.roll(-1, 0) - v.roll(1, 0)) * (0.5 / dx)
+    du_dy = (u.roll(-1, 1) - u.roll(1, 1)) * (0.5 / dx)
+    return dv_dx - du_dy
+
+  @staticmethod
+  def laplacian2(f: Tensor, L: float | None = None) -> Tensor:
+    n = int(f.shape[0])
+    dx = (L / n) if L is not None else 1.0
+    return (f.roll(1, 0) + f.roll(-1, 0) + f.roll(1, 1) + f.roll(-1, 1) - 4 * f) * (1.0 / (dx * dx))
+
+  @staticmethod
+  def poisson_solve2(f: Tensor, L: float = 2 * math.pi) -> Tensor:
+    return poisson_solve_fft2(f, L=L)
 
 
 
