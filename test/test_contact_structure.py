@@ -30,11 +30,26 @@ def test_contact_structure_diagnostics():
   structure = ConformalStructure(alpha=0.2, use_contact=True)
   prog = compile_structure(state=(q, p, s), H=H, structure=structure, contact_diagnostics=True)
   (_, _, _), history = prog.evolve((q, p, s), 0.05, 3)
-  q0, p0, s0, e0 = history[0]
+  q0, p0, s0, e0, e_tot = history[0]
   assert q0.shape == q.shape
   assert p0.shape == p.shape
   assert s0.shape == s.shape
   assert e0.numel() == 1
+  assert e_tot.numel() == 1
+
+
+def test_contact_structure_total_energy_drift():
+  def H(q, p):
+    return 0.5 * (q * q).sum() + 0.5 * (p * p).sum()
+
+  q = Tensor(np.random.randn(4).astype(np.float32))
+  p = Tensor(np.random.randn(4).astype(np.float32))
+  s = Tensor([0.0])
+  structure = ConformalStructure(alpha=0.1, use_contact=True)
+  prog = compile_structure(state=(q, p, s), H=H, structure=structure, contact_diagnostics=True)
+  (_, _, _), history = prog.evolve((q, p, s), 0.02, 10, record_every=1)
+  e_tot = np.array([float(h[4].numpy()) for h in history])
+  assert np.isfinite(e_tot).all()
 
 
 def test_langevin_structure_damps_energy():

@@ -3,6 +3,7 @@ import math
 from tinygrad.tensor import Tensor
 
 from tinyphysics.operators.poisson import poisson_solve_fft2
+from tinyphysics.operators.operator import Operator
 
 
 class FieldOperator:
@@ -42,4 +43,36 @@ class FieldOperator:
     return poisson_solve_fft2(f, L=L)
 
 
-__all__ = ["FieldOperator"]
+def grad2_op(L: float | None = None) -> Operator:
+  return Operator("grad2", lambda f: FieldOperator.grad2(f, L=L))
+
+
+def div2_op(L: float | None = None) -> Operator:
+  return Operator("div2", lambda u, v: FieldOperator.div2(u, v, L=L))
+
+
+def curl2_op(L: float | None = None) -> Operator:
+  return Operator("curl2", lambda u, v: FieldOperator.curl2(u, v, L=L))
+
+
+def laplacian2_op(L: float | None = None) -> Operator:
+  return Operator("laplacian2", lambda f: FieldOperator.laplacian2(f, L=L))
+
+
+def poisson_solve2_op(L: float = 2 * math.pi) -> Operator:
+  return Operator("poisson_solve2", lambda f: FieldOperator.poisson_solve2(f, L=L))
+
+
+def operator_signature(ops: list[str]) -> str:
+  return "->".join(ops)
+
+
+__all__ = [
+  "FieldOperator",
+  "grad2_op",
+  "div2_op",
+  "curl2_op",
+  "laplacian2_op",
+  "poisson_solve2_op",
+  "operator_signature",
+]

@@ -49,8 +49,8 @@ tensor‑bins and Barnes‑Hut paths, plus a `NBodySystem` wrapper for batch‑a
 ### Phase 4: Long-Range Forces
 **Goal:** Accurate electrostatics and gravity at scale
 
-- [ ] Ewald summation for periodic systems
-- [ ] Particle Mesh Ewald (PME) with FFT
+- [x] Ewald summation for periodic systems (baseline energy)
+- [x] Particle Mesh Ewald (PME) with FFT (baseline forces)
 - [ ] Fast Multipole Method (FMM) for open boundaries
 - [ ] Gravitational softening options
 

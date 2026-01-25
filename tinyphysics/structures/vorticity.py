@@ -21,6 +21,7 @@ from tinygrad.engine.jit import TinyJit
 
 from tinyphysics.core.structure import Structure, StructureKind
 from tinyphysics.operators.poisson import _complex_mul_real, _complex_mul_i
+from tinyphysics.operators.spatial import grad2_op, poisson_solve2_op
 
 
 class VorticityStructure(Structure):
@@ -85,6 +86,20 @@ class VorticityStructure(Structure):
     adv_hat = _complex_mul_real(rfft2d(adv), self.mask)
     return -irfft2d(adv_hat, n=(self.N, self.N))
 
+  def _rhs_operator(self, w: Tensor, trace: list[str] | None = None) -> Tensor:
+    if trace is not None:
+      trace.extend(["poisson_solve2", "grad2", "grad2"])
+    psi = poisson_solve2_op(L=self.L)(w)
+    dpsidx, dpsidy = grad2_op(L=self.L)(psi)
+    dwdx, dwdy = grad2_op(L=self.L)(w)
+    u = dpsidy
+    v = -dpsidx
+    adv = u * dwdx + v * dwdy
+    return -adv
+
+  def operator_trace(self, out: list[str]):
+    out.extend(["poisson_solve2", "grad2", "grad2"])
+
   def diagnostics(self, w: Tensor) -> tuple[Tensor, Tensor]:
     """Return (energy, enstrophy) for vorticity field."""
     w_hat = rfft2d(w)
@@ -96,24 +111,25 @@ class VorticityStructure(Structure):
     enstrophy = 0.5 * (w * w).sum() * area
     return energy, enstrophy
 
-  def step(self, w: Tensor, dt: float, method: str = "midpoint", iters: int = 2) -> Tensor:
+  def step(self, w: Tensor, dt: float, method: str = "midpoint", iters: int = 2, use_operator: bool = False) -> Tensor:
     """Single timestep using implicit midpoint or explicit Euler."""
+    rhs = self._rhs_operator if use_operator else self._rhs
     if method == "euler":
-      return (w + dt * self._rhs(w)).realize()
+      return (w + dt * rhs(w)).realize()
 
     if method != "midpoint":
       raise ValueError(f"Unknown method: {method}")
 
     # Implicit midpoint with fixed-point iteration
-    w_next = w + dt * self._rhs(w)
+    w_next = w + dt * rhs(w)
     for _ in range(max(1, iters)):
       w_mid = 0.5 * (w + w_next)
-      w_next = w + dt * self._rhs(w_mid)
+      w_next = w + dt * rhs(w_mid)
     return w_next.realize()
 
   def evolve(self, w0: Tensor | np.ndarray, dt: float, steps: int,
              record_every: int = 1, method: str = "midpoint", iters: int = 2,
-             unroll: int | None = None, diagnostics: bool = False) -> tuple[Tensor, list]:
+             unroll: int | None = None, diagnostics: bool = False, use_operator: bool = False) -> tuple[Tensor, list]:
     """Evolve vorticity field for multiple steps.
 
     Args:
@@ -151,7 +167,7 @@ class VorticityStructure(Structure):
 
     if unroll and unroll > 1 and steps >= unroll:
       # Use JIT-compiled unrolled step
-      step_fn = self._get_unrolled_step(dt, unroll, method, iters)
+      step_fn = self._get_unrolled_step(dt, unroll, method, iters, use_operator)
 
       i = 0
       while i + unroll <= steps:
@@ -166,7 +182,7 @@ class VorticityStructure(Structure):
 
       # Handle remaining steps
       for j in range(i, steps):
-        w = self.step(w, dt, method, iters)
+        w = self.step(w, dt, method, iters, use_operator=use_operator)
         if (j + 1) % record_every == 0:
           if diagnostics:
             e, z = self.diagnostics(w)
@@ -176,7 +192,7 @@ class VorticityStructure(Structure):
     else:
       # Non-unrolled path
       for i in range(steps):
-        w = self.step(w, dt, method, iters)
+        w = self.step(w, dt, method, iters, use_operator=use_operator)
         if (i + 1) % record_every == 0:
           if diagnostics:
             e, z = self.diagnostics(w)
@@ -186,24 +202,25 @@ class VorticityStructure(Structure):
 
     return w, history
 
-  def _get_unrolled_step(self, dt: float, unroll: int, method: str, iters: int) -> Callable:
+  def _get_unrolled_step(self, dt: float, unroll: int, method: str, iters: int, use_operator: bool) -> Callable:
     """Get or create JIT-compiled unrolled step function."""
-    key = (dt, unroll, method, iters)
+    key = (dt, unroll, method, iters, use_operator)
     if key in self._unroll_cache:
       return self._unroll_cache[key]
 
     def unrolled_fn(w: Tensor) -> Tensor:
       for _ in range(unroll):
-        w = self.step(w, dt, method, iters)
+        w = self.step(w, dt, method, iters, use_operator=use_operator)
       return w
 
     jit_fn = TinyJit(unrolled_fn)
     self._unroll_cache[key] = jit_fn
     return jit_fn
 
-  def compile_unrolled_step(self, dt: float, unroll: int, method: str = "midpoint", iters: int = 3) -> Callable:
+  def compile_unrolled_step(self, dt: float, unroll: int, method: str = "midpoint", iters: int = 3,
+                            use_operator: bool = False) -> Callable:
     """Public interface for getting unrolled step function."""
-    return self._get_unrolled_step(dt, unroll, method, iters)
+    return self._get_unrolled_step(dt, unroll, method, iters, use_operator)
 
   def split(self, H_func: Callable | None) -> list[Callable] | None:
     """Operator splitting not implemented for vorticity dynamics."""

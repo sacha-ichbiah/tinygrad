@@ -118,10 +118,17 @@ def compute_energy(w: np.ndarray | Tensor, L: float, N: int, structure: Vorticit
   return 0.5 * float((w_np * psi).sum()) * dx * dx
 
 
+def operator_trace(structure: VorticityStructure) -> tuple[str, ...]:
+  trace: list[str] = []
+  structure.operator_trace(trace)
+  return tuple(trace)
+
+
 __all__ = [
   "create_vorticity_system",
   "kelvin_helmholtz_ic",
   "taylor_green_ic",
   "compute_enstrophy",
   "compute_energy",
+  "operator_trace",
 ]

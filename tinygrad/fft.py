@@ -123,7 +123,6 @@ _fft3d_contig_threshold_cache: dict[tuple[str, object], int] = {}
 _fft3d_plan_cache: dict[tuple[tuple[int, ...], str, object],
                         tuple[bool, bool, tuple[int, int, int] | None, tuple[bool, bool, bool] | None, int, tuple[bool, bool]]] = {}
 _twiddle128_cache: dict[tuple[bool, str, object], Tensor] = {}
-_fft3d_128_plan_cache: dict[tuple[str, object], str] = {}
 
 
 def _twiddle(n: int, r: int, m: int, inverse: bool, device: str, dtype) -> Tensor:
@@ -1320,45 +1319,16 @@ def _uop_fft1d_128_axis_radix2(x_ptr: UOp, tmp_ptr: UOp, out_ptr: UOp, tw_ptr: U
 
 
 def _fft3d_128_plan(device: str, dtype) -> str:
-  key = (device, dtype)
-  cached = _fft3d_128_plan_cache.get(key)
-  if cached is not None:
-    return cached
-  plan_env = getenv("TINYGRAD_FFT_3D_128_PLAN", "")
-  if plan_env in ("radix2", "radix4"):
-    _fft3d_128_plan_cache[key] = plan_env
-    return plan_env
-  if getenv("TINYGRAD_FFT_3D_128_AUTOTUNE", 1) == 0:
-    _fft3d_128_plan_cache[key] = "radix4"
-    return "radix4"
-  x = Tensor.empty(128, 128, 128, 2, device=device, dtype=dtypes.float32)
-  best_plan, best_time = "radix4", float("inf")
-  for plan in ("radix4", "radix2"):
-    _ = _fft3d_128_kernel_multi(x, False, plan=plan).realize()
-    start = time.perf_counter()
-    _ = _fft3d_128_kernel_multi(x, False, plan=plan).realize()
-    dt = time.perf_counter() - start
-    if dt < best_time:
-      best_time, best_plan = dt, plan
-  _fft3d_128_plan_cache[key] = best_plan
-  return best_plan
+  # NOTE: kernel_multi is disabled, so plan selection doesn't matter.
+  # Return radix4 as default (it was generally faster in benchmarks).
+  return "radix4"
 
 
 def _fft3d_128_kernel_multi(x: Tensor, inverse: bool, plan: str | None = None) -> Tensor:
-  if x.shape != (128, 128, 128, 2):
-    raise ValueError("fft3d_128_kernel_multi expects complex shape (128,128,128,2)")
-  plan = _fft3d_128_plan(x.device, x.dtype) if plan is None else plan
-  axis_fn = _uop_fft1d_128_axis if plan == "radix4" else _uop_fft1d_128_axis_radix2
-  tw = _twiddle_128(inverse, x.device, x.dtype)
-  tmp = Tensor.empty(128, 128, 128, 2, device=x.device, dtype=x.dtype)
-  out = Tensor.empty(128, 128, 128, 2, device=x.device, dtype=x.dtype)
-  def kernel(x_uop: UOp, tmp_uop: UOp, tw_uop: UOp, out_uop: UOp):
-    k = []
-    k += axis_fn(x_uop, tmp_uop, out_uop, tw_uop, 2, inverse)
-    k += axis_fn(out_uop, out_uop, tmp_uop, tw_uop, 1, inverse)
-    k += axis_fn(tmp_uop, tmp_uop, out_uop, tw_uop, 0, inverse)
-    return tuple(k)
-  return Tensor.custom_kernel(x, tmp, tw, out, fxn=kernel)[-1]
+  # NOTE: kernel_multi has buffer aliasing issues that produce incorrect results.
+  # The custom_kernel infrastructure doesn't support the buffer rotation needed for 3D FFT.
+  # Disabled until the underlying issue is fixed. Use regular path instead.
+  return None
 
 
 def _fft3d_128_special(x: Tensor, inverse: bool) -> Tensor:
@@ -1508,7 +1478,10 @@ def _fft3d_impl(x: Tensor, inverse: bool = False) -> Tensor:
     raise ValueError("fft3d requires at least 3D input")
   if x.ndim == 4 and tuple(int(s) for s in x.shape[-4:-1]) == (128, 128, 128):
     if getenv("TINYGRAD_FFT_3D_128_KERNEL_MULTI", 1):
-      return _fft3d_128_kernel_multi(x, inverse)
+      result = _fft3d_128_kernel_multi(x, inverse)
+      if result is not None:
+        return result
+      # Fall through to regular path if kernel_multi returns None (radix4 buffer issue)
     if getenv("TINYGRAD_FFT_3D_128_SPECIAL", 0):
       return _fft3d_128_special(x, inverse)
   if x.ndim == 4 and tuple(int(s) for s in x.shape[-4:-1]) == (8, 8, 8):

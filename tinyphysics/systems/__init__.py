@@ -6,6 +6,7 @@ from .fluids import IdealFluidSystem2D
 from .quantum import QuantumSystem, QuantumHamiltonianCompiler
 from .nbody import NBodySystem
 from .molecular import LennardJonesSystem
+from .electrostatics import ElectrostaticsSystem
 
 __all__ = [
   "CanonicalSystem",
@@ -22,4 +23,5 @@ __all__ = [
   "QuantumHamiltonianCompiler",
   "NBodySystem",
   "LennardJonesSystem",
+  "ElectrostaticsSystem",
 ]

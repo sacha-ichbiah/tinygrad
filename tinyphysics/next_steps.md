@@ -76,12 +76,8 @@ Practical, implementation‑ready queue based on the current codebase and design
 
 ## Next (ordered)
 
-- [x] **Phase 4 kickoff: Poisson 3D + PME baseline**
-  - Add `poisson_solve_fft3` and a minimal PME operator (deposit + solve + field).
-  - Add a small test for charge conservation and finite forces.
+- [x] **Electrostatics bench hook**
+  - Added PME benchmark entry in `bench/run_universal.py` (optional).
 
-- [ ] **Contact structure completion**
-  - Add explicit contact variable evolution and diagnostics for dissipative flows.
-
-- [ ] **Operator wrapper integration**
-  - Hook grad/div/curl/poisson ops into compiler-visible Operator nodes.
+- [x] **FMM stub**
+  - Added placeholder module with API shape for future FMM.

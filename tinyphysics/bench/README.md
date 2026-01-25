@@ -108,3 +108,11 @@ Recommended max_per ranges (rule of thumb):
 - N >= 2048, dense: 32–64
 
 Barnes‑Hut defaults: theta=0.5, softening=1e-2 (tune for accuracy vs. speed).
+
+## PME Bench
+
+Run a minimal PME vs direct force timing:
+
+```bash
+python tinyphysics/bench/pme_bench.py
+```

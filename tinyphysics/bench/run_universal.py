@@ -9,6 +9,7 @@ from tinyphysics.bench.universal_physics_bench import (
   bench_canonical, bench_so3, bench_quantum, bench_constraint, bench_dissipative, bench_fluid, bench_thermostat,
   bench_barostat, bench_lj_tensor_bins, bench_lj_barostat
 )
+from tinyphysics.bench.pme_bench import bench_pme
 
 
 def main():
@@ -48,6 +49,10 @@ def main():
     print(f"lj: {t_lj:.4f}s")
   if t_lj_baro is not None:
     print(f"lj_barostat: {t_lj_baro:.4f}s")
+  if os.getenv("TINYGRAD_BENCH_PME", "0"):
+    t_pme, t_direct = bench_pme()
+    print(f"pme: {t_pme:.4f}s")
+    print(f"direct_coulomb: {t_direct:.4f}s")
   if os.getenv("TINYGRAD_BENCH_NEIGHBORS", "0"):
     from tinyphysics.bench.neighbors_bench import bench_neighbors
     t_n, count = bench_neighbors()

@@ -15,7 +15,7 @@ def contact_extend(q: Tensor, p: Tensor, s: Tensor, H: Callable, alpha: float, d
   dHdp = p_req.grad.detach()
   qn = q + dt * dHdp
   pn = p - dt * dHdq - dt * alpha * p
-  sn = s + dt * (p * dHdp).sum() * alpha
+  sn = s + dt * ((p * dHdp).sum() - Hval) * alpha
   return qn, pn, sn
 
 

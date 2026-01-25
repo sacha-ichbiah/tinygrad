@@ -7445,7 +7445,13 @@ def compile_symplectic_program(kind: str, *, H=None, policy: SymplecticPolicy | 
         ops.append(SymplecticOp("SYMP_STEP_LINEAR", symp_step))
       else:
         uop_kernel = None
-        if sample_state is not None and kwargs.get("uop_kernel", True) and integrator in ("leapfrog", "yoshida4"):
+        operator_trace = kwargs.get("operator_trace")
+        use_uop = kwargs.get("uop_kernel", True)
+        if operator_trace is not None and any(op in ("poisson_solve2", "grad2", "div2", "curl2", "laplacian2") for op in operator_trace):
+          use_uop = False
+        if operator_trace is not None and tuple(operator_trace) == ("poisson_solve2", "grad2", "grad2"):
+          use_uop = False
+        if sample_state is not None and use_uop and integrator in ("leapfrog", "yoshida4"):
           try:
             uop_kernel = SymplecticStepKernelUOp(H, integrator=integrator)
           except Exception:
@@ -7456,7 +7462,7 @@ def compile_symplectic_program(kind: str, *, H=None, policy: SymplecticPolicy | 
           # Always use non-JIT path - nested JITs cause state pollution issues
           # when inner JIT's captured state persists across outer JIT warmup phases.
           # The outer JIT (compile_unrolled_step) handles caching, so inner JIT is redundant.
-          if uop_kernel is not None and not (q.requires_grad or p.requires_grad or capturing):
+          if uop_kernel is not None and use_uop and not (q.requires_grad or p.requires_grad or capturing):
             return uop_kernel((q, p), dt)
           return system.step(q, p, dt)
         def symp_step_inplace(state, dt):

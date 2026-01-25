@@ -116,6 +116,14 @@ def compile_structure(
     return _compile_quantum_from_structure(structure, H)
 
   if structure.kind == StructureKind.CANONICAL:
+    operator_trace: list[str] = []
+    if getattr(structure, "operator_trace", None) is not None:
+      try:
+        structure.operator_trace(operator_trace)
+      except Exception:
+        pass
+    if operator_trace:
+      kwargs.setdefault("operator_trace", tuple(operator_trace))
     constraint_fn = constraint
     if constraint_fn is None:
       constraint_fn = structure.constraints(state) if hasattr(structure, "constraints") else None
@@ -143,6 +151,14 @@ def compile_structure(
     return StructureProgram(prog)
 
   if structure.kind == StructureKind.LIE_POISSON:
+    operator_trace: list[str] = []
+    if getattr(structure, "operator_trace", None) is not None:
+      try:
+        structure.operator_trace(operator_trace)
+      except Exception:
+        pass
+    if operator_trace:
+      kwargs.setdefault("operator_trace", tuple(operator_trace))
     def J_func(z: Tensor):
       return lambda grad: structure.bracket(z, grad)
     prog = compile_symplectic_program(
@@ -179,12 +195,14 @@ def compile_structure(
           for i in range(steps):
             if i % record_every == 0:
               if self.diagnostics:
-                history.append((q.detach(), p.detach(), s.detach(), self.H(q, p).detach()))
+                Hval = self.H(q, p).detach()
+                history.append((q.detach(), p.detach(), s.detach(), Hval, (Hval + s).detach()))
               else:
                 history.append((q.detach(), p.detach(), s.detach()))
             q, p, s = contact_extend(q, p, s, self.H, self.alpha, dt)
           if self.diagnostics:
-            history.append((q.detach(), p.detach(), s.detach(), self.H(q, p).detach()))
+            Hval = self.H(q, p).detach()
+            history.append((q.detach(), p.detach(), s.detach(), Hval, (Hval + s).detach()))
           else:
             history.append((q.detach(), p.detach(), s.detach()))
           return (q, p, s), history
