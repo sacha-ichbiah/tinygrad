@@ -71,6 +71,18 @@ def _digit_reverse_tensor(n: int, radices: list[int], device: str) -> Tensor:
   return cached
 
 
+def _digit_reverse_view(x: Tensor, n: int, radices: list[int]) -> Tensor:
+  if len(radices) <= 1:
+    return x
+  prefix = x.shape[:-2]
+  x = x.reshape(*prefix, *radices, 2)
+  nd = len(prefix)
+  rev_axes = [nd + i for i in range(len(radices) - 1, -1, -1)]
+  perm = list(range(nd)) + rev_axes + [nd + len(radices)]
+  x = x.permute(*perm)
+  return x.reshape(*prefix, n, 2)
+
+
 def _rev8_tensor(device: str) -> Tensor:
   cached = _rev8_cache.get(device)
   if cached is not None:
@@ -94,10 +106,20 @@ _fft_plan_obj_cache: dict[tuple[tuple[int, ...], bool, str, object, str], "FFTPl
 _fft_autotuned: set[tuple[str, object]] = set()
 _fft_autotune_active: set[tuple[str, object]] = set()
 _stage_twiddle_cache: dict[tuple[int, bool, str, object], Tensor] = {}
+_stage_twiddle4_cache: dict[tuple[int, bool, str, object], tuple[Tensor, Tensor, Tensor]] = {}
+_stage_twiddle_broadcast_cache: dict[tuple[int, bool, str, object, int], Tensor] = {}
+_stage_twiddle4_broadcast_cache: dict[tuple[int, bool, str, object, int], tuple[Tensor, Tensor, Tensor]] = {}
 _rev8_cache: dict[str, Tensor] = {}
 _fft_split_radix_threshold_cache: dict[tuple[str, object], int] = {}
 _digit_reverse_cache: dict[tuple[int, tuple[int, ...]], list[int]] = {}
 _digit_reverse_tensor_cache: dict[tuple[int, tuple[int, ...], str], Tensor] = {}
+_swap_last2_perm_cache: dict[int, tuple[int, ...]] = {}
+_axis_perm_cache: dict[tuple[int, int], tuple[tuple[int, ...], tuple[int, ...] | None]] = {}
+_fft3d_axis_order_cache: dict[tuple[tuple[int, ...], bool], tuple[int, int, int]] = {}
+_permute_last3_cache: dict[tuple[int, tuple[int, int, int]], tuple[int, ...]] = {}
+_fft3d_contig_threshold_cache: dict[tuple[str, object], int] = {}
+_fft3d_plan_cache: dict[tuple[tuple[int, ...], str, object],
+                        tuple[bool, bool, tuple[int, int, int] | None, tuple[bool, bool, bool] | None, int, tuple[bool, bool]]] = {}
 
 
 def _twiddle(n: int, r: int, m: int, inverse: bool, device: str, dtype) -> Tensor:
@@ -358,34 +380,58 @@ def _fft_pow2_iterative_radix8(x: Tensor, n: int, inverse: bool) -> Tensor:
   if n >= 8 and n >= threshold:
     bits = int(math.log2(n))
     radices = [8] + [2] * (bits - 3)
-    idx = _digit_reverse_tensor(n, radices, x.device).reshape((1,) * (x.ndim - 2) + (n, 1)).expand(*x.shape)
-    x = x.gather(-2, idx)
-    prefix = x.shape[:-2]
-    x = x.reshape(*prefix, -1, 8, 2)
+    x = _digit_reverse_view(x, n, radices)
+    prefix0 = x.shape[:-2]
+    x = x.reshape(*prefix0, -1, 8, 2)
     x = _fft_pow2_base8(x, inverse)
-    x = x.reshape(*prefix, n, 2)
+    x = x.reshape(*prefix0, n, 2)
     m = 16
   else:
-    radices = [2] * int(math.log2(n))
-    idx = _digit_reverse_tensor(n, radices, x.device).reshape((1,) * (x.ndim - 2) + (n, 1)).expand(*x.shape)
-    x = x.gather(-2, idx)
-    m = 2
+    bits = int(math.log2(n))
+    if n >= 4:
+      radices = [4] + [2] * (bits - 2)
+      x = _digit_reverse_view(x, n, radices)
+      prefix0 = x.shape[:-2]
+      x = x.reshape(*prefix0, -1, 4, 2)
+      x = _fft_pow2_base4(x, inverse)
+      x = x.reshape(*prefix0, n, 2)
+      m = 8
+    else:
+      radices = [2] * bits
+      x = _digit_reverse_view(x, n, radices)
+      prefix0 = x.shape[:-2]
+      m = 2
 
-  sign = 1.0 if inverse else -1.0
+  ndim = len(prefix0) + 2
   while m <= n:
+    if m >= 4 and m * 4 <= n and (len(prefix0) <= 2 or n >= 1024):
+      m4 = m * 4
+      quarter = m4 // 4
+      x = x.reshape(*prefix0, -1, m4, 2)
+      x0 = x[..., :quarter, :]
+      x1 = x[..., quarter:2 * quarter, :]
+      x2 = x[..., 2 * quarter:3 * quarter, :]
+      x3 = x[..., 3 * quarter:, :]
+      tw1, tw2, tw3 = _stage_twiddle4_broadcast(m4, inverse, x.device, x.dtype, ndim)
+      t1 = _complex_mul(x1, tw1)
+      t2 = _complex_mul(x2, tw2)
+      t3 = _complex_mul(x3, tw3)
+      y = _fft_pow2_base4(Tensor.stack([x0, t1, t2, t3], dim=-2), inverse)
+      y = y.permute(*range(y.ndim - 3), y.ndim - 2, y.ndim - 3, y.ndim - 1)
+      x = y.reshape(*prefix0, n, 2)
+      m = m4
+      continue
     half = m // 2
-    prefix = x.shape[:-2]
-    x = x.reshape(*prefix, -1, m, 2)
+    x = x.reshape(*prefix0, -1, m, 2)
     even = x[..., :half, :]
     odd = x[..., half:, :]
     if m == 2:
       x = Tensor.cat(_complex_add(even, odd), _complex_sub(even, odd), dim=-2)
     else:
-      tw = _stage_twiddle(m, inverse, x.device, x.dtype)
-      tw = tw.reshape((1,) * (x.ndim - 2) + (half, 2))
+      tw = _stage_twiddle_broadcast(m, inverse, x.device, x.dtype, ndim)
       t = _complex_mul(odd, tw)
       x = Tensor.cat(_complex_add(even, t), _complex_sub(even, t), dim=-2)
-    x = x.reshape(*prefix, n, 2)
+    x = x.reshape(*prefix0, n, 2)
     m *= 2
 
   if inverse:
@@ -396,6 +442,17 @@ def _fft_pow2_iterative_radix8(x: Tensor, n: int, inverse: bool) -> Tensor:
 
 def _fft_mixed_radix_plan(x: Tensor, n: int, inverse: bool) -> Tensor:
   radices = _factor_list(n)
+  if radices.count(2) >= 2:
+    compressed: list[int] = []
+    i = 0
+    while i < len(radices):
+      if i + 1 < len(radices) and radices[i] == 2 and radices[i + 1] == 2:
+        compressed.append(4)
+        i += 2
+      else:
+        compressed.append(radices[i])
+        i += 1
+    radices = compressed
   if len(radices) <= 1:
     return _dft_small(x, n, inverse)
   m = 1
@@ -437,6 +494,28 @@ def _get_split_radix_threshold(device: str, dtype) -> int:
   return 32
 
 
+def _get_fft3d_contig_threshold(device: str, dtype) -> int:
+  env = os.getenv("TINYGRAD_FFT_CONTIGUOUS_3D_THRESHOLD")
+  if env is not None:
+    return int(env)
+  cached = _fft3d_contig_threshold_cache.get((device, dtype))
+  if cached is not None:
+    return cached
+  return 4096
+
+
+def _maybe_contiguous(x: Tensor, threshold: int) -> Tensor:
+  if threshold <= 0 or x.device != "CPU":
+    return x
+  try:
+    numel = int(x.numel())
+  except Exception:
+    return x
+  if numel >= threshold and not x.uop.is_contiguous():
+    return x.contiguous()
+  return x
+
+
 def _ensure_autotuned(device: str, dtype):
   if (device, dtype) in _fft_autotuned:
     return
@@ -460,6 +539,187 @@ def _stage_twiddle(m: int, inverse: bool, device: str, dtype) -> Tensor:
   tw = Tensor.stack([angles.cos(), angles.sin()], dim=-1).realize()
   _stage_twiddle_cache[key] = tw
   return tw
+
+
+def _stage_twiddle_broadcast(m: int, inverse: bool, device: str, dtype, ndim: int) -> Tensor:
+  key = (m, inverse, device, dtype, ndim)
+  cached = _stage_twiddle_broadcast_cache.get(key)
+  if cached is not None:
+    return cached
+  half = m // 2
+  tw = _stage_twiddle(m, inverse, device, dtype)
+  tw = tw.reshape((1,) * (ndim - 2) + (half, 2))
+  _stage_twiddle_broadcast_cache[key] = tw
+  return tw
+
+
+def _stage_twiddle4(m: int, inverse: bool, device: str, dtype) -> tuple[Tensor, Tensor, Tensor]:
+  key = (m, inverse, device, dtype)
+  cached = _stage_twiddle4_cache.get(key)
+  if cached is not None:
+    return cached
+  sign = 1.0 if inverse else -1.0
+  quarter = m // 4
+  angles = Tensor.arange(quarter, device=device, dtype=dtype, requires_grad=False) * (sign * 2 * math.pi / m)
+  tw1 = Tensor.stack([angles.cos(), angles.sin()], dim=-1)
+  tw2 = _complex_mul(tw1, tw1)
+  tw3 = _complex_mul(tw2, tw1)
+  tw1, tw2, tw3 = tw1.realize(), tw2.realize(), tw3.realize()
+  _stage_twiddle4_cache[key] = (tw1, tw2, tw3)
+  return tw1, tw2, tw3
+
+
+def _stage_twiddle4_broadcast(m: int, inverse: bool, device: str, dtype, ndim: int) -> tuple[Tensor, Tensor, Tensor]:
+  key = (m, inverse, device, dtype, ndim)
+  cached = _stage_twiddle4_broadcast_cache.get(key)
+  if cached is not None:
+    return cached
+  quarter = m // 4
+  tw1, tw2, tw3 = _stage_twiddle4(m, inverse, device, dtype)
+  tw1 = tw1.reshape((1,) * (ndim - 2) + (quarter, 2))
+  tw2 = tw2.reshape((1,) * (ndim - 2) + (quarter, 2))
+  tw3 = tw3.reshape((1,) * (ndim - 2) + (quarter, 2))
+  _stage_twiddle4_broadcast_cache[key] = (tw1, tw2, tw3)
+  return tw1, tw2, tw3
+
+
+def _fft_pow2_iterative_radix4(x: Tensor, n: int, inverse: bool) -> Tensor:
+  bits = int(math.log2(n))
+  radices = [4] * (bits // 2)
+  x = _digit_reverse_view(x, n, radices)
+  prefix0 = x.shape[:-2]
+  ndim = len(prefix0) + 2
+  m = 4
+  while m <= n:
+    quarter = m // 4
+    x = x.reshape(*prefix0, -1, m, 2)
+    prefix = x.shape[:-2]
+    x0 = x[..., :quarter, :]
+    x1 = x[..., quarter:2 * quarter, :]
+    x2 = x[..., 2 * quarter:3 * quarter, :]
+    x3 = x[..., 3 * quarter:, :]
+    if m == 4:
+      t1, t2, t3 = x1, x2, x3
+    else:
+      tw1, tw2, tw3 = _stage_twiddle4_broadcast(m, inverse, x.device, x.dtype, ndim)
+      t1 = _complex_mul(x1, tw1)
+      t2 = _complex_mul(x2, tw2)
+      t3 = _complex_mul(x3, tw3)
+    y = _fft_pow2_base4(Tensor.stack([x0, t1, t2, t3], dim=-2), inverse)
+    y = y.permute(*range(y.ndim - 3), y.ndim - 2, y.ndim - 3, y.ndim - 1)
+    x = y.reshape(*prefix, m, 2)
+    m *= 4
+  x = x.reshape(*prefix0, n, 2)
+  if inverse:
+    scale = 1.0 / n
+    x = Tensor.stack([x[..., 0] * scale, x[..., 1] * scale], dim=-1)
+  return x
+
+
+def _fft_pow2_unrolled_16(x: Tensor, inverse: bool) -> Tensor:
+  x = _digit_reverse_view(x, 16, [8, 2])
+  prefix = x.shape[:-2]
+  x = x.reshape(*prefix, -1, 8, 2)
+  x = _fft_pow2_base8(x, inverse)
+  x = x.reshape(*prefix, 16, 2)
+  x = x.reshape(*prefix, -1, 16, 2)
+  even = x[..., :8, :]
+  odd = x[..., 8:, :]
+  tw = _stage_twiddle_broadcast(16, inverse, x.device, x.dtype, len(prefix) + 2)
+  t = _complex_mul(odd, tw)
+  x = Tensor.cat(_complex_add(even, t), _complex_sub(even, t), dim=-2)
+  x = x.reshape(*prefix, 16, 2)
+  if inverse:
+    scale = 1.0 / 16
+    x = Tensor.stack([x[..., 0] * scale, x[..., 1] * scale], dim=-1)
+  return x
+
+
+def _fft_base_on_axis_minus3(x: Tensor, r: int, inverse: bool) -> Tensor:
+  if r not in (4, 8):
+    raise ValueError("base FFT only supports r=4 or r=8")
+  perm = list(range(x.ndim))
+  perm[-3], perm[-2] = perm[-2], perm[-3]
+  x = x.permute(*perm)
+  x = _fft_pow2_base4(x, inverse) if r == 4 else _fft_pow2_base8(x, inverse)
+  inv = [0] * x.ndim
+  for i, p in enumerate(perm):
+    inv[p] = i
+  return x.permute(*inv)
+
+
+def _fft_pow2_unrolled_128(x: Tensor, inverse: bool) -> Tensor:
+  n = 128
+  prefix = x.shape[:-2]
+  m = 1
+  # stage r=8
+  r = 8
+  m_new = m * r
+  blocks = n // m_new
+  x = x.reshape(*prefix, blocks, m, r, 2)
+  x = x.permute(*range(x.ndim - 4), x.ndim - 4, x.ndim - 2, x.ndim - 3, x.ndim - 1)
+  tw = _twiddle(n, r, m, inverse, x.device, x.dtype).reshape((1,) * (x.ndim - 3) + (r, m, 2))
+  x = _complex_mul(x, tw)
+  x = _fft_base_on_axis_minus3(x, r, inverse)
+  x = x.reshape(*prefix, blocks, m_new, 2)
+  m = m_new
+  # stage r=4
+  r = 4
+  m_new = m * r
+  blocks = n // m_new
+  x = x.reshape(*prefix, blocks, m, r, 2)
+  x = x.permute(*range(x.ndim - 4), x.ndim - 4, x.ndim - 2, x.ndim - 3, x.ndim - 1)
+  tw = _twiddle(n, r, m, inverse, x.device, x.dtype).reshape((1,) * (x.ndim - 3) + (r, m, 2))
+  x = _complex_mul(x, tw)
+  x = _fft_base_on_axis_minus3(x, r, inverse)
+  x = x.reshape(*prefix, blocks, m_new, 2)
+  m = m_new
+  # stage r=4
+  r = 4
+  m_new = m * r
+  blocks = n // m_new
+  x = x.reshape(*prefix, blocks, m, r, 2)
+  x = x.permute(*range(x.ndim - 4), x.ndim - 4, x.ndim - 2, x.ndim - 3, x.ndim - 1)
+  tw = _twiddle(n, r, m, inverse, x.device, x.dtype).reshape((1,) * (x.ndim - 3) + (r, m, 2))
+  x = _complex_mul(x, tw)
+  x = _fft_base_on_axis_minus3(x, r, inverse)
+  x = x.reshape(*prefix, blocks, m_new, 2)
+  if inverse:
+    scale = 1.0 / n
+    x = Tensor.stack([x[..., 0] * scale, x[..., 1] * scale], dim=-1)
+  return x.reshape(*prefix, n, 2)
+
+
+def _fft1d_pow2_fast(x: Tensor, n: int, inverse: bool) -> Tensor:
+  if n <= 1:
+    return x
+  if n == 2:
+    x0, x1 = x[..., 0, :], x[..., 1, :]
+    out = Tensor.stack([_complex_add(x0, x1), _complex_sub(x0, x1)], dim=-2)
+    if inverse:
+      scale = 0.5
+      out = Tensor.stack([out[..., 0] * scale, out[..., 1] * scale], dim=-1)
+    return out
+  if n == 4:
+    out = _fft_pow2_base4(x, inverse)
+    if inverse:
+      scale = 0.25
+      out = Tensor.stack([out[..., 0] * scale, out[..., 1] * scale], dim=-1)
+    return out
+  if n == 8:
+    out = _fft_pow2_base8(x, inverse)
+    if inverse:
+      scale = 0.125
+      out = Tensor.stack([out[..., 0] * scale, out[..., 1] * scale], dim=-1)
+    return out
+  if n == 16:
+    return _fft_pow2_unrolled_16(x, inverse)
+  if n == 128:
+    if getenv("TINYGRAD_FFT_128_FUSED", 0):
+      return _fft_pow2_unrolled_128(x, inverse)
+  if n >= 128:
+    return _fft_pow2_radix8_plan(x, n, inverse)
+  return _fft_pow2_iterative_radix8(x, n, inverse)
 
 
 def _fft1d_impl(x: Tensor, inverse: bool = False) -> Tensor:
@@ -486,6 +746,7 @@ def _fft1d_impl(x: Tensor, inverse: bool = False) -> Tensor:
         scale = 0.125
         out = Tensor.stack([out[..., 0] * scale, out[..., 1] * scale], dim=-1)
       return out
+    bits = int(math.log2(n))
     split_thr = _get_split_radix_threshold(x.device, x.dtype)
     if split_thr and n <= split_thr:
       out = _fft_pow2_split_radix(x, n, inverse)
@@ -493,6 +754,8 @@ def _fft1d_impl(x: Tensor, inverse: bool = False) -> Tensor:
         scale = 1.0 / n
         out = Tensor.stack([out[..., 0] * scale, out[..., 1] * scale], dim=-1)
       return out
+    if n % 4 == 0 and (bits % 2 == 0) and (bits <= 6 or bits >= 10):
+      return _fft_pow2_iterative_radix4(x, n, inverse)
     return _fft_pow2_iterative_radix8(x, n, inverse)
   if not _is_power_of_two(n):
     if n >= getenv("TINYGRAD_FFT_MIXEDRADIX_THRESHOLD", 1 << 30):
@@ -531,17 +794,310 @@ def _fft2d_impl(x: Tensor, inverse: bool = False) -> Tensor:
   x = _as_complex(x)
   if x.ndim < 2:
     raise ValueError("fft2d requires at least 2D input")
+  def _swap_last2(x: Tensor) -> Tensor:
+    if x.ndim == 3:
+      return x.permute(1, 0, 2)
+    perm = _swap_last2_perm_cache.get(x.ndim)
+    if perm is None:
+      perm = tuple(list(range(x.ndim - 3)) + [x.ndim - 2, x.ndim - 3, x.ndim - 1])
+      _swap_last2_perm_cache[x.ndim] = perm
+    return x.permute(*perm)
+  swap_first = x.shape[-2] < x.shape[-3]
+  if swap_first:
+    x = _swap_last2(x)
   x = _fft1d_impl(x, inverse=inverse)
-  if x.ndim == 3:
-    x = x.permute(1, 0, 2)
-  else:
-    x = x.permute(*range(x.ndim - 3), x.ndim - 2, x.ndim - 3, x.ndim - 1)
+  x = _swap_last2(x)
   x = _fft1d_impl(x, inverse=inverse)
-  if x.ndim == 3:
-    x = x.permute(1, 0, 2)
-  else:
-    x = x.permute(*range(x.ndim - 3), x.ndim - 2, x.ndim - 3, x.ndim - 1)
+  if not swap_first:
+    x = _swap_last2(x)
   return x
+
+
+def _fft2d_pow2_fast(x: Tensor, inverse: bool = False) -> Tensor:
+  x = _as_complex(x)
+  if x.ndim < 2:
+    raise ValueError("fft2d requires at least 2D input")
+  def _swap_last2(x: Tensor) -> Tensor:
+    if x.ndim == 3:
+      return x.permute(1, 0, 2)
+    perm = _swap_last2_perm_cache.get(x.ndim)
+    if perm is None:
+      perm = tuple(list(range(x.ndim - 3)) + [x.ndim - 2, x.ndim - 3, x.ndim - 1])
+      _swap_last2_perm_cache[x.ndim] = perm
+    return x.permute(*perm)
+  swap_first = x.shape[-2] < x.shape[-3]
+  if swap_first:
+    x = _swap_last2(x)
+  n0, n1 = int(x.shape[-3]), int(x.shape[-2])
+  x = _fft1d_pow2_fast(x, n1, inverse)
+  x = _swap_last2(x)
+  x = _fft1d_pow2_fast(x, n0, inverse)
+  if not swap_first:
+    x = _swap_last2(x)
+  return x
+
+
+def _rfft1d_impl(x: Tensor) -> Tensor:
+  n = int(x.shape[-1])
+  out = fft1d(_as_complex(x))
+  return out[..., : n // 2 + 1, :]
+
+
+def _permute_axis_to_last2(x: Tensor, axis: int) -> tuple[Tensor, tuple[int, ...] | None]:
+  if axis < 0:
+    axis += x.ndim
+  last = x.ndim - 1
+  if axis == last - 1:
+    return x, None
+  key = (x.ndim, axis)
+  cached = _axis_perm_cache.get(key)
+  if cached is None:
+    dims = list(range(x.ndim - 1))
+    dims.remove(axis)
+    dims.append(axis)
+    perm = tuple(dims + [last])
+    inv = [0] * x.ndim
+    for i, p in enumerate(perm):
+      inv[p] = i
+    cached = (perm, tuple(inv))
+    _axis_perm_cache[key] = cached
+  perm, inv = cached
+  return x.permute(*perm), inv
+
+
+def _fft_axis(x: Tensor, axis: int, inverse: bool) -> Tensor:
+  x, inv = _permute_axis_to_last2(x, axis)
+  x = _fft1d_impl(x, inverse=inverse)
+  return x if inv is None else x.permute(*inv)
+
+
+def _fft_axis_fft1d(x: Tensor, axis: int, inverse: bool) -> Tensor:
+  x, inv = _permute_axis_to_last2(x, axis)
+  x = fft1d(x, inverse=inverse)
+  return x if inv is None else x.permute(*inv)
+
+
+def _rfft2d_impl(x: Tensor) -> Tensor:
+  x = _rfft1d_impl(x)
+  if x.ndim == 3:
+    x = x.permute(1, 0, 2)
+  else:
+    perm = _swap_last2_perm_cache.get(x.ndim)
+    if perm is None:
+      perm = tuple(list(range(x.ndim - 3)) + [x.ndim - 2, x.ndim - 3, x.ndim - 1])
+      _swap_last2_perm_cache[x.ndim] = perm
+    x = x.permute(*perm)
+  x = fft1d(x)
+  if x.ndim == 3:
+    x = x.permute(1, 0, 2)
+  else:
+    perm = _swap_last2_perm_cache.get(x.ndim)
+    if perm is None:
+      perm = tuple(list(range(x.ndim - 3)) + [x.ndim - 2, x.ndim - 3, x.ndim - 1])
+      _swap_last2_perm_cache[x.ndim] = perm
+    x = x.permute(*perm)
+  return x
+
+
+def _fft3d_fused_8(x: Tensor, inverse: bool) -> Tensor:
+  prefix = x.shape[:-4]
+  W = _dft_matrix(8, inverse, x.device, x.dtype)
+  x6 = x.reshape(*prefix, 1, 1, 1, 8, 8, 8, 2)
+  Wx = W.reshape((1,) * len(prefix) + (8, 1, 1, 8, 1, 1, 2))
+  Wy = W.reshape((1,) * len(prefix) + (1, 8, 1, 1, 8, 1, 2))
+  Wz = W.reshape((1,) * len(prefix) + (1, 1, 8, 1, 1, 8, 2))
+  t = _complex_mul(x6, Wx)
+  t = _complex_mul(t, Wy)
+  t = _complex_mul(t, Wz)
+  out = t.sum(axis=-4).sum(axis=-3).sum(axis=-2)
+  if inverse:
+    scale = 1.0 / 512
+    out = Tensor.stack([out[..., 0] * scale, out[..., 1] * scale], dim=-1)
+  return out
+
+
+def _fft3d_128_special(x: Tensor, inverse: bool) -> Tensor:
+  layout = int(getenv("TINYGRAD_FFT_3D_128_LAYOUT", 0))
+  if layout == 1:
+    x = x.permute(2, 0, 1, 3).contiguous()
+    x = _fft2d_pow2_fast(x, inverse)
+    x, inv = _permute_axis_to_last2(x, 0)
+    x = _fft1d_pow2_fast(x, 128, inverse)
+    x = x if inv is None else x.permute(*inv)
+    return x.permute(1, 2, 0, 3)
+  if layout == 2:
+    x = _fft2d_pow2_fast(x, inverse)
+    x, inv = _permute_axis_to_last2(x, 0)
+    x = _fft1d_pow2_fast(x, 128, inverse)
+    x = x if inv is None else x.permute(*inv)
+    return x
+  x = x.permute(1, 2, 0, 3).contiguous()
+  x = _fft2d_pow2_fast(x, inverse)
+  x, inv = _permute_axis_to_last2(x, 0)
+  x = _fft1d_pow2_fast(x, 128, inverse)
+  x = x if inv is None else x.permute(*inv)
+  return x.permute(2, 0, 1, 3)
+
+
+def _fft3d_impl_4d(x: Tensor, inverse: bool, use_pow2: bool, use_block2d: bool,
+                   contig_thr: int, contig_mask: tuple[bool, bool]) -> Tensor:
+  prefix = x.ndim - 4
+  def _perm_last3(x: Tensor, order: tuple[int, int, int]) -> Tensor:
+    if order == (0, 1, 2):
+      return x
+    key = (x.ndim, order)
+    perm = _permute_last3_cache.get(key)
+    if perm is None:
+      perm = tuple(list(range(prefix)) + [prefix + order[0], prefix + order[1], prefix + order[2], prefix + 3])
+      _permute_last3_cache[key] = perm
+    return x.permute(*perm)
+  if use_block2d:
+    x = _fft2d_pow2_fast(x, inverse)
+    if contig_mask[0]:
+      x = _maybe_contiguous(x, contig_thr)
+    x = _perm_last3(x, (1, 2, 0))
+    if contig_mask[1]:
+      x = _maybe_contiguous(x, contig_thr)
+    x = _fft1d_pow2_fast(x, int(x.shape[-2]), inverse)
+    x = _perm_last3(x, (2, 0, 1))
+    return x
+  if use_pow2:
+    n0, n1, n2 = int(x.shape[-4]), int(x.shape[-3]), int(x.shape[-2])
+    use_cycle = bool(getenv("TINYGRAD_FFT_3D_CYCLE", 0))
+    if use_cycle:
+      x = _fft1d_pow2_fast(x, n2, inverse)
+      x = _perm_last3(x, (1, 2, 0))
+      if contig_mask[0]:
+        x = _maybe_contiguous(x, contig_thr)
+      x = _fft1d_pow2_fast(x, n0, inverse)
+      x = _perm_last3(x, (1, 2, 0))
+      if contig_mask[1]:
+        x = _maybe_contiguous(x, contig_thr)
+      x = _fft1d_pow2_fast(x, n1, inverse)
+      x = _perm_last3(x, (1, 2, 0))
+      return x
+    x = _fft1d_pow2_fast(x, n2, inverse)
+    x = _perm_last3(x, (0, 2, 1))
+    if contig_mask[0]:
+      x = _maybe_contiguous(x, contig_thr)
+    x = _fft1d_pow2_fast(x, n1, inverse)
+    x = _perm_last3(x, (1, 2, 0))
+    if contig_mask[1]:
+      x = _maybe_contiguous(x, contig_thr)
+    x = _fft1d_pow2_fast(x, n0, inverse)
+    x = _perm_last3(x, (2, 1, 0))
+    return x
+  x = _fft1d_impl(x, inverse=inverse)
+  x = _perm_last3(x, (0, 2, 1))
+  if contig_mask[0]:
+    x = _maybe_contiguous(x, contig_thr)
+  x = _fft1d_impl(x, inverse=inverse)
+  x = _perm_last3(x, (1, 2, 0))
+  if contig_mask[1]:
+    x = _maybe_contiguous(x, contig_thr)
+  x = _fft1d_impl(x, inverse=inverse)
+  x = _perm_last3(x, (2, 1, 0))
+  return x
+
+
+def _fft3d_impl_order(x: Tensor, inverse: bool, order: tuple[int, int, int],
+                      use_pow2: bool, pow2_axes: tuple[bool, bool, bool], contig_thr: int) -> Tensor:
+  if use_pow2:
+    for i, ax in enumerate(order):
+      x, inv = _permute_axis_to_last2(x, ax)
+      x = _fft1d_pow2_fast(x, int(x.shape[-2]), inverse)
+      x = x if inv is None else x.permute(*inv)
+      x = _maybe_contiguous(x, contig_thr)
+    return x
+  for ax in order:
+    x = _fft_axis(x, ax, inverse)
+    x = _maybe_contiguous(x, contig_thr)
+  return x
+
+
+def _fft3d_autotune(x: Tensor, inverse: bool, use_pow2: bool, use_block2d: bool,
+                    order: tuple[int, int, int] | None, pow2_axes: tuple[bool, bool, bool],
+                    contig_thr: int) -> tuple[tuple[int, int, int] | None, int]:
+  if x.device != "CPU":
+    return order, contig_thr
+  if x.ndim == 4:
+    thr_list = []
+    for v in (0, contig_thr, 4096, 16384):
+      if v not in thr_list: thr_list.append(v)
+    best_thr, best_time = contig_thr, float("inf")
+    for thr in thr_list:
+      x0 = _fft3d_impl_4d(x, inverse, use_pow2, use_block2d, thr).realize()
+      start = time.perf_counter()
+      _ = _fft3d_impl_4d(x0, inverse, use_pow2, use_block2d, thr).realize()
+      dt = time.perf_counter() - start
+      if dt < best_time:
+        best_time, best_thr = dt, thr
+    return order, best_thr
+  axes = [x.ndim - 4, x.ndim - 3, x.ndim - 2]
+  perms = [
+    (axes[0], axes[1], axes[2]),
+    (axes[0], axes[2], axes[1]),
+    (axes[1], axes[0], axes[2]),
+    (axes[1], axes[2], axes[0]),
+    (axes[2], axes[0], axes[1]),
+    (axes[2], axes[1], axes[0]),
+  ]
+  thr_list = []
+  for v in (0, contig_thr, 4096, 16384):
+    if v not in thr_list: thr_list.append(v)
+  best_order, best_thr, best_time = order, contig_thr, float("inf")
+  for ord0 in perms:
+    for thr in thr_list:
+      x0 = _fft3d_impl_order(x, inverse, ord0, use_pow2, pow2_axes, thr).realize()
+      start = time.perf_counter()
+      _ = _fft3d_impl_order(x0, inverse, ord0, use_pow2, pow2_axes, thr).realize()
+      dt = time.perf_counter() - start
+      if dt < best_time:
+        best_time, best_order, best_thr = dt, ord0, thr
+  return best_order, best_thr
+
+
+def _fft3d_impl(x: Tensor, inverse: bool = False) -> Tensor:
+  x = _as_complex(x)
+  if x.ndim < 3:
+    raise ValueError("fft3d requires at least 3D input")
+  if x.ndim == 4 and tuple(int(s) for s in x.shape[-4:-1]) == (128, 128, 128):
+    if getenv("TINYGRAD_FFT_3D_128_SPECIAL", 0):
+      return _fft3d_128_special(x, inverse)
+  if x.ndim == 4 and tuple(int(s) for s in x.shape[-4:-1]) == (8, 8, 8):
+    return _fft3d_fused_8(x, inverse)
+  plan_key = (tuple(x.shape), x.device, x.dtype)
+  plan = _fft3d_plan_cache.get(plan_key)
+  if plan is None:
+    axes = (x.ndim - 4, x.ndim - 3, x.ndim - 2)
+    sizes = tuple(int(x.shape[a]) for a in axes)
+    pow2_axes = tuple(_is_power_of_two(s) for s in sizes)
+    use_pow2 = all(pow2_axes)
+    use_block2d = bool(getenv("TINYGRAD_FFT_3D_BLOCK", 0)) and use_pow2
+    contig_mask = (True, True)
+    if x.ndim == 4 and min(sizes) >= 128:
+      contig_mask = (True, False)
+    if x.ndim == 4:
+      order = None
+    else:
+      last2 = x.ndim - 2
+      others = [a for a in axes if a != last2]
+      order = (last2,) + tuple(sorted(others, key=lambda a: x.shape[a]))
+    contig_thr = _get_fft3d_contig_threshold(x.device, x.dtype)
+    if getenv("TINYGRAD_FFT_3D_AUTOTUNE", 0) and not capturing:
+      order, contig_thr = _fft3d_autotune(x, inverse, use_pow2, use_block2d, order, pow2_axes, contig_thr)
+    plan = _fft3d_plan_cache.setdefault(plan_key, (use_block2d, use_pow2, order, pow2_axes, contig_thr, contig_mask))
+  use_block2d, use_pow2, order, pow2_axes, contig_thr, contig_mask = plan
+  if x.ndim == 4:
+    return _fft3d_impl_4d(x, inverse, use_pow2, use_block2d, contig_thr, contig_mask)
+  if use_block2d:
+    x = _fft2d_pow2_fast(x, inverse)
+    x = _maybe_contiguous(x, contig_thr)
+    x, inv = _permute_axis_to_last2(x, x.ndim - 4)
+    x = _fft1d_pow2_fast(x, int(x.shape[-2]), inverse)
+    x = x if inv is None else x.permute(*inv)
+    return _maybe_contiguous(x, contig_thr)
+  return _fft3d_impl_order(x, inverse, order, use_pow2, pow2_axes, contig_thr)
 
 
 def fft1d(x: Tensor, inverse: bool = False) -> Tensor:
@@ -591,11 +1147,47 @@ def ifft2d(x: Tensor) -> Tensor:
   return fft2d(x, inverse=True)
 
 
+def fft3d(x: Tensor, inverse: bool = False) -> Tensor:
+  x = _as_complex(x)
+  _ensure_autotuned(x.device, x.dtype)
+  if x.ndim < 3:
+    raise ValueError("fft3d requires at least 3D input")
+  if getenv("TINYGRAD_FFT_3D_MULTI_JIT", 0) and not capturing:
+    axes = [x.ndim - 4, x.ndim - 3, x.ndim - 2]
+    sizes = {a: x.shape[a] for a in axes}
+    order = tuple(ax for _, ax in sorted((sizes[a], a) for a in axes))
+    for ax in order:
+      x = _fft_axis_fft1d(x, ax, inverse)
+    return x
+  if x.device == "CPU" and getenv("TINYGRAD_FFT_NUMPY_3D", 0):
+    import numpy as np
+    data = x.numpy()
+    c = data[..., 0] + 1j * data[..., 1]
+    out = np.fft.ifftn(c) if inverse else np.fft.fftn(c)
+    return Tensor.stack([Tensor(out.real, device=x.device), Tensor(out.imag, device=x.device)], dim=-1)
+  if getenv("TINYGRAD_FFT_JIT", 1) and not capturing:
+    key = (tuple(x.shape), inverse, x.device, x.dtype, "3d")
+    plan = _fft_plan_cache.get(key)
+    if plan is None:
+      def plan_fn(x_in: Tensor) -> Tensor:
+        return _fft3d_impl(x_in, inverse).realize()
+      plan = _fft_plan_cache.setdefault(key, TinyJit(plan_fn))
+    try:
+      return plan(x)
+    except JitError:
+      _fft_plan_cache.pop(key, None)
+  return _fft3d_impl(x, inverse=inverse)
+
+
+def ifft3d(x: Tensor) -> Tensor:
+  return fft3d(x, inverse=True)
+
+
 class FFTPlan:
   def __init__(self, input_shape: tuple[int, ...], complex_shape: tuple[int, ...],
                inverse: bool, device: str, dtype, kind: str):
-    if kind not in ("1d", "2d"):
-      raise ValueError("FFTPlan kind must be '1d' or '2d'")
+    if kind not in ("1d", "2d", "3d"):
+      raise ValueError("FFTPlan kind must be '1d', '2d', or '3d'")
     self.shape = input_shape
     self.complex_shape = complex_shape
     self.inverse = inverse
@@ -605,7 +1197,9 @@ class FFTPlan:
     def plan_fn(x_in: Tensor) -> Tensor:
       if self.kind == "1d":
         return _fft1d_impl(x_in, self.inverse).realize()
-      return _fft2d_impl(x_in, self.inverse).realize()
+      if self.kind == "2d":
+        return _fft2d_impl(x_in, self.inverse).realize()
+      return _fft3d_impl(x_in, self.inverse).realize()
     self._jit = TinyJit(plan_fn)
 
   def __call__(self, x: Tensor) -> Tensor:
@@ -638,9 +1232,7 @@ def rfft1d(x: Tensor) -> Tensor:
     raise ValueError("rfft1d requires at least 1D input")
   if x.shape[-1] == 2:
     raise ValueError("rfft1d expects real input without complex last dim")
-  n = int(x.shape[-1])
-  out = fft1d(_as_complex(x))
-  return out[..., : n // 2 + 1, :]
+  return _rfft1d_impl(x)
 
 
 def irfft1d(x: Tensor, n: int | None = None) -> Tensor:
@@ -662,17 +1254,7 @@ def irfft1d(x: Tensor, n: int | None = None) -> Tensor:
 def rfft2d(x: Tensor) -> Tensor:
   if x.ndim < 2:
     raise ValueError("rfft2d requires at least 2D input")
-  x = rfft1d(x)
-  if x.ndim == 3:
-    x = x.permute(1, 0, 2)
-  else:
-    x = x.permute(*range(x.ndim - 3), x.ndim - 2, x.ndim - 3, x.ndim - 1)
-  x = fft1d(x)
-  if x.ndim == 3:
-    x = x.permute(1, 0, 2)
-  else:
-    x = x.permute(*range(x.ndim - 3), x.ndim - 2, x.ndim - 3, x.ndim - 1)
-  return x
+  return _rfft2d_impl(x)
 
 
 def irfft2d(x: Tensor, n: tuple[int, int] | None = None) -> Tensor:
@@ -701,7 +1283,6 @@ def autotune_fft_thresholds(device: str = "CPU", dtype=dtypes.float32,
                             sizes: tuple[int, ...] = (32, 64, 128, 256, 512, 1024),
                             thresholds: tuple[int, ...] = (4, 8, 16, 32, 64, 128),
                             iters: int = 2) -> int:
-  import numpy as np
   _fft_autotune_active.add((device, dtype))
   best_thr = thresholds[0]
   best_time = float("inf")
@@ -709,7 +1290,7 @@ def autotune_fft_thresholds(device: str = "CPU", dtype=dtypes.float32,
     _fft_threshold_cache[(device, dtype)] = thr
     total = 0.0
     for n in sizes:
-      x = Tensor(np.random.randn(n, 2).astype(np.float32), device=device, dtype=dtype)
+      x = Tensor.randn(n, 2, device=device, dtype=dtype)
       out = _fft1d_impl(x, inverse=False)
       out.realize()
       start = time.perf_counter()
@@ -729,7 +1310,6 @@ def autotune_split_radix_thresholds(device: str = "CPU", dtype=dtypes.float32,
                                     sizes: tuple[int, ...] = (8, 16, 32, 64),
                                     thresholds: tuple[int, ...] = (0, 16, 32, 64),
                                     iters: int = 1) -> int:
-  import numpy as np
   _fft_autotune_active.add((device, dtype))
   best_thr = thresholds[0]
   best_time = float("inf")
@@ -737,7 +1317,7 @@ def autotune_split_radix_thresholds(device: str = "CPU", dtype=dtypes.float32,
     _fft_split_radix_threshold_cache[(device, dtype)] = thr
     total = 0.0
     for n in sizes:
-      x = Tensor(np.random.randn(n, 2).astype(np.float32), device=device, dtype=dtype)
+      x = Tensor.randn(n, 2, device=device, dtype=dtype)
       out = _fft1d_impl(x, inverse=False)
       out.realize()
       start = time.perf_counter()

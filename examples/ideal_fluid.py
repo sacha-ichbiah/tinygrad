@@ -32,14 +32,26 @@ def run_simulation():
     W = omega_init
 
     dt = 0.02
-    steps = 500
-    record_every = 10
+    steps = int(os.getenv("IDEAL_FLUID_STEPS", "5000"))
+    record_every = int(os.getenv("IDEAL_FLUID_RECORD_EVERY", "50"))
+    progress_every = int(os.getenv("IDEAL_FLUID_PROGRESS_EVERY", str(record_every * 5)))
+    if progress_every % record_every != 0:
+        progress_every = ((progress_every // record_every) + 1) * record_every
     history_w = []
     
     print(f"Start Ideal Fluid (Symplectic Midpoint) Simulation N={N}")
 
     solver = IdealFluidVorticity2D(N, L=L, dealias=2.0/3.0, dtype=np.float32)
-    W, history = solver.evolve(W, dt=dt, steps=steps, record_every=record_every, method="midpoint", iters=5)
+    history = []
+    steps_done = 0
+    while steps_done < steps:
+        chunk = min(progress_every, steps - steps_done)
+        W, chunk_history = solver.evolve(W, dt=dt, steps=chunk, record_every=record_every, method="midpoint", iters=5)
+        if history:
+            chunk_history = chunk_history[1:]
+        history.extend(chunk_history)
+        steps_done += chunk
+        print(f"Progress: {steps_done}/{steps} steps")
 
     for frame in history:
         history_w.append(frame.tolist())
@@ -65,25 +77,32 @@ def generate_viewer(history, N):
     <title>Ideal Fluid (Kelvin-Helmholtz)</title>
     <style>
         body {{ font-family: sans-serif; background: #222; color: #fff; display: flex; flex-direction: column; align-items: center; }}
-        canvas {{ border: 1px solid #555; image-rendering: pixelated; }}
+        canvas {{ border: 1px solid #555; image-rendering: pixelated; width: 512px; height: 512px; }}
     </style>
 </head>
 <body>
     <h1>Ideal Fluid (Vorticity)</h1>
     <p>Red = Positive Vorticity, Blue = Negative.</p>
-    <canvas id="simCanvas" width="512" height="512"></canvas>
+    <p>Frame: <span id="frame">0</span> / {len(history) - 1}</p>
+    <canvas id="simCanvas" width="{N}" height="{N}"></canvas>
     <script>
         const history = {json.dumps(history)};
         const N = {N};
         const canvas = document.getElementById('simCanvas');
         const ctx = canvas.getContext('2d');
         const imageData = ctx.createImageData(N, N);
-        
-        // Scale canvas up via CSS
+        const frameEl = document.getElementById('frame');
+        const targetFPS = 30;
         
         let frame = 0;
+        let lastTime = 0;
         
-        function draw() {{
+        function draw(ts) {{
+            if (ts - lastTime < 1000 / targetFPS) {{
+                requestAnimationFrame(draw);
+                return;
+            }}
+            lastTime = ts;
             const W = history[frame];
             // Find min/max for scaling? Or fixed
             // Vorticity ~ [-2, 2] roughly
@@ -110,18 +129,15 @@ def generate_viewer(history, N):
                 }}
             }}
             
-            // Put image data to temp canvas then draw scaled?
-            // Actually checking pixelated style works better if we drawImage.
+            ctx.putImageData(imageData, 0, 0);
             
-            createImageBitmap(imageData).then(bmp => {{
-                ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
-            }});
-            
+            frameEl.textContent = frame;
             frame = (frame + 1) % history.length;
             requestAnimationFrame(draw);
         }}
         
-        draw();
+        ctx.imageSmoothingEnabled = false;
+        requestAnimationFrame(draw);
     </script>
 </body>
 </html>
