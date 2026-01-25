@@ -13,6 +13,8 @@ from tinyphysics.operators.tensor_neighbors import (
   neighbor_force_from_pairs,
   neighbor_force_tensor_bins,
   autotune_max_per,
+  build_cell_table,
+  CellTable,
 )
 from tinyphysics.operators.barnes_hut import barnes_hut_forces
 
@@ -26,6 +28,10 @@ class NBodySystem:
   box: float = 10.0
   method: str = "neighbor"  # neighbor|barnes_hut|naive|tensor|tensor_bins|auto
   max_per: int | None | str = None
+  table_every: int | None = None
+  _table_cache: CellTable | None = None
+  _table_steps: int = 0
+  last_method: str | None = None
 
   def _force_np(self, q_np: np.ndarray, m: np.ndarray | None = None) -> np.ndarray:
     if m is None:
@@ -73,14 +79,18 @@ class NBodySystem:
       q, p = state
       method = self.method
       if method == "auto":
+        n = int(q.shape[0])
         if "CPU" in q.device.upper():
-          n = int(q.shape[0])
           if n <= 512:
             method = "tensor"
           else:
-            method = "neighbor"
+            vol = self.box * self.box * self.box
+            density = n / vol if vol > 0 else 0.0
+            expected_neighbors = density * (4.0 / 3.0) * np.pi * (self.r_cut ** 3)
+            method = "neighbor" if expected_neighbors < 32.0 else "tensor_bins"
         else:
           method = "tensor_bins"
+      self.last_method = method
       if method == "tensor_bins":
         if "CPU" in q.device.upper():
           cpu_thresh = int(getenv("TINYGRAD_TENSOR_BINS_CPU_THRESHOLD", 512))
@@ -89,7 +99,14 @@ class NBodySystem:
         max_per = self.max_per
         if isinstance(max_per, str) and max_per == "auto":
           max_per = autotune_max_per(q, self.box, self.r_cut)
-        f = neighbor_force_tensor_bins(q, self.mass, self.G, self.softening, self.box, self.r_cut, max_per=max_per)
+        cell_table = None
+        if self.table_every is not None and self.table_every > 0:
+          if self._table_cache is None or (self._table_steps % self.table_every) == 0:
+            self._table_cache = build_cell_table(q, self.box, self.r_cut, max_per=max_per)
+          self._table_steps += 1
+          cell_table = self._table_cache
+        f = neighbor_force_tensor_bins(q, self.mass, self.G, self.softening, self.box, self.r_cut,
+                                       max_per=max_per, cell_table=cell_table)
       elif method == "tensor":
         if "CPU" in q.device.upper() and int(getenv("TINYGRAD_NBODY_TENSOR_CPU", 0)) == 0:
           q_np = q.detach().numpy()

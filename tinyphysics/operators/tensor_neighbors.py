@@ -1,5 +1,5 @@
 from __future__ import annotations
-import numpy as np
+from dataclasses import dataclass
 
 from tinygrad.tensor import Tensor
 from tinygrad.dtype import dtypes
@@ -7,6 +7,17 @@ from tinygrad.helpers import getenv
 from tinyphysics.operators.neighbor import neighbor_pairs
 
 _OFFSETS_CACHE: dict[str, Tensor] = {}
+
+@dataclass
+class CellTable:
+  table: Tensor
+  cell_to_seg: Tensor
+  max_per: int
+  ncell: int
+  order: Tensor
+  n: int
+  box: float
+  r_cut: float
 
 
 def _linear_cell_index(coords: Tensor, ncell: int) -> Tensor:
@@ -68,9 +79,16 @@ def _build_cell_table(pos: Tensor, box: float, r_cut: float, max_per: int | None
   cell_to_seg = cell_to_seg.scatter(0, cell_unique, Tensor.arange(num_seg, device=pos.device, dtype=dtypes.int32))
   return table.realize(), cell_to_seg.realize(), max_per, ncell, order.realize()
 
+def build_cell_table(pos: Tensor, box: float, r_cut: float, max_per: int | None = None) -> CellTable | None:
+  table, cell_to_seg, max_per, ncell, order = _build_cell_table(pos, box, r_cut, max_per=max_per)
+  if table is None:
+    return None
+  return CellTable(table=table, cell_to_seg=cell_to_seg, max_per=max_per, ncell=ncell, order=order,
+                   n=int(pos.shape[0]), box=box, r_cut=r_cut)
+
 
 def neighbor_force_tensor_bins(pos: Tensor, mass: Tensor, G: float, softening: float, box: float,
-                               r_cut: float, max_per: int | None = None) -> Tensor:
+                               r_cut: float, max_per: int | None = None, cell_table: CellTable | None = None) -> Tensor:
   if pos.ndim == 3:
     outs = []
     for b in range(pos.shape[0]):
@@ -87,8 +105,18 @@ def neighbor_force_tensor_bins(pos: Tensor, mass: Tensor, G: float, softening: f
   n = int(pos.shape[0])
   if n == 0:
     return pos.zeros_like()
-  table, cell_to_seg, max_per, ncell, _ = _build_cell_table(pos, box, r_cut, max_per=max_per)
-  if table is None or max_per == 0:
+  if cell_table is not None:
+    if cell_table.n != n or cell_table.box != box or cell_table.r_cut != r_cut:
+      cell_table = None
+  if cell_table is None:
+    cell_table = build_cell_table(pos, box, r_cut, max_per=max_per)
+  if cell_table is None:
+    return pos.zeros_like()
+  table = cell_table.table
+  cell_to_seg = cell_table.cell_to_seg
+  max_per = cell_table.max_per
+  ncell = cell_table.ncell
+  if max_per == 0:
     return pos.zeros_like()
 
   inv = 1.0 / r_cut
@@ -223,6 +251,8 @@ def neighbor_force_from_pairs(pos: Tensor, mass: Tensor, pairs: list[tuple[int, 
 
 __all__ = [
   "build_cell_bins",
+  "build_cell_table",
+  "CellTable",
   "neighbor_force_tensor",
   "neighbor_force_from_pairs",
   "neighbor_force_tensor_bins",

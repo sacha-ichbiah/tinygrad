@@ -17,6 +17,9 @@ PYTHONPATH=/workspaces/tinygrad python tinyphysics/bench/universal_physics_bench
 - dissipative: conformal damping
 - fluid: 2D vorticity step
 - thermostat: Langevin damping (optional)
+- lj: Lennard‑Jones tensor‑bins (optional)
+- barostat: Berendsen NPT (optional)
+- lj_barostat: LJ + Berendsen (optional)
 
 ## Notes
 
@@ -25,11 +28,18 @@ PYTHONPATH=/workspaces/tinygrad python tinyphysics/bench/universal_physics_bench
 - Use consistent CPU affinity if you compare across runs.
 - Optional thresholds can be set via env vars like `TINYGRAD_BENCH_CANONICAL_MAX` (seconds).
 - Optional thermostat bench: set `TINYGRAD_BENCH_THERMOSTAT=1` and `TINYGRAD_BENCH_THERMOSTAT_MAX`.
-- Optional thermostat bench: set `TINYGRAD_BENCH_THERMOSTAT=1` and `TINYGRAD_BENCH_THERMOSTAT_MAX`.
+- Optional LJ bench: set `TINYGRAD_BENCH_LJ=1` and `TINYGRAD_BENCH_LJ_MAX`.
+- Optional barostat bench: set `TINYGRAD_BENCH_BAROSTAT=1` and `TINYGRAD_BENCH_BAROSTAT_MAX`.
+- Optional LJ barostat bench: set `TINYGRAD_BENCH_LJ_BAROSTAT=1` and `TINYGRAD_BENCH_LJ_BAROSTAT_MAX`.
+  - Use `_MAX` env vars to enforce time thresholds in CI for NPT-related benches.
 
 ## Split-Operator Demo
 
 A minimal split-operator example is available at `examples/split_operator_demo.py`.
+
+## NPT Example
+
+A minimal barostat example is available at `examples/lennard_jones_barostat.py`.
 
 ## Neighbor List Bench
 
@@ -43,6 +53,18 @@ Optional tensor-bins micro-bench:
 
 ```bash
 TINYGRAD_BENCH_TENSOR_BINS=1 python tinyphysics/bench/neighbors_bench.py
+```
+
+Optional tensor-bins table build timing:
+
+```bash
+TINYGRAD_BENCH_TENSOR_BINS_TABLE=1 python tinyphysics/bench/neighbors_bench.py
+```
+
+Optional tensor-bins force-only timing (table prebuilt):
+
+```bash
+TINYGRAD_BENCH_TENSOR_BINS_FORCE=1 python tinyphysics/bench/neighbors_bench.py
 ```
 
 CPU tensor-bins uses a small-N fallback to direct tensor pairwise when `N <= TINYGRAD_TENSOR_BINS_CPU_THRESHOLD` (default 512).

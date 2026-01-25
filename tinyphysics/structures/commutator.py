@@ -137,29 +137,15 @@ class QuantumSplitOperator1D:
       phase_v = self._phase_v
     psi = _complex_mul(psi, phase_v)
 
-    # Use numpy FFT for large arrays (tinygrad FFT has roundtrip issues for N >= 128)
-    N = psi.shape[0]
-    if N >= 128:
-      psi_np = psi.numpy()
-      psi_complex = psi_np[..., 0] + 1j * psi_np[..., 1]
-      k = self.k2.numpy()
-      phase_k = self._phase_k.numpy()
-      phase_k_complex = phase_k[..., 0] + 1j * phase_k[..., 1]
-      psi_k = np.fft.fft(psi_complex)
-      psi_k = psi_k * phase_k_complex
-      psi_new = np.fft.ifft(psi_k)
-      psi = Tensor.stack([Tensor(psi_new.real.astype(np.float32), device=psi.device),
-                          Tensor(psi_new.imag.astype(np.float32), device=psi.device)], dim=-1)
+    if self._use_fft_plan and self._fft_plan is not None and not capturing:
+      psi_k = self._fft_plan(psi)
     else:
-      if self._use_fft_plan and self._fft_plan is not None and not capturing:
-        psi_k = self._fft_plan(psi)
-      else:
-        psi_k = fft1d(psi)
-      psi_k = _complex_mul(psi_k, self._phase_k)
-      if self._use_fft_plan and self._ifft_plan is not None and not capturing:
-        psi = self._ifft_plan(psi_k)
-      else:
-        psi = ifft1d(psi_k)
+      psi_k = fft1d(psi)
+    psi_k = _complex_mul(psi_k, self._phase_k)
+    if self._use_fft_plan and self._ifft_plan is not None and not capturing:
+      psi = self._ifft_plan(psi_k)
+    else:
+      psi = ifft1d(psi_k)
 
     psi = _complex_mul(psi, phase_v)
     return psi
@@ -197,31 +183,18 @@ class QuantumSplitOperator1D:
     return prob.numpy().copy()
 
   def _get_unrolled_step(self, unroll: int):
-    """Get or create unrolled step function.
-
-    Note: JIT compilation is disabled when numpy FFT is used (N >= 128)
-    because numpy operations aren't JIT-compatible.
-    """
+    """Get or create unrolled step function."""
     if unroll in self._unroll_cache:
       return self._unroll_cache[unroll]
-
-    # Check if numpy FFT fallback is used (N >= 128)
-    use_numpy_fft = self.x.shape[0] >= 128
 
     def unrolled_fn(psi: Tensor) -> Tensor:
       for _ in range(unroll):
         psi = self._step_raw(psi)
       return self.renormalize(psi).realize()
 
-    if use_numpy_fft:
-      # Don't use JIT when numpy FFT is used (breaks JIT tracing)
-      self._unroll_cache[unroll] = unrolled_fn
-      return unrolled_fn
-    else:
-      # Use JIT for pure tinygrad FFT (N < 128)
-      jit_fn = TinyJit(unrolled_fn)
-      self._unroll_cache[unroll] = jit_fn
-      return jit_fn
+    jit_fn = TinyJit(unrolled_fn)
+    self._unroll_cache[unroll] = jit_fn
+    return jit_fn
 
   def evolve(self, psi: Tensor, steps: int, record_every: int = 1, unroll: int | None = None):
     """Evolve wavefunction with JIT-compiled unrolled steps.

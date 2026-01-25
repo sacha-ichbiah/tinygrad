@@ -5,6 +5,7 @@ from .vortices import PointVortexStructure, PointVortexSystem
 from .fluids import IdealFluidSystem2D
 from .quantum import QuantumSystem, QuantumHamiltonianCompiler
 from .nbody import NBodySystem
+from .molecular import LennardJonesSystem
 
 __all__ = [
   "CanonicalSystem",
@@ -20,4 +21,5 @@ __all__ = [
   "QuantumSystem",
   "QuantumHamiltonianCompiler",
   "NBodySystem",
+  "LennardJonesSystem",
 ]

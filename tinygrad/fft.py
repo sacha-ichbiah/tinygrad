@@ -394,7 +394,8 @@ def _fft_pow2_radix8_plan(x: Tensor, n: int, inverse: bool) -> Tensor:
 
 def _fft_pow2_iterative_radix8(x: Tensor, n: int, inverse: bool) -> Tensor:
   threshold = _get_radix8_threshold(x.device, x.dtype)
-  if n >= 8 and n >= threshold:
+  use_radix8_base = n >= 8 and n >= threshold
+  if use_radix8_base:
     bits = int(math.log2(n))
     radices = [8] + [2] * (bits - 3)
     x = _digit_reverse_view(x, n, radices)
@@ -421,7 +422,10 @@ def _fft_pow2_iterative_radix8(x: Tensor, n: int, inverse: bool) -> Tensor:
 
   ndim = len(prefix0) + 2
   while m <= n:
-    if m >= 4 and m * 4 <= n and (len(prefix0) <= 2 or n >= 1024):
+    # The radix-4 shortcut is only compatible with the radix-4 base initialization path.
+    # For radix-8 base, the data layout after digit reversal with mixed radices [8, 2, 2, ...]
+    # is incompatible with the radix-4 butterfly combining logic.
+    if not use_radix8_base and m >= 4 and m * 4 <= n and (len(prefix0) <= 2 or n >= 1024):
       m4 = m * 4
       quarter = m4 // 4
       x = x.reshape(*prefix0, -1, m4, 2)
@@ -735,7 +739,16 @@ def _fft1d_pow2_fast(x: Tensor, n: int, inverse: bool) -> Tensor:
     if getenv("TINYGRAD_FFT_128_FUSED", 0):
       return _fft_pow2_unrolled_128(x, inverse)
   if n >= 128:
-    return _fft_pow2_radix8_plan(x, n, inverse)
+    # _fft_pow2_radix8_plan only works for exactly 2 same-radix stages (e.g., N=64 with [8,8])
+    # For other patterns, use split_radix which handles all cases correctly
+    radices = _radix_plan_pow2(n)
+    if len(radices) == 2 and radices[0] == radices[1]:
+      return _fft_pow2_radix8_plan(x, n, inverse)
+    out = _fft_pow2_split_radix(x, n, inverse)
+    if inverse:
+      scale = 1.0 / n
+      out = Tensor.stack([out[..., 0] * scale, out[..., 1] * scale], dim=-1)
+    return out
   return _fft_pow2_iterative_radix8(x, n, inverse)
 
 

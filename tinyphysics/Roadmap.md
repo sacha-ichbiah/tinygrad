@@ -38,10 +38,10 @@ tensor‑bins and Barnes‑Hut paths, plus a `NBodySystem` wrapper for batch‑a
 ### Phase 3: Constraints & Thermostats
 **Goal:** Support molecular dynamics workflows
 
-- [ ] RATTLE/SHAKE for holonomic constraints (bonds, angles)
-- [ ] Nose-Hoover chains for canonical ensemble (NVT)
-- [ ] Langevin thermostat (dissipative structure)
-- [ ] Berendsen barostat for NPT ensemble
+- [x] RATTLE/SHAKE for holonomic constraints (bonds, angles)
+- [x] Nose-Hoover chains for canonical ensemble (NVT) (minimal chain_len=1)
+- [x] Langevin thermostat (dissipative structure)
+- [x] Berendsen barostat for NPT ensemble
 
 ### Phase 4: Long-Range Forces
 **Goal:** Accurate electrostatics and gravity at scale

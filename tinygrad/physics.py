@@ -6977,11 +6977,9 @@ class SymplecticProgram:
 
   def evolve(self, state, dt: float, steps: int, record_every: int = 1,
              unroll: int | None = None, vector_width: int | None = None,
-             project_every: int | None = None, fused: bool = False) -> tuple[object, list]:
+             project_every: int | None = None) -> tuple[object, list]:
     if steps < 0:
       raise ValueError("steps must be >= 0")
-    if fused:
-      return self._evolve_fused(state, dt, steps, record_every, project_every)
     if project_every is None and self.project is not None:
       project_every = self.policy.projection_stride("constraint")
     if unroll is None and self.policy.should_scan(steps, _state_shape(state), _state_device(state)):
@@ -6993,11 +6991,14 @@ class SymplecticProgram:
         raise ValueError("steps must be divisible by unroll")
       if record_every % unroll != 0:
         record_every = unroll
-      if len(self.ops) == 1 and self.ops[0].inplace_fn is not None and _state_is_detached(state) and project_every is None and self.project is None:
+      # Check if we can use the inplace path (only when JIT is already warmed up)
+      use_inplace = (len(self.ops) == 1 and self.ops[0].inplace_fn is not None and
+                     _state_is_detached(state) and project_every is None and self.project is None)
+      if use_inplace:
         step = self.compile_unrolled_step_inplace(dt, unroll)
-        if step.captured is None:
-          _ = step(state)
-          _ = step(state)
+        # Skip inplace path if JIT needs warmup (would corrupt state due to buffer replacement issues)
+        use_inplace = step.captured is not None
+      if use_inplace:
         i = 0
         next_record = 0
         while i < steps:
@@ -7020,6 +7021,9 @@ class SymplecticProgram:
             i += unroll
       else:
         step = self.compile_unrolled_step(dt, unroll, project_every=project_every)
+        if step.captured is None:
+          _ = step(state)
+          _ = step(state)
         for i in range(0, steps, unroll):
           if i % record_every == 0:
             history.append(_detach_state(_unvectorize_state(state, vec_meta)))
@@ -7036,17 +7040,6 @@ class SymplecticProgram:
         state = self.project(state, dt) if self.project is not None else state
     history.append(_detach_state(_unvectorize_state(state, vec_meta)))
     return _unvectorize_state(state, vec_meta), history
-
-  def _evolve_fused(self, state, dt: float, steps: int, record_every: int = 1,
-                    project_every: int | None = None) -> tuple[object, list]:
-    """Fused evolution - builds entire evolution as single UOp DAG.
-
-    This eliminates synchronization barriers between unroll batches by
-    constructing the full computation graph before any realize() call.
-    """
-    from tinyphysics.core.fused import FusedEvolution
-    fused = FusedEvolution(lambda s, d: self.step(s, d))
-    return fused.evolve(state, dt, steps, record_every, self.project, project_every or 0)
 
 
 def _detach_state(state):
@@ -7320,6 +7313,15 @@ def split_leapfrog(q: Tensor, p: Tensor, H_func, dt: float) -> tuple[Tensor, Ten
 
 def rattle_project(q: Tensor, p: Tensor, constraint_fn: Callable, tol: float = 1e-9, max_iter: int = 10) -> tuple[Tensor, Tensor]:
   """RATTLE-style projection for holonomic constraints g(q)=0."""
+  if isinstance(constraint_fn, (list, tuple)):
+    qn, pn = q, p
+    for _ in range(max_iter):
+      q_prev = qn
+      for fn in constraint_fn:
+        qn, pn = rattle_project(qn, pn, fn, tol=tol, max_iter=1)
+      if (qn - q_prev).abs().max().numpy() < tol:
+        break
+    return qn, pn
   for _ in range(max_iter):
     q_req = q.detach().requires_grad_(True)
     g = constraint_fn(q_req)
@@ -7609,6 +7611,16 @@ class IdealFluidVorticity2D:
       w_next = w + dt * self._rhs(w_mid)
     return w_next
 
+  def diagnostics(self, w: Tensor) -> tuple[Tensor, Tensor]:
+    w_hat = rfft2d(w)
+    psi_hat = _complex_mul_real(w_hat, self.invK2)
+    psi = irfft2d(psi_hat, n=(self.N, self.N))
+    dx = self.L / self.N
+    area = dx * dx
+    energy = 0.5 * (w * psi).sum() * area
+    enstrophy = 0.5 * (w * w).sum() * area
+    return energy, enstrophy
+
   def step(self, w: np.ndarray, dt: float, method: str = "midpoint", iters: int = 5) -> np.ndarray:
     w_t = Tensor(w.astype(self.dtype, copy=False))
     if not self._should_jit():
@@ -7623,7 +7635,7 @@ class IdealFluidVorticity2D:
     return out.numpy()
 
   def evolve(self, w0: np.ndarray, dt: float, steps: int, record_every: int = 1,
-             method: str = "midpoint", iters: int = 5) -> tuple[np.ndarray, list]:
+             method: str = "midpoint", iters: int = 5, diagnostics: bool = False) -> tuple[np.ndarray, list]:
     w_t = Tensor(w0.astype(self.dtype, copy=True))
     use_jit = self._should_jit(steps)
     step = None
@@ -7637,8 +7649,17 @@ class IdealFluidVorticity2D:
     history = []
     for i in range(steps):
       if i % record_every == 0:
-        history.append(w_t.detach())
+        if diagnostics:
+          e, z = self.diagnostics(w_t)
+          history.append((w_t.detach(), e.detach(), z.detach()))
+        else:
+          history.append(w_t.detach())
       w_t = step(w_t) if use_jit else self._step_tensor(w_t, dt, method=method, iters=iters).realize()
-    history.append(w_t.detach())
-    history_np = [h.numpy().copy() for h in history]
+    if diagnostics:
+      e, z = self.diagnostics(w_t)
+      history.append((w_t.detach(), e.detach(), z.detach()))
+      history_np = [(h.numpy().copy(), float(eh.numpy()), float(zh.numpy())) for h, eh, zh in history]
+    else:
+      history.append(w_t.detach())
+      history_np = [h.numpy().copy() for h in history]
     return w_t.numpy(), history_np

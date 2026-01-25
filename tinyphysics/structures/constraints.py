@@ -6,6 +6,10 @@ from tinygrad.tensor import Tensor
 from tinyphysics.core.structure import Structure, StructureKind
 
 
+def combine_constraints(*constraints: Callable[[Tensor | tuple[Tensor, ...]], Tensor]):
+  return [c for c in constraints if c is not None]
+
+
 @dataclass
 class ConstrainedStructure:
   base: Structure
@@ -25,4 +29,4 @@ class ConstrainedStructure:
     return self.constraint_fn
 
 
-__all__ = ["ConstrainedStructure"]
+__all__ = ["ConstrainedStructure", "combine_constraints"]

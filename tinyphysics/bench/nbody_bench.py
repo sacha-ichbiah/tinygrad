@@ -37,6 +37,19 @@ def bench_nbody(n: int = 256, steps: int = 10, method: str = "neighbor",
   return time.time() - t0
 
 
+def bench_nbody_auto(n: int = 256, steps: int = 10):
+  rng = np.random.default_rng(0)
+  q = Tensor(rng.random((n, 3)).astype(np.float32) * 10.0)
+  p = Tensor(rng.random((n, 3)).astype(np.float32))
+  m = Tensor(np.ones((n,), dtype=np.float32))
+  system = NBodySystem(mass=m, r_cut=1.0, box=10.0, method="auto")
+  prog = system.compile(q, p)
+  t0 = time.time()
+  (q, p), _ = prog.evolve((q, p), 0.01, steps)
+  _ = q.realize(); _ = p.realize()
+  return time.time() - t0, system.last_method
+
+
 def bench_nbody_compare(n: int = 256, steps: int = 10):
   rng = np.random.default_rng(0)
   q = Tensor(rng.random((n, 3)).astype(np.float32) * 10.0)
@@ -51,6 +64,7 @@ def bench_nbody_compare(n: int = 256, steps: int = 10):
   timings["neighbor"] = (bench_nbody(n=n, steps=steps, method="neighbor", q=q, p=p, m=m), None)
   timings["tensor"] = (bench_nbody(n=n, steps=steps, method="tensor", q=q, p=p, m=m), None)
   timings["tensor_bins"] = (bench_nbody(n=n, steps=steps, method="tensor_bins", q=q, p=p, m=m, max_per=max_per), max_per)
+  timings["auto"] = (bench_nbody_auto(n=n, steps=steps)[0], None)
   return timings, pair_count, max_per_auto
 
 
@@ -68,6 +82,10 @@ if __name__ == "__main__":
       max_per = max_per_env
       if method == "tensor_bins" and max_per is None:
         max_per = "auto"
-      t = bench_nbody(n=n, method=method, max_per=max_per)
-      suffix = "" if max_per is None or method != "tensor_bins" else f", max_per={max_per}"
-      print(f"{method}: {t:.4f}s{suffix}")
+      if method == "auto":
+        t, chosen = bench_nbody_auto(n=n)
+        print(f"{method}: {t:.4f}s, chosen={chosen}")
+      else:
+        t = bench_nbody(n=n, method=method, max_per=max_per)
+        suffix = "" if max_per is None or method != "tensor_bins" else f", max_per={max_per}"
+        print(f"{method}: {t:.4f}s{suffix}")

@@ -120,6 +120,26 @@ def test_project_every_stride():
   assert abs(g2) < 1e-6
 
 
+def test_combined_constraints_projection():
+  def H(q, p):
+    return (p * p).sum() / 2
+
+  def c1(q):
+    return (q * q).sum() - 1.0
+
+  def c2(q):
+    return q[2]
+
+  from tinyphysics.structures.constraints import combine_constraints
+  constraint = combine_constraints(c1, c2)
+  q = Tensor([1.5, 0.0, 0.0])
+  p = Tensor([0.1, 0.0, 0.0])
+  prog = compile_symplectic_program("canonical", H=H, constraint=constraint, project_every=1)
+  (q1, _), _ = prog.evolve((q, p), 0.1, 1, unroll=1)
+  assert abs(float(c1(q1).numpy())) < 1e-4
+  assert abs(float(c2(q1).numpy())) < 1e-4
+
+
 def test_conformal_dissipation_reduces_energy():
   def H(q, p):
     return (p * p).sum() / 2 + (q * q).sum() / 2

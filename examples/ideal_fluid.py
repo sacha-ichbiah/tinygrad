@@ -5,9 +5,6 @@ VorticityStructure, which is a proper Lie-Poisson structure that flows
 through the universal physics compiler.
 """
 import os
-# Fix FFT for sizes N=128, 256, 512 (uses split_radix which is correct, instead of iterative_radix8 which has a bug)
-os.environ.setdefault("TINYGRAD_FFT_SPLIT_RADIX_THRESHOLD", "1024")
-
 import numpy as np
 from tinygrad.tensor import Tensor
 import json

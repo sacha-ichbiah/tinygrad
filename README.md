@@ -113,6 +113,19 @@ And it is easy to add more! Your accelerator of choice only needs to support a t
 
 To check default accelerator run: `python3 -c "from tinygrad import Device; print(Device.DEFAULT)"`
 
+## Physics (TinyPhysics)
+
+Structure-preserving physics compiler built on tinygrad ops.
+
+Examples:
+
+- `examples/lennard_jones_barostat.py`
+- `examples/vorticity_diagnostics.py`
+
+Bench: see `tinyphysics/bench/README.md` (includes `TINYGRAD_BENCH_LJ_BAROSTAT`).
+Universal demo: `tinyphysics/examples_universal.py` (includes NPT barostat).
+LJ options: `lj_energy(..., shift=True)` and `LennardJonesSystem(force_shift=True)`.
+
 ## Installation
 
 The current recommended way to install tinygrad is from source.

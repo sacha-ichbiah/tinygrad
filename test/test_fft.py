@@ -126,3 +126,24 @@ def test_irfft2d_roundtrip():
   xt = Tensor(x)
   out = irfft2d(rfft2d(xt), n=(n, n)).numpy()
   assert np.max(np.abs(out - x)) < 1e-3
+
+
+def test_fft1d_large_pow2():
+  # Test large power-of-2 sizes that use the iterative radix-8 path
+  for n in [128, 256, 512]:
+    x = np.random.randn(n).astype(np.float32)
+    xt = Tensor(x)
+    out = fft1d(xt).numpy()
+    np_out = np.fft.fft(x)
+    out_c = out[..., 0] + 1j * out[..., 1]
+    assert _complex_close(out_c, np_out, tol=1e-3), f"fft1d failed for n={n}"
+
+
+def test_ifft1d_roundtrip_large():
+  # Test roundtrip for large sizes
+  for n in [128, 256, 512]:
+    x = np.random.randn(n).astype(np.float32)
+    xt = Tensor(x)
+    out = ifft1d(fft1d(xt)).numpy()
+    out_r = out[..., 0]
+    assert np.max(np.abs(out_r - x)) < 1e-3, f"roundtrip failed for n={n}"

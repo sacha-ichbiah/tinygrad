@@ -64,7 +64,7 @@ class VorticityStructure(Structure):
 
   def _rhs(self, w: Tensor) -> Tensor:
     """Compute right-hand side: -u·∇ω with de-aliasing."""
-    w_hat = rfft2d(w).realize()
+    w_hat = rfft2d(w)
     psi_hat = _complex_mul_real(w_hat, self.invK2)
 
     # Compute velocity and vorticity gradients in spectral space
@@ -75,15 +75,26 @@ class VorticityStructure(Structure):
 
     # Batch iFFT for efficiency
     batch = Tensor.stack([u_hat, v_hat, dwdx_hat, dwdy_hat], dim=0)
-    real_batch = irfft2d(batch, n=(self.N, self.N)).realize()
+    real_batch = irfft2d(batch, n=(self.N, self.N))
     u, v, dwdx, dwdy = real_batch[0], real_batch[1], real_batch[2], real_batch[3]
 
     # Advection term in physical space
     adv = u * dwdx + v * dwdy
 
     # De-alias in spectral space
-    adv_hat = _complex_mul_real(rfft2d(adv).realize(), self.mask)
+    adv_hat = _complex_mul_real(rfft2d(adv), self.mask)
     return -irfft2d(adv_hat, n=(self.N, self.N))
+
+  def diagnostics(self, w: Tensor) -> tuple[Tensor, Tensor]:
+    """Return (energy, enstrophy) for vorticity field."""
+    w_hat = rfft2d(w)
+    psi_hat = _complex_mul_real(w_hat, self.invK2)
+    psi = irfft2d(psi_hat, n=(self.N, self.N))
+    dx = self.L / self.N
+    area = dx * dx
+    energy = 0.5 * (w * psi).sum() * area
+    enstrophy = 0.5 * (w * w).sum() * area
+    return energy, enstrophy
 
   def step(self, w: Tensor, dt: float, method: str = "midpoint", iters: int = 3) -> Tensor:
     """Single timestep using implicit midpoint or explicit Euler."""
@@ -102,7 +113,7 @@ class VorticityStructure(Structure):
 
   def evolve(self, w0: Tensor | np.ndarray, dt: float, steps: int,
              record_every: int = 1, method: str = "midpoint", iters: int = 3,
-             unroll: int | None = None) -> tuple[Tensor, list[np.ndarray]]:
+             unroll: int | None = None, diagnostics: bool = False) -> tuple[Tensor, list]:
     """Evolve vorticity field for multiple steps.
 
     Args:
@@ -132,7 +143,11 @@ class VorticityStructure(Structure):
       else:
         unroll = 1
 
-    history = [w.numpy().copy()]
+    if diagnostics:
+      e0, z0 = self.diagnostics(w)
+      history = [(w.numpy().copy(), float(e0.numpy()), float(z0.numpy()))]
+    else:
+      history = [w.numpy().copy()]
 
     if unroll and unroll > 1 and steps >= unroll:
       # Use JIT-compiled unrolled step
@@ -143,19 +158,31 @@ class VorticityStructure(Structure):
         w = step_fn(w)
         i += unroll
         if i % record_every == 0:
-          history.append(w.numpy().copy())
+          if diagnostics:
+            e, z = self.diagnostics(w)
+            history.append((w.numpy().copy(), float(e.numpy()), float(z.numpy())))
+          else:
+            history.append(w.numpy().copy())
 
       # Handle remaining steps
       for j in range(i, steps):
         w = self.step(w, dt, method, iters)
         if (j + 1) % record_every == 0:
-          history.append(w.numpy().copy())
+          if diagnostics:
+            e, z = self.diagnostics(w)
+            history.append((w.numpy().copy(), float(e.numpy()), float(z.numpy())))
+          else:
+            history.append(w.numpy().copy())
     else:
       # Non-unrolled path
       for i in range(steps):
         w = self.step(w, dt, method, iters)
         if (i + 1) % record_every == 0:
-          history.append(w.numpy().copy())
+          if diagnostics:
+            e, z = self.diagnostics(w)
+            history.append((w.numpy().copy(), float(e.numpy()), float(z.numpy())))
+          else:
+            history.append(w.numpy().copy())
 
     return w, history
 

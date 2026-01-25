@@ -287,8 +287,9 @@ Planned steps:
    - Add a constrained demo + test that uses `project_every`.
 
 2. **Thermostats**
-   - Implement a minimal structure‑preserving thermostat (Langevin / Nose‑Hoover chain).
-   - Add a small regression test and optional benchmark entry.
+   - Langevin (done): noise + diagnostics + regression test.
+   - Nose-Hoover chain (done): minimal chain_len=1 with regression test.
+   - Add a small benchmark entry (optional).
 
 3. **Diagnostics**
    - Expose contact‑energy or entropy proxies in history for dissipative runs.

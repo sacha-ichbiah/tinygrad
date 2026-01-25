@@ -12,7 +12,8 @@ from tinyphysics.core.compiler import compile_structure
 from tinyphysics.structures.canonical import CanonicalStructure
 from tinyphysics.structures.lie_poisson import SO3Structure
 from tinyphysics.structures.conformal import ConformalStructure
-from tinyphysics.structures.contact import LangevinStructure
+from tinyphysics.structures.contact import LangevinStructure, BerendsenBarostatStructure
+from tinyphysics.systems.molecular import LennardJonesSystem, lj_pressure, lj_energy
 from tinyphysics.structures.commutator import QuantumHamiltonianCompiler, QuantumCompilerStructure, gaussian_wavepacket
 from tinygrad.physics import IdealFluidVorticity2D
 
@@ -92,6 +93,19 @@ def bench_thermostat(steps: int = 200):
   return time.time() - t0
 
 
+def bench_barostat(steps: int = 100):
+  def H(q, p):
+    return 0.5 * (q * q).sum() + 0.5 * (p * p).sum()
+  q = Tensor(np.random.randn(64, 3).astype(np.float32))
+  p = Tensor(np.random.randn(64, 3).astype(np.float32))
+  box = Tensor([6.0], dtype=q.dtype)
+  prog = compile_structure(state=(q, p, box), H=H, structure=BerendsenBarostatStructure(target_P=1.0, tau=1.0, kappa=1.0))
+  t0 = time.time()
+  (q, p, box), _ = prog.evolve((q, p, box), 0.01, steps)
+  _ = q.realize(); _ = p.realize(); _ = box.realize()
+  return time.time() - t0
+
+
 def bench_fluid(steps: int = 20, n: int = 64):
   solver = IdealFluidVorticity2D(n)
   w = Tensor(np.random.randn(n, n).astype(np.float32))
@@ -100,6 +114,36 @@ def bench_fluid(steps: int = 20, n: int = 64):
   for _ in range(steps):
     out = solver._step_tensor(out, 0.01)
   _ = out.realize()
+  return time.time() - t0
+
+
+def bench_lj_tensor_bins(steps: int = 10, n: int = 512):
+  q = Tensor(np.random.randn(n, 3).astype(np.float32)) * 0.5 + 5.0
+  p = Tensor(np.zeros((n, 3), dtype=np.float32))
+  m = Tensor(np.ones((n,), dtype=np.float32))
+  system = LennardJonesSystem(mass=m, box=10.0, r_cut=2.5, method="tensor_bins", max_per="auto")
+  prog = system.compile(q, p)
+  t0 = time.time()
+  (q, p), _ = prog.evolve((q, p), 0.005, steps)
+  _ = q.realize(); _ = p.realize()
+  return time.time() - t0
+
+
+def bench_lj_barostat(steps: int = 10, n: int = 256):
+  q = Tensor(np.random.randn(n, 3).astype(np.float32)) * 0.5 + 5.0
+  p = Tensor(np.random.randn(n, 3).astype(np.float32)) * 0.1
+  box = Tensor([10.0], dtype=q.dtype)
+  def H(qv, pv):
+    kinetic = 0.5 * (pv * pv).sum()
+    potential = lj_energy(qv, sigma=1.0, epsilon=1.0, softening=1e-6, box=10.0, r_cut=2.5, periodic=False, shift=True)
+    return kinetic + potential
+  def pressure_fn(qv, pv, boxv):
+    return lj_pressure(qv, pv, sigma=1.0, epsilon=1.0, softening=1e-6, box=boxv[0], r_cut=2.5, periodic=False)
+  prog = compile_structure(state=(q, p, box), H=H, structure=BerendsenBarostatStructure(target_P=1.0, tau=1.0, kappa=1.0,
+                                                                                         pressure_fn=pressure_fn))
+  t0 = time.time()
+  (q, p, box), _ = prog.evolve((q, p, box), 0.005, steps)
+  _ = q.realize(); _ = p.realize(); _ = box.realize()
   return time.time() - t0
 
 
@@ -129,6 +173,9 @@ if __name__ == "__main__":
   t_d = bench_dissipative()
   t_f = bench_fluid()
   t_th = bench_thermostat() if os.getenv("TINYGRAD_BENCH_THERMOSTAT", "0") else None
+  t_lj = bench_lj_tensor_bins() if os.getenv("TINYGRAD_BENCH_LJ", "0") else None
+  t_baro = bench_barostat() if os.getenv("TINYGRAD_BENCH_BAROSTAT", "0") else None
+  t_lj_baro = bench_lj_barostat() if os.getenv("TINYGRAD_BENCH_LJ_BAROSTAT", "0") else None
   _check_threshold("canonical", t_can, _parse_threshold("TINYGRAD_BENCH_CANONICAL_MAX"))
   _check_threshold("so3", t_lp, _parse_threshold("TINYGRAD_BENCH_SO3_MAX"))
   _check_threshold("quantum", t_q, _parse_threshold("TINYGRAD_BENCH_QUANTUM_MAX"))
@@ -137,6 +184,12 @@ if __name__ == "__main__":
   _check_threshold("fluid", t_f, _parse_threshold("TINYGRAD_BENCH_FLUID_MAX"))
   if t_th is not None:
     _check_threshold("thermostat", t_th, _parse_threshold("TINYGRAD_BENCH_THERMOSTAT_MAX"))
+  if t_lj is not None:
+    _check_threshold("lj", t_lj, _parse_threshold("TINYGRAD_BENCH_LJ_MAX"))
+  if t_baro is not None:
+    _check_threshold("barostat", t_baro, _parse_threshold("TINYGRAD_BENCH_BAROSTAT_MAX"))
+  if t_lj_baro is not None:
+    _check_threshold("lj_barostat", t_lj_baro, _parse_threshold("TINYGRAD_BENCH_LJ_BAROSTAT_MAX"))
   print(f"canonical: {t_can:.4f}s")
   print(f"so3: {t_lp:.4f}s")
   print(f"quantum: {t_q:.4f}s")
@@ -145,3 +198,9 @@ if __name__ == "__main__":
   print(f"fluid: {t_f:.4f}s")
   if t_th is not None:
     print(f"thermostat: {t_th:.4f}s")
+  if t_lj is not None:
+    print(f"lj: {t_lj:.4f}s")
+  if t_baro is not None:
+    print(f"barostat: {t_baro:.4f}s")
+  if t_lj_baro is not None:
+    print(f"lj_barostat: {t_lj_baro:.4f}s")
