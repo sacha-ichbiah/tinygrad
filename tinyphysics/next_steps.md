@@ -81,3 +81,5 @@ Practical, implementation‑ready queue based on the current codebase and design
 
 - [x] **FMM stub**
   - Added placeholder module with API shape for future FMM.
+- [x] **FMM stub test**
+  - Added minimal NotImplemented regression test.

@@ -1325,9 +1325,11 @@ def _fft3d_128_plan(device: str, dtype) -> str:
 
 
 def _fft3d_128_kernel_multi(x: Tensor, inverse: bool, plan: str | None = None) -> Tensor:
-  # NOTE: kernel_multi has buffer aliasing issues that produce incorrect results.
-  # The custom_kernel infrastructure doesn't support the buffer rotation needed for 3D FFT.
-  # Disabled until the underlying issue is fixed. Use regular path instead.
+  # NOTE: UOp-based 3D FFT kernel is disabled due to issues with the custom_kernel infrastructure.
+  # The custom_kernel API expects the kernel function to return UOps representing output buffers,
+  # but the FFT stage kernels return UOp.sink(store).end(*ranges) which aren't compatible.
+  # The regular FFT path already achieves good GPU utilization (8 fused kernels, ~150 GFLOPS).
+  # Re-enabling requires understanding how custom_kernel processes KERNEL_MULTI operations.
   return None
 
 

@@ -234,11 +234,12 @@ class LennardJonesSystem:
   def _force(self, q: Tensor) -> Tensor:
     method = self.method
     if method == "auto":
+      n = int(q.shape[0])
       if "CPU" in q.device.upper():
-        n = int(q.shape[0])
         method = "neighbor" if n >= 512 else "tensor"
       else:
-        method = "tensor_bins"
+        # On GPU, all-pairs is faster for N < 2048 due to cell-list overhead
+        method = "tensor" if n < 2048 else "tensor_bins"
     if method == "neighbor" and "CPU" in q.device.upper():
       pairs = neighbor_pairs(q.detach().numpy(), self.box, self.r_cut)
       return _lj_force_from_pairs(q, pairs, self.sigma, self.epsilon, self.softening, self.box, self.r_cut,
@@ -281,20 +282,35 @@ class LennardJonesSystem:
     base = compile_structure(state=(q, p), H=H, structure=structure, integrator=integrator, split_schedule=split_schedule)
 
     class _NoVecProgram:
-      def __init__(self, prog):
+      def __init__(self, prog, split_ops):
         self._prog = prog
+        self._split_ops = split_ops  # [kick, drift]
 
       def step(self, state, dt: float):
         return self._prog.step(state, dt)
 
       def evolve(self, state, dt: float, steps: int, **kwargs):
+        record_every = kwargs.get("record_every", 1)
+        realize_every = kwargs.get("realize_every", max(1, steps // 10))
         history = []
         cur = state
-        record_every = kwargs.get("record_every", 1)
+
+        # Use direct split ops for better GPU efficiency
+        kick, drift = self._split_ops
         for i in range(steps):
           if i % record_every == 0:
             history.append(cur)
-          cur = self._prog.step(cur, dt)
+
+          # Strang splitting: kick(dt/2) -> drift(dt) -> kick(dt/2)
+          cur = kick(cur, 0.5 * dt)
+          cur = drift(cur, dt)
+          cur = kick(cur, 0.5 * dt)
+
+          # Periodic realize to avoid graph explosion
+          if (i + 1) % realize_every == 0:
+            cur[0].realize()
+            cur[1].realize()
+
         history.append(cur)
         return cur, history
 
@@ -306,7 +322,7 @@ class LennardJonesSystem:
           return cur
         return run
 
-    return _NoVecProgram(base)
+    return _NoVecProgram(base, self.split_ops())
 
 
 __all__ = ["LennardJonesSystem", "lj_energy", "lj_pressure"]

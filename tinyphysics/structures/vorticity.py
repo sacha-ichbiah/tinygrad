@@ -20,7 +20,7 @@ from tinygrad.fft import rfft2d, irfft2d
 from tinygrad.engine.jit import TinyJit
 
 from tinyphysics.core.structure import Structure, StructureKind
-from tinyphysics.operators.poisson import _complex_mul_real, _complex_mul_i
+from tinyphysics.operators.poisson import _complex_mul_real
 from tinyphysics.operators.spatial import grad2_op, poisson_solve2_op
 
 
@@ -52,6 +52,28 @@ class VorticityStructure(Structure):
     self.KY = Tensor(KY.astype(self.dtype))
     self.invK2 = Tensor(invK2.astype(self.dtype))
 
+    # Precompute combined operators for velocity computation
+    # u = ∂ψ/∂y where ψ = invK2 * w, so u_hat = i*KY*invK2*w_hat
+    # v = -∂ψ/∂x, so v_hat = -i*KX*invK2*w_hat
+    self.invK2_KY = Tensor((invK2 * KY).astype(self.dtype))  # For u velocity
+    self.invK2_KX = Tensor((invK2 * KX).astype(self.dtype))  # For v velocity
+
+    # Pre-stack wavenumber arrays for vectorized computation
+    # Stack order: [invK2_KY, invK2_KX, KX, KY] for [u, v, dwdx, dwdy]
+    self._k_stack_real = Tensor(np.stack([
+      -invK2 * KY,  # u_r coefficient (multiply by -w_i)
+      invK2 * KX,   # v_r coefficient (multiply by w_i)
+      -KX,          # dwdx_r coefficient (multiply by w_i, then negate)
+      -KY,          # dwdy_r coefficient (multiply by w_i, then negate)
+    ], axis=0).astype(self.dtype))
+
+    self._k_stack_imag = Tensor(np.stack([
+      invK2 * KY,   # u_i coefficient (multiply by w_r)
+      -invK2 * KX,  # v_i coefficient (multiply by -w_r)
+      KX,           # dwdx_i coefficient (multiply by w_r)
+      KY,           # dwdy_i coefficient (multiply by w_r)
+    ], axis=0).astype(self.dtype))
+
     cutoff = self.dealias * np.max(np.abs(kx))
     self.mask = Tensor(((np.abs(KX) < cutoff) & (np.abs(KY) < cutoff)).astype(self.dtype))
 
@@ -64,18 +86,20 @@ class VorticityStructure(Structure):
     return self._rhs(w)
 
   def _rhs(self, w: Tensor) -> Tensor:
-    """Compute right-hand side: -u·∇ω with de-aliasing."""
+    """Compute right-hand side: -u·∇ω with de-aliasing.
+
+    Optimized version with vectorized spectral operations using pre-stacked wavenumbers.
+    """
     w_hat = rfft2d(w)
-    psi_hat = _complex_mul_real(w_hat, self.invK2)
+    w_r, w_i = w_hat[..., 0], w_hat[..., 1]
 
-    # Compute velocity and vorticity gradients in spectral space
-    u_hat = _complex_mul_i(psi_hat, self.KY, sign=1.0)    # u = ∂ψ/∂y
-    v_hat = _complex_mul_i(psi_hat, self.KX, sign=-1.0)   # v = -∂ψ/∂x
-    dwdx_hat = _complex_mul_i(w_hat, self.KX, sign=1.0)
-    dwdy_hat = _complex_mul_i(w_hat, self.KY, sign=1.0)
+    # Vectorized spectral computation using pre-stacked wavenumber arrays
+    # real_parts[i] = _k_stack_real[i] * w_i for u, v, dwdx, dwdy
+    # imag_parts[i] = _k_stack_imag[i] * w_r for u, v, dwdx, dwdy
+    real_parts = (self._k_stack_real * w_i).unsqueeze(-1)  # [4, N, N//2+1, 1]
+    imag_parts = (self._k_stack_imag * w_r).unsqueeze(-1)  # [4, N, N//2+1, 1]
+    batch = Tensor.cat(real_parts, imag_parts, dim=-1)  # [4, N, N//2+1, 2]
 
-    # Batch iFFT for efficiency
-    batch = Tensor.stack([u_hat, v_hat, dwdx_hat, dwdy_hat], dim=0)
     real_batch = irfft2d(batch, n=(self.N, self.N))
     u, v, dwdx, dwdy = real_batch[0], real_batch[1], real_batch[2], real_batch[3]
 
@@ -83,8 +107,9 @@ class VorticityStructure(Structure):
     adv = u * dwdx + v * dwdy
 
     # De-alias in spectral space
-    adv_hat = _complex_mul_real(rfft2d(adv), self.mask)
-    return -irfft2d(adv_hat, n=(self.N, self.N))
+    adv_hat = rfft2d(adv)
+    adv_hat_masked = adv_hat * self.mask.unsqueeze(-1)
+    return -irfft2d(adv_hat_masked, n=(self.N, self.N))
 
   def _rhs_operator(self, w: Tensor, trace: list[str] | None = None) -> Tensor:
     if trace is not None:

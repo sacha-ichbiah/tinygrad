@@ -42,42 +42,59 @@ def build_cell_bins(pos: Tensor, box: float, r_cut: float):
   return order, sorted_cells, ncell
 
 
-def _build_cell_table(pos: Tensor, box: float, r_cut: float, max_per: int | None = None):
+def _build_cell_table_fast(pos: Tensor, box: float, r_cut: float, max_per: int | None = None):
+  """Fast cell table build that avoids sorting by using direct scatter."""
   n = int(pos.shape[0])
-  order, cell_sorted, ncell = build_cell_bins(pos, box, r_cut)
-  if order.ndim == 2:
-    order = order[0]
-    cell_sorted = cell_sorted[0]
   if n == 0:
-    return None, None, 0, ncell, order
-  diff = (cell_sorted[1:] != cell_sorted[:-1])
-  seg = Tensor.zeros(1, device=pos.device, dtype=dtypes.int32).cat(diff.cast(dtypes.int32), dim=0).cumsum()
-  seg_f = seg.cast(dtypes.float32)
-  num_seg = int(seg_f.max().item()) + 1
-  idx = Tensor.arange(n, device=pos.device, dtype=dtypes.int32)
-  init = Tensor.full((num_seg,), float(n), device=pos.device, dtype=dtypes.float32)
-  start = init.scatter_reduce(0, seg, idx.cast(dtypes.float32), reduce="amin", include_self=True)
-  start_i = start.cast(dtypes.int32)
-  slot = idx - start_i.gather(0, seg)
-  slot_f = slot.cast(dtypes.float32)
-  max_found = int(slot_f.max().item()) + 1
-  if max_found < 1:
-    max_found = 1
+    return None, None, 0, 1, Tensor.arange(n, device=pos.device, dtype=dtypes.int32)
+
+  ncell = max(1, int(box / r_cut))
+  num_cells = ncell * ncell * ncell
+  inv = 1.0 / r_cut
+
+  # Compute cell ID for each particle
+  coords = (pos * inv).cast(dtypes.int32) % ncell
+  cell_ids = _linear_cell_index(coords, ncell).reshape(-1)
+
+  # Estimate max_per if not provided
   if max_per is None:
-    max_per = max_found
-  else:
-    max_per = int(max_per)
-    if max_per < 1:
-      max_per = 1
-  if max_per is not None:
-    slot = slot.minimum(max_per - 1)
-  table = Tensor.full((num_seg * max_per,), -1, device=pos.device, dtype=dtypes.int32)
-  table = table.scatter(0, seg * max_per + slot, order)
-  table = table.reshape(num_seg, max_per)
-  cell_unique = cell_sorted.gather(0, start_i)
-  cell_to_seg = Tensor.full((ncell * ncell * ncell,), -1, device=pos.device, dtype=dtypes.int32)
-  cell_to_seg = cell_to_seg.scatter(0, cell_unique, Tensor.arange(num_seg, device=pos.device, dtype=dtypes.int32))
+    avg_per_cell = max(1, n // max(1, num_cells))
+    max_per = max(8, avg_per_cell * 4)
+
+  # Count particles per cell
+  cell_counts = Tensor.zeros(num_cells, device=pos.device, dtype=dtypes.int32)
+  ones = Tensor.ones(n, device=pos.device, dtype=dtypes.int32)
+  cell_counts = cell_counts.scatter_reduce(0, cell_ids, ones, reduce="sum", include_self=True)
+
+  # Compute prefix sum for slot assignment
+  # For each particle, its slot is: (particle_idx among particles in same cell)
+  # We use scatter_reduce with amin to find first particle in each cell
+  idx = Tensor.arange(n, device=pos.device, dtype=dtypes.int32)
+  init = Tensor.full((num_cells,), n, device=pos.device, dtype=dtypes.int32)
+  first_in_cell = init.scatter_reduce(0, cell_ids, idx, reduce="amin", include_self=True)
+
+  # Slot = particle_idx - first_particle_in_cell (clamped to max_per-1)
+  slot = idx - first_in_cell.gather(0, cell_ids)
+  slot = slot.minimum(max_per - 1).maximum(0)
+
+  # Build table using scatter
+  table = Tensor.full((num_cells * max_per,), -1, device=pos.device, dtype=dtypes.int32)
+  table = table.scatter(0, cell_ids * max_per + slot, idx)
+  table = table.reshape(num_cells, max_per)
+
+  # cell_to_seg: identity for non-empty cells, -1 for empty
+  cell_to_seg = Tensor.arange(num_cells, device=pos.device, dtype=dtypes.int32)
+  cell_to_seg = (cell_counts > 0).where(cell_to_seg, -1)
+
+  # order is just identity since we're not sorting
+  order = idx
+
   return table.realize(), cell_to_seg.realize(), max_per, ncell, order.realize()
+
+
+def _build_cell_table(pos: Tensor, box: float, r_cut: float, max_per: int | None = None):
+  """Build cell table - uses fast path that avoids sorting."""
+  return _build_cell_table_fast(pos, box, r_cut, max_per)
 
 def build_cell_table(pos: Tensor, box: float, r_cut: float, max_per: int | None = None) -> CellTable | None:
   table, cell_to_seg, max_per, ncell, order = _build_cell_table(pos, box, r_cut, max_per=max_per)
